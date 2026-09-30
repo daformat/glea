@@ -549,16 +549,21 @@ final class JournalView: ColumnPageView {
     return stack
   }
 
-  /// Days are top-level entries; each day's headings nest under it.
+  /// Today is the top-level entry; earlier days sit a level below it (like
+  /// heading 2s), and each day's headings nest under their day.
   private func refreshToc() {
     var levels: [Int] = []
+    /// How far each entry is pushed in: 1 for earlier days and their headings.
+    var indents: [Int] = []
     var titles: [String] = []
     var locators: [() -> NSRect?] = []
     var revealers: [Int: () -> Void] = [:]
     let today = NoteStore.shared.today
     for day in shownDays {
       guard let header = headers[day], let editor = editors[day] else { continue }
+      let indent = day == today ? 0 : 1
       levels.append(0)
+      indents.append(indent)
       titles.append(day == today ? "Today" : day.displayTitle)
       locators.append { [weak self, weak header] in
         guard let self, let header else { return nil }
@@ -566,6 +571,7 @@ final class JournalView: ColumnPageView {
       }
       for heading in markdownHeadings(in: editor.content) {
         levels.append(heading.level)
+        indents.append(indent)
         titles.append(heading.title)
         locators.append { [weak self, weak editor] in
           guard let self, let editor, let rect = editor.lineRect(forCharacterAt: heading.offset) else { return nil }
@@ -576,7 +582,7 @@ final class JournalView: ColumnPageView {
     }
     let depths = tocDepths(forHeadingLevels: levels)
     setTocTargets(depths.indices.map { i in
-      TocTarget(entry: TocEntry(depth: depths[i], title: titles[i]), reveal: revealers[i], locate: locators[i])
+      TocTarget(entry: TocEntry(depth: depths[i] + indents[i], title: titles[i]), reveal: revealers[i], locate: locators[i])
     })
   }
 

@@ -150,6 +150,8 @@ final class TableOfContentsView: NSView {
     let dash = CALayer()
     dash.cornerRadius = 1
     dash.anchorPoint = CGPoint(x: 0, y: 0.5)
+    // Its width is the state's (applyState); placing a row only moves it.
+    dash.bounds = CGRect(x: 0, y: 0, width: 26, height: 2)
     let label = CATextLayer()
     label.string = entry.title
     label.font = NSFont.systemFont(ofSize: fontSize, weight: .medium)
@@ -264,7 +266,6 @@ final class TableOfContentsView: NSView {
 
   private func placeRow(_ row: (dash: CALayer, label: CATextLayer), at index: Int) {
     let y = listTop + CGFloat(index) * rowHeight
-    row.dash.bounds = CGRect(x: 0, y: 0, width: 26, height: 2)
     row.dash.position = CGPoint(x: markerX, y: y + rowHeight / 2)
     let x = dashX + CGFloat(entries[index].depth) * indent
     let width = max(10, labelRoom - CGFloat(entries[index].depth) * indent - 8)
