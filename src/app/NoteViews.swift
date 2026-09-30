@@ -281,7 +281,9 @@ final class LinkLabel: NSTextField {
   }
 
   override func mouseDown(with event: NSEvent) {
-    onClick?()
+    // Once the click is over: opening a note may remove this label.
+    guard let onClick else { return }
+    DispatchQueue.main.async { onClick() }
   }
 }
 
@@ -377,7 +379,8 @@ final class QuietButton: NSView {
   override func mouseExited(with event: NSEvent) { hovering = false }
   override func mouseDown(with event: NSEvent) {}
   override func mouseUp(with event: NSEvent) {
-    if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    // Once the click is over: what it does may remove this button.
+    if bounds.contains(convert(event.locationInWindow, from: nil)), let onClick { DispatchQueue.main.async { onClick() } }
   }
   override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
   override func accessibilityPerformPress() -> Bool {

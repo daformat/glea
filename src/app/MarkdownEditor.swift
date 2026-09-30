@@ -806,7 +806,7 @@ struct MarkdownStyler {
       let name = ns.substring(with: m.range(at: 1))
       let hasAlias = m.range(at: 2).location != NSNotFound
       let visible = hasAlias ? m.range(at: 2) : m.range(at: 1)
-      if let url = URL(string: "glea-note:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)) {
+      if let url = MarkdownStyler.linkValue("glea-note:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)) {
         storage.addAttribute(.link, value: url, range: abs(visible))
       }
       storage.addAttribute(.font, value: NSFont.systemFont(ofSize: Theme.bodySize, weight: .medium), range: abs(visible))
@@ -818,7 +818,7 @@ struct MarkdownStyler {
       construct = m.range
       taken.append(m.range)
       let text = m.range(at: 1)
-      if let url = URL(string: ns.substring(with: m.range(at: 2))) {
+      if let url = MarkdownStyler.linkValue(ns.substring(with: m.range(at: 2))) {
         storage.addAttribute(.link, value: url, range: abs(text))
       }
       syntax(NSRange(location: m.range.location, length: 1))
@@ -827,7 +827,7 @@ struct MarkdownStyler {
 
     for m in MarkdownStyler.bareURL.matches(in: line, range: local) where free(m.range) {
       taken.append(m.range)
-      if let url = URL(string: ns.substring(with: m.range)) {
+      if let url = MarkdownStyler.linkValue(ns.substring(with: m.range)) {
         storage.addAttribute(.link, value: url, range: abs(m.range))
       }
     }
@@ -2781,7 +2781,11 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         view = MediaBlockView(descriptor: media, noteID: ref.id)
         let key = media.key
         view.onHeightChange = { [weak self] in self?.mediaHeightChanged(key) }
-        view.onOpenURL = { [weak self] url in self?.onOpenLink?(url) }
+        view.onOpenURL = { [weak self] url in
+          // (After the event: opening a note may free this editor and its embeds.)
+          guard let open = self?.onOpenLink else { return }
+          DispatchQueue.main.async { open(url) }
+        }
         mediaViews[media.key] = view
         (mediaHost ?? textView).addSubview(view)
         created = true
@@ -2913,7 +2917,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
     let url = (link as? URL) ?? (link as? String).flatMap(URL.init(string:))
-    if let url { onOpenLink?(url) }
+    // Once the click is over: opening another note frees this editor (and
+    // the text holding the link) while AppKit is still handling it.
+    if let url, let open = onOpenLink { DispatchQueue.main.async { open(url) } }
     return true
   }
 
@@ -2959,5 +2965,19 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   @objc private func imageLoaded() {
     restyle()
+  }
+}
+
+extension MarkdownStyler {
+  /// One link object per address, kept for good. Clicking a link moves the
+  /// cursor into it, which restyles it (its syntax shows): a fresh object
+  /// there would free the one AppKit is still holding to report the click.
+  @MainActor private static var links: [String: NSURL] = [:]
+
+  @MainActor static func linkValue(_ string: String) -> NSURL? {
+    if let url = links[string] { return url }
+    guard let url = NSURL(string: string) else { return nil }
+    links[string] = url
+    return url
   }
 }
