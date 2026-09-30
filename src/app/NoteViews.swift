@@ -330,7 +330,7 @@ final class HoverView: NSView {
   }
 }
 
-private extension NSView {
+extension NSView {
   /// Fades in or out like an embed's expand / collapse toggle on hover;
   /// hidden once out, so it can't be clicked.
   func fade(in shows: Bool) {
@@ -505,6 +505,9 @@ final class JournalView: ColumnPageView {
     for (index, day) in shownDays.enumerated() {
       let header = makeHeader(for: day, isToday: day == today)
       addToColumn(header, spacingAfter: 10)
+      if day == today, let summary = makeSummary() {
+        addToColumn(summary, spacingAfter: 20)
+      }
       let editor = MarkdownEditorView(ref: day, placeholder: day == today ? "What's on your mind today?" : "")
       editor.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
       editors[day] = editor
@@ -529,6 +532,21 @@ final class JournalView: ColumnPageView {
       more.contentTintColor = Theme.accent
       column.addArrangedSubview(more)
     }
+  }
+
+  /// What happened on the last active day, unless hidden for today.
+  private func makeSummary() -> DailySummaryView? {
+    guard DailySummaryView.hiddenOn != NoteStore.shared.today.name,
+          let summary = ActivityLog.shared.summary() else { return nil }
+    let view = DailySummaryView(summary: summary)
+    guard view.hasContent else { return nil }
+    view.navigator = navigator
+    view.onHide = { [weak self, weak view] in
+      guard let self, let view else { return }
+      self.column.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+    return view
   }
 
   private func makeHeader(for day: NoteRef, isToday: Bool) -> NSView {

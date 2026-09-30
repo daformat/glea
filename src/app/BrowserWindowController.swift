@@ -1940,6 +1940,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     discardIfUntouched()
     saveSession()
     HistoryStore.shared.save()
+    ActivityLog.shared.save()
+  }
+
+  /// The page being read in this window, for the daily summary: none in the
+  /// notes, in incognito, or on the start page.
+  var pageInFront: (url: String, title: String)? {
+    guard mode == .web, !isIncognito, !isShowingNewTab, let tab = activeTab, tab.url.hasPrefix("http") else { return nil }
+    return (tab.url, tab.title)
   }
 
   func dayMayHaveChanged() {

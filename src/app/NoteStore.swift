@@ -424,6 +424,7 @@ final class NoteStore {
         save(other, content: regex.stringByReplacingMatches(in: entry.content, range: range, withTemplate: template))
       }
     }
+    ActivityLog.shared.renamed(ref, to: newRef)
     postChange([ref.id, newRef.id])
     return .success(newRef)
   }
@@ -511,6 +512,7 @@ final class NoteStore {
         body = body.replacingOccurrences(of: "](\(remote))", with: "](\(local))")
       }
       self.append(NoteStore.format(capture, body: body), to: ref)
+      ActivityLog.shared.collected(into: ref)
       completion()
     }
   }

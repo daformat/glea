@@ -1381,7 +1381,10 @@ final class MarkdownTextView: NSTextView {
   var keepsSelectionThroughUndo = false
 
   override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
-    defer { slashMenu.selectionDidChange() }
+    defer {
+      slashMenu.selectionDidChange()
+      linkMenu.selectionDidChange()
+    }
     guard keepsSelectionThroughUndo, let first = ranges.first?.rangeValue else {
       super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
       return
@@ -1390,11 +1393,13 @@ final class MarkdownTextView: NSTextView {
   }
 
   /// The blocks menu "/" opens.
-  private(set) lazy var slashMenu = SlashMenu(textView: self)
+  private(set) lazy var slashMenu = SlashMenu(textView: self, kind: .blocks)
+  /// The notes menu "[[" opens.
+  private(set) lazy var linkMenu = SlashMenu(textView: self, kind: .noteLink)
 
-  /// While the slash menu shows, it takes ↑/↓, Return, Tab and Esc.
+  /// While a menu shows, it takes ↑/↓, Return, Tab and Esc.
   override func doCommand(by selector: Selector) {
-    if slashMenu.handle(selector) { return }
+    if slashMenu.handle(selector) || linkMenu.handle(selector) { return }
     super.doCommand(by: selector)
   }
 
@@ -1431,6 +1436,7 @@ final class MarkdownTextView: NSTextView {
     let result = super.resignFirstResponder()
     if result {
       slashMenu.close()
+      linkMenu.close()
       onFocusChange?(false)
     }
     return result
@@ -1674,31 +1680,6 @@ final class MarkdownTextView: NSTextView {
     return NSRange(location: start, length: selection.location - start)
   }
 
-  override var rangeForUserCompletion: NSRange {
-    wikiLinkContext ?? super.rangeForUserCompletion
-  }
-
-  override func completions(forPartialWordRange charRange: NSRange, indexOfSelectedItem index: UnsafeMutablePointer<Int>) -> [String]? {
-    guard let context = wikiLinkContext else { return [] }
-    let partial = (string as NSString).substring(with: context).lowercased()
-    let names = noteNames()
-    let prefixed = names.filter { $0.lowercased().hasPrefix(partial) }
-    let containing = names.filter { !$0.lowercased().hasPrefix(partial) && $0.lowercased().contains(partial) }
-    index.pointee = 0
-    return Array((prefixed + containing).prefix(20))
-  }
-
-  override func insertCompletion(_ word: String, forPartialWordRange charRange: NSRange, movement: Int, isFinal flag: Bool) {
-    super.insertCompletion(word, forPartialWordRange: charRange, movement: movement, isFinal: flag)
-    guard flag, movement == NSTextMovement.return.rawValue || movement == NSTextMovement.tab.rawValue else { return }
-    let s = string as NSString
-    let location = selectedRange().location
-    if location + 2 <= s.length && s.substring(with: NSRange(location: location, length: 2)) == "]]" {
-      setSelectedRange(NSRange(location: location + 2, length: 0))
-    } else {
-      insertText("]]", replacementRange: selectedRange())
-    }
-  }
 
   // MARK: Task shortcut
 
@@ -1787,8 +1768,8 @@ final class MarkdownTextView: NSTextView {
       scrollRangeToVisible(selectedRange())
       return
     }
-    // What Esc does in a text view (NSTextView has no cancelOperation).
-    complete(sender)
+    // Inside "[[…" whose menu was closed: Esc brings it back.
+    if let context = wikiLinkContext { linkMenu.open(at: context.location - 2) }
   }
 
   override func insertText(_ string: Any, replacementRange: NSRange) {
@@ -1821,11 +1802,7 @@ final class MarkdownTextView: NSTextView {
   override func didChangeText() {
     super.didChangeText()
     slashMenu.textDidChange()
-    let location = selectedRange().location
-    let s = string as NSString
-    if location >= 2, s.substring(with: NSRange(location: location - 2, length: 2)) == "[[", !noteNames().isEmpty {
-      DispatchQueue.main.async { self.complete(nil) }
-    }
+    linkMenu.textDidChange()
   }
 }
 
@@ -1968,7 +1945,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     textView.linkTextAttributes = [.foregroundColor: Theme.accent, .cursor: NSCursor.pointingHand]
     textView.typingAttributes = MarkdownStyler.baseAttributes
     textView.delegate = self
-    textView.noteNames = { NoteStore.shared.noteNames }
+    // (Not this note: a link to itself goes nowhere.)
+    textView.noteNames = { [weak self] in NoteStore.shared.noteNames.filter { $0 != self?.ref.name } }
     textView.onFocusChange = { [weak self] focused in
       // Once focus has moved: while resigning, the window still counts the
       // text view as focused, and restyling then restarts its caret (two
@@ -2958,6 +2936,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     guard isDirty else { return }
     isDirty = false
     NoteStore.shared.save(ref, content: textView.string)
+    ActivityLog.shared.edited(ref)
   }
 
   /// Points the editor at another note (after a rename, for example).

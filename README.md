@@ -31,6 +31,7 @@ That stock build can't play H.264 or AAC. Release builds use CEF built from sour
 
 ### Journal and notes
 - **Journal** (⇧⌘J): today's entry on top, previous days below, all editable in place.
+- **Daily summary**, like Beam's: at the top of today's journal, a card recaps your last active day. It lists the notes you worked on, the pages you read (for 30 seconds or more, with the time spent) and where to pick up: the last note you edited and the longest page you read, unless you've gone back to them since. It's drawn by the app, not written into the journal file. *Hide* puts it away until the next day. Reading time counts only while Glea is in front and you've touched the keyboard or mouse in the last 90 seconds, and never in incognito windows. The record (`activity.json` in Application Support) keeps 30 days.
 - **Notes**: create them from the omnibox, with ⌥⌘N, or by linking: `[[Note name]]` links are clickable, autocomplete after `[[`, and each note lists its **linked references** (backlinks).
 - **Renaming** a note updates every `[[link]]` to it.
 - **Unlinked references**, like Beam's: under the backlinks, a folded list of places where the note's name appears as plain text (whole words, not in code or links). *Link* turns one into a `[[link]]`, *Link All* does them all.

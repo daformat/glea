@@ -4,6 +4,8 @@ import AppKit
 // the blocks a note can have. Typing on filters it, ↑/↓ move through it,
 // Return or Tab (or a click) turns what was typed into the chosen block, and
 // Esc closes it, leaving the text as it is.
+//
+// The same menu, opened by "[[", offers the notes to link to.
 
 struct SlashItem {
   let title: String
@@ -50,6 +52,23 @@ struct SlashItem {
     }
   }
 
+  /// Notes whose name starts with `query` first, then those containing it,
+  /// and a new note named `query` when none is called that. Choosing one
+  /// completes the link ("[[query" → "[[Name]]").
+  @MainActor static func notes(_ query: String, names: [String]) -> [SlashItem] {
+    let wanted = query.trimmingCharacters(in: .whitespaces)
+    let lower = wanted.lowercased()
+    let starting = names.filter { lower.isEmpty || $0.lowercased().hasPrefix(lower) }
+    let containing = lower.isEmpty ? [] : names.filter { !$0.lowercased().hasPrefix(lower) && $0.lowercased().contains(lower) }
+    var items = (starting + containing).prefix(8).map { name in
+      SlashItem(title: name, keywords: [], symbol: "doc.text", hint: "", apply: { $0.completeNoteLink(name) })
+    }
+    if !wanted.isEmpty, !NoteStore.shared.hasNote(named: wanted) {
+      items.append(SlashItem(title: wanted, keywords: [], symbol: "plus", hint: "new note", apply: { $0.completeNoteLink(wanted) }))
+    }
+    return items
+  }
+
   /// The items `query` finds: those whose title or a keyword starts with it
   /// first, then those containing it.
   @MainActor static func matching(_ query: String) -> [SlashItem] {
@@ -65,6 +84,17 @@ struct SlashItem {
 }
 
 extension MarkdownTextView {
+  /// Writes `name` at the cursor (just after "[["), and closes the link:
+  /// the cursor goes after "]]", which is added unless it's already there.
+  func completeNoteLink(_ name: String) {
+    let location = selectedRange().location
+    let s = string as NSString
+    let closed = location + 2 <= s.length && s.substring(with: NSRange(location: location, length: 2)) == "]]"
+    let text = closed ? name : name + "]]"
+    replace(NSRange(location: location, length: 0), with: text,
+            select: NSRange(location: location + (name as NSString).length + 2, length: 0))
+  }
+
   /// A fenced code block at the cursor, with the cursor inside it.
   func insertCodeBlock() {
     let s = string as NSString
@@ -96,21 +126,32 @@ extension MarkdownTextView {
   }
 }
 
-/// The menu's state for one text view: where the "/" is, what it matches,
-/// and the panel showing it.
+/// The menu's state for one text view: where the "/" (or "[[") is, what it
+/// matches, and the panel showing it.
 @MainActor
 final class SlashMenu {
+  enum Kind {
+    /// "/": the blocks a note can have.
+    case blocks
+    /// "[[": the notes to link to.
+    case noteLink
+  }
+
   private unowned let textView: MarkdownTextView
-  /// Where the "/" is, while the menu is open (it may have no matches, and
-  /// then shows nothing until typing finds some again).
+  private let kind: Kind
+  /// What opens it.
+  private var trigger: String { kind == .blocks ? "/" : "[[" }
+  /// Where the trigger is, while the menu is open (it may have no matches,
+  /// and then shows nothing until typing finds some again).
   private var start: Int?
   private var items: [SlashItem] = []
   private var selected = 0
   private var panel: SlashMenuPanel?
   private var observers: [NSObjectProtocol] = []
 
-  init(textView: MarkdownTextView) {
+  init(textView: MarkdownTextView, kind: Kind) {
     self.textView = textView
+    self.kind = kind
   }
 
   var isOpen: Bool { start != nil }
@@ -120,18 +161,26 @@ final class SlashMenu {
       update()
       return
     }
-    // A "/" just typed at the start of a line or after a space (not in a
-    // code block, not in a URL).
     let caret = textView.selectedRange()
     let s = textView.string as NSString
-    guard caret.length == 0, caret.location >= 1, caret.location <= s.length,
-          s.character(at: caret.location - 1) == 0x2F else { return }
-    if caret.location >= 2 {
+    let length = (trigger as NSString).length
+    guard caret.length == 0, caret.location >= length, caret.location <= s.length,
+          s.substring(with: NSRange(location: caret.location - length, length: length)) == trigger else { return }
+    // A "/" at the start of a line or after a space (not in a URL); "[["
+    // anywhere. Neither in a code block.
+    if kind == .blocks, caret.location >= 2 {
       let before = s.character(at: caret.location - 2)
       guard before == 0x20 || before == 0x09 || before == 0x0A else { return }
     }
-    guard !isInCodeBlock(caret.location - 1) else { return }
-    start = caret.location - 1
+    guard !isInCodeBlock(caret.location - length) else { return }
+    start = caret.location - length
+    update()
+  }
+
+  /// Opens it on a trigger typed earlier (Esc inside "[[…").
+  func open(at location: Int) {
+    close()
+    start = location
     update()
   }
 
@@ -175,13 +224,22 @@ final class SlashMenu {
     guard let start else { return }
     let s = textView.string as NSString
     let caret = textView.selectedRange()
-    guard caret.length == 0, caret.location > start, start < s.length, s.character(at: start) == 0x2F else { return close() }
-    let query = s.substring(with: NSRange(location: start + 1, length: caret.location - start - 1))
-    // Past a line, a space right after the "/", or a long run: just text.
-    guard !query.contains("\n"), !query.hasPrefix(" "), (query as NSString).length <= 24 else { return close() }
-    let matches = SlashItem.matching(query)
-    if matches.isEmpty && query.hasSuffix(" ") { return close() }
-    items = matches
+    let length = (trigger as NSString).length
+    guard caret.length == 0, caret.location >= start + length, start + length <= s.length,
+          s.substring(with: NSRange(location: start, length: length)) == trigger else { return close() }
+    let query = s.substring(with: NSRange(location: start + length, length: caret.location - start - length))
+    switch kind {
+    case .blocks:
+      // Past a line, a space right after the "/", or a long run: just text.
+      guard caret.location > start, !query.contains("\n"), !query.hasPrefix(" "), (query as NSString).length <= 24 else { return close() }
+      let matches = SlashItem.matching(query)
+      if matches.isEmpty && query.hasSuffix(" ") { return close() }
+      items = matches
+    case .noteLink:
+      // Past the line or the link's end: done.
+      guard !query.contains("\n"), !query.contains("]"), (query as NSString).length <= 120 else { return close() }
+      items = SlashItem.notes(query, names: textView.noteNames())
+    }
     selected = 0
     if items.isEmpty { hidePanel() } else { showPanel() }
   }
@@ -191,19 +249,22 @@ final class SlashMenu {
     panel?.menuView.selected = index
   }
 
-  /// Replaces the "/" and what follows with the item's block, as one undo step.
+  /// Replaces the "/" and what follows with the item's block, or what follows
+  /// "[[" with the note's name, as one undo step.
   private func choose(_ index: Int) {
     guard let start, items.indices.contains(index) else { return }
     let item = items[index]
-    let range = NSRange(location: start, length: textView.selectedRange().location - start)
+    // "/" goes with the query; "[[" stays.
+    let from = kind == .blocks ? start : start + (trigger as NSString).length
+    let range = NSRange(location: from, length: textView.selectedRange().location - from)
     close()
     textView.breakUndoCoalescing()
     let undo = textView.undoManager
     undo?.beginUndoGrouping()
-    textView.replace(range, with: "", select: NSRange(location: start, length: 0))
+    textView.replace(range, with: "", select: NSRange(location: from, length: 0))
     item.apply(textView)
     undo?.endUndoGrouping()
-    undo?.setActionName(item.title)
+    undo?.setActionName(kind == .blocks ? item.title : "Link to Note")
   }
 
   private func isInCodeBlock(_ location: Int) -> Bool {
@@ -227,7 +288,7 @@ final class SlashMenu {
     panel.menuView.onHover = { [weak self] index in self?.select(index) }
     panel.menuView.onChoose = { [weak self] index in self?.choose(index) }
     let size = panel.menuView.fittingSize
-    // Below the "/" (above it when there's no room), its icons in line with it.
+    // Below the "/" or "[[" (above it when there's no room), its icons in line with it.
     let slash = textView.firstRect(forCharacterRange: NSRange(location: start, length: 1), actualRange: nil)
     let screen = window.screen?.visibleFrame ?? .infinite
     var origin = NSPoint(x: slash.minX - SlashMenuView.padding - 6, y: slash.minY - 6 - size.height)
@@ -438,15 +499,22 @@ final class SlashMenuView: NSView {
         tinted.draw(in: NSRect(x: rect.minX + 8 + (18 - size.width) / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height),
                     from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
       }
-      let title = NSAttributedString(string: item.title, attributes: [.font: NSFont.systemFont(ofSize: 13.5), .foregroundColor: Theme.text])
-      let titleSize = title.size()
-      title.draw(at: NSPoint(x: rect.minX + 34, y: rect.midY - titleSize.height / 2))
       let hint = NSAttributedString(string: item.hint, attributes: [
         .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular),
         .foregroundColor: index == selected ? Theme.secondaryText : Theme.tertiaryText,
       ])
       let hintSize = hint.size()
       hint.draw(at: NSPoint(x: rect.maxX - 10 - hintSize.width, y: rect.midY - hintSize.height / 2))
+      // Long titles (note names) end in "…" before the hint.
+      let truncating = NSMutableParagraphStyle()
+      truncating.lineBreakMode = .byTruncatingTail
+      let title = NSAttributedString(string: item.title, attributes: [
+        .font: NSFont.systemFont(ofSize: 13.5), .foregroundColor: Theme.text, .paragraphStyle: truncating,
+      ])
+      let titleHeight = title.size().height
+      let titleWidth = rect.maxX - 10 - (hintSize.width > 0 ? hintSize.width + 12 : 0) - (rect.minX + 34)
+      title.draw(with: NSRect(x: rect.minX + 34, y: rect.midY - titleHeight / 2, width: max(0, titleWidth), height: titleHeight),
+                 options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
   }
 

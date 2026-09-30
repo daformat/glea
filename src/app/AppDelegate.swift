@@ -54,6 +54,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       MainActor.assumeIsolated { self?.controller.chromeOpenedWindow(showing: url) }
     }
     TestHooks.install(controller: controller)
+    ActivityLog.shared.startTrackingReading {
+      // The key window may be a page's own window, above Glea's.
+      var window = NSApp.keyWindow
+      for _ in 0..<4 {
+        guard let current = window, !(current.windowController is BrowserWindowController) else { break }
+        let next = current.parent ?? GleaBrowserWindow.host(of: current)?.window
+        window = next === current ? nil : next
+      }
+      return (window?.windowController as? BrowserWindowController)?.pageInFront
+    }
     for url in pendingURLs { controller.openTab(url.absoluteString) }
     pendingURLs = []
 
