@@ -1,0 +1,1592 @@
+import AppKit
+import AVKit
+import UniformTypeIdentifiers
+import GleaBridge
+
+// Media blocks in notes: images, videos and embeds (YouTube, Spotify, X…),
+// shown inline and collapsible, after hello-mat.com's media component.
+//
+// A line holding only an image (`![alt](src)`), a video file, or a link from
+// a supported service becomes a block. Collapsed, it's one line: an icon (the
+// picture itself, or the site's icon) and the title. Expanded, it shows the
+// media. Embeds load in a Chromium view and have a loading state (a small box
+// with the service's icon beating); local images and videos appear at once.
+
+// MARK: - Providers
+
+struct EmbedProvider {
+  enum Sizing {
+    /// Video-like: full width, height from the aspect ratio.
+    case aspect(CGFloat)
+    /// Fixed height (players, cards).
+    case fixed(CGFloat)
+    /// The page reports its height (tweets, posts).
+    case dynamic
+  }
+
+  let name: String
+  let symbol: String
+  let pattern: NSRegularExpression
+  let sizing: Sizing
+  var maxWidth: CGFloat? = nil
+  /// oEmbed endpoint for a URL (title, and html when there's no player URL).
+  var oembed: ((String) -> String)? = nil
+  /// A player URL built from the regex groups, used instead of oEmbed html.
+  var player: ((String, [String]) -> String)? = nil
+
+  private static func re(_ pattern: String) -> NSRegularExpression {
+    try! NSRegularExpression(pattern: pattern, options: .caseInsensitive)
+  }
+
+  private static func q(_ url: String) -> String {
+    url.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? url
+  }
+
+  static let all: [EmbedProvider] = [
+    EmbedProvider(
+      name: "YouTube", symbol: "play.rectangle.fill",
+      pattern: re("^https?://(?:www\\.|m\\.)?(?:youtube\\.com/(?:watch\\?(?:.*&)?v=|shorts/|embed/|live/)|youtu\\.be/)([\\w-]{11})"),
+      sizing: .aspect(16 / 9),
+      oembed: { "https://www.youtube.com/oembed?format=json&url=\(q($0))" },
+      player: { _, g in "https://www.youtube-nocookie.com/embed/\(g[1])?rel=0&modestbranding=1" }),
+    EmbedProvider(
+      name: "Vimeo", symbol: "play.rectangle.fill",
+      pattern: re("^https?://(?:www\\.|player\\.)?vimeo\\.com/(?:video/)?(\\d+)"),
+      sizing: .aspect(16 / 9),
+      oembed: { "https://vimeo.com/api/oembed.json?url=\(q($0))" },
+      player: { _, g in "https://player.vimeo.com/video/\(g[1])?dnt=1" }),
+    EmbedProvider(
+      name: "Loom", symbol: "video.fill",
+      pattern: re("^https?://(?:www\\.)?loom\\.com/(?:share|embed)/(\\w+)"),
+      sizing: .aspect(16 / 9),
+      oembed: { "https://www.loom.com/v1/oembed?url=\(q($0))" },
+      player: { _, g in "https://www.loom.com/embed/\(g[1])" }),
+    EmbedProvider(
+      name: "TED", symbol: "person.wave.2.fill",
+      pattern: re("^https?://(?:www\\.)?ted\\.com/talks/([\\w-]+)"),
+      sizing: .aspect(16 / 9),
+      oembed: { "https://www.ted.com/services/v1/oembed.json?url=\(q($0))" },
+      player: { _, g in "https://embed.ted.com/talks/\(g[1])" }),
+    EmbedProvider(
+      name: "Spotify", symbol: "music.note",
+      pattern: re("^https?://open\\.spotify\\.com/(?:intl-\\w+/)?(track|album|playlist|artist|show|episode)/(\\w+)"),
+      sizing: .fixed(352),
+      oembed: { "https://open.spotify.com/oembed?url=\(q($0))" },
+      player: { _, g in "https://open.spotify.com/embed/\(g[1])/\(g[2])" }),
+    EmbedProvider(
+      name: "SoundCloud", symbol: "waveform",
+      pattern: re("^https?://(?:www\\.|m\\.)?soundcloud\\.com/[\\w-]+/[\\w-]+"),
+      sizing: .fixed(166),
+      oembed: { "https://soundcloud.com/oembed?format=json&maxheight=166&url=\(q($0))" }),
+    EmbedProvider(
+      name: "Apple Music", symbol: "music.note",
+      pattern: re("^https?://music\\.apple\\.com/(.+)"),
+      sizing: .fixed(450),
+      player: { url, g in
+        "https://embed.music.apple.com/\(g[1])"
+      }),
+    EmbedProvider(
+      name: "X", symbol: "bubble.left.fill",
+      pattern: re("^https?://(?:www\\.|mobile\\.)?(?:twitter|x)\\.com/\\w+/status(?:es)?/\\d+"),
+      sizing: .dynamic, maxWidth: 550,
+      oembed: { "https://publish.x.com/oembed?dnt=true&url=\(q($0))" }),
+    EmbedProvider(
+      name: "Bluesky", symbol: "bubble.left.fill",
+      pattern: re("^https?://bsky\\.app/profile/[^/]+/post/\\w+"),
+      sizing: .dynamic, maxWidth: 600,
+      oembed: { "https://embed.bsky.app/oembed?url=\(q($0))" }),
+    EmbedProvider(
+      name: "Reddit", symbol: "bubble.left.and.bubble.right.fill",
+      pattern: re("^https?://(?:www\\.|old\\.)?reddit\\.com/r/\\w+/comments/\\w+"),
+      sizing: .dynamic, maxWidth: 640,
+      oembed: { "https://www.reddit.com/oembed?url=\(q($0))" }),
+    EmbedProvider(
+      name: "Instagram", symbol: "camera.fill",
+      pattern: re("^https?://(?:www\\.)?instagram\\.com/(p|reel|tv)/([\\w-]+)"),
+      sizing: .fixed(620), maxWidth: 480,
+      player: { _, g in "https://www.instagram.com/\(g[1])/\(g[2])/embed/captioned/" }),
+    EmbedProvider(
+      name: "TikTok", symbol: "music.note.tv",
+      pattern: re("^https?://(?:www\\.)?tiktok\\.com/@[\\w.-]+/video/(\\d+)"),
+      sizing: .fixed(740), maxWidth: 340,
+      oembed: { "https://www.tiktok.com/oembed?url=\(q($0))" },
+      player: { _, g in "https://www.tiktok.com/embed/v2/\(g[1])" }),
+    EmbedProvider(
+      name: "Figma", symbol: "square.on.circle",
+      pattern: re("^https?://(?:www\\.)?figma\\.com/(?:file|design|proto|board)/[\\w-]+"),
+      sizing: .aspect(16 / 10),
+      player: { url, _ in "https://www.figma.com/embed?embed_host=glea&url=\(q(url))" }),
+    EmbedProvider(
+      name: "CodePen", symbol: "chevron.left.forwardslash.chevron.right",
+      pattern: re("^https?://codepen\\.io/([\\w-]+)/(?:pen|full)/(\\w+)"),
+      sizing: .fixed(400),
+      oembed: { "https://codepen.io/api/oembed?format=json&url=\(q($0))" },
+      player: { _, g in "https://codepen.io/\(g[1])/embed/\(g[2])?default-tab=result" }),
+    EmbedProvider(
+      name: "GitHub Gist", symbol: "chevron.left.forwardslash.chevron.right",
+      pattern: re("^https?://gist\\.github\\.com/([\\w-]+)/(\\w+)"),
+      sizing: .dynamic,
+      player: nil),
+    EmbedProvider(
+      name: "Flickr", symbol: "photo",
+      pattern: re("^https?://(?:www\\.)?(?:flickr\\.com/photos|flic\\.kr/p)/\\S+"),
+      sizing: .aspect(3 / 2),
+      oembed: { "https://www.flickr.com/services/oembed?format=json&url=\(q($0))" }),
+    EmbedProvider(
+      name: "Giphy", symbol: "photo",
+      pattern: re("^https?://(?:www\\.)?giphy\\.com/(?:gifs|embed)/(?:[\\w-]*-)?(\\w+)"),
+      sizing: .aspect(4 / 3)),
+  ]
+
+  static func match(_ url: String) -> (EmbedProvider, [String])? {
+    let range = NSRange(url.startIndex..., in: url)
+    for provider in all {
+      guard let m = provider.pattern.firstMatch(in: url, range: range) else { continue }
+      let groups = (0..<m.numberOfRanges).map { i -> String in
+        guard let r = Range(m.range(at: i), in: url) else { return "" }
+        return String(url[r])
+      }
+      return (provider, groups)
+    }
+    return nil
+  }
+}
+
+// MARK: - Descriptors (what a line shows)
+
+final class MediaDescriptor: NSObject {
+  enum Kind {
+    case image(URL)
+    case video(URL)
+    case embed(URL, EmbedProvider, [String])
+  }
+
+  let key: String
+  let kind: Kind
+  let title: String?
+  let indent: CGFloat
+
+  init(key: String, kind: Kind, title: String?, indent: CGFloat) {
+    self.key = key
+    self.kind = kind
+    self.title = title
+    self.indent = indent
+  }
+
+  var isLocal: Bool {
+    switch kind {
+    case .image(let url), .video(let url): return url.isFileURL
+    case .embed: return false
+    }
+  }
+
+  var sourceURL: URL {
+    switch kind {
+    case .image(let url), .video(let url), .embed(let url, _, _): return url
+    }
+  }
+
+  static let videoExtensions: Set<String> = ["mp4", "mov", "m4v"]
+
+  /// The file types AVFoundation plays (audio and video).
+  private static let playableTypes: Set<String> = Set(AVURLAsset.audiovisualTypes().map(\.rawValue))
+
+  /// A file (by its extension) that can be played: shown as a player.
+  static func isPlayable(_ url: URL) -> Bool {
+    let ext = url.pathExtension.lowercased()
+    if videoExtensions.contains(ext) { return true }
+    guard !ext.isEmpty, !imageExtensions.contains(ext), let type = UTType(filenameExtension: ext) else { return false }
+    return playableTypes.contains(type.identifier)
+  }
+
+  /// Sound only: a compact player.
+  static func isAudio(_ url: URL) -> Bool {
+    UTType(filenameExtension: url.pathExtension.lowercased())?.conforms(to: .audio) ?? false
+  }
+
+  var isAudio: Bool {
+    if case .video(let url) = kind { return Self.isAudio(url) }
+    return false
+  }
+  static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "tif", "bmp", "avif", "svg"]
+
+  private static let imageLine = try! NSRegularExpression(pattern: "^!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)(?:\\s+\"([^\"]*)\")?\\)$")
+  private static let videoLinkLine = try! NSRegularExpression(pattern: "^\\[([^\\]\\n]*)\\]\\((https?://[^)\\s]+)\\)$")
+  private static let urlLine = try! NSRegularExpression(pattern: "^https?://\\S+$")
+
+  /// The media a line's content stands for, if it is a media line.
+  static func parse(_ content: String, baseDirectory: URL, indent: CGFloat, occurrence: Int) -> MediaDescriptor? {
+    let text = content.trimmingCharacters(in: .whitespaces)
+    let ns = text as NSString
+    let full = NSRange(location: 0, length: ns.length)
+    func resolve(_ source: String) -> URL? {
+      if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("file://") { return URL(string: source) }
+      let path = source.removingPercentEncoding ?? source
+      return baseDirectory.appendingPathComponent(path).standardizedFileURL
+    }
+    if let m = imageLine.firstMatch(in: text, range: full) {
+      let source = ns.substring(with: m.range(at: 2))
+      guard let url = resolve(source) else { return nil }
+      let alt = ns.substring(with: m.range(at: 1))
+      let title = m.range(at: 3).location != NSNotFound ? ns.substring(with: m.range(at: 3)) : (alt.isEmpty ? nil : alt)
+      let key = "\(source)#\(occurrence)"
+      if isPlayable(url) {
+        return MediaDescriptor(key: key, kind: .video(url), title: title == "Video" ? nil : title, indent: indent)
+      }
+      // An embed link written as an image.
+      if let (provider, groups) = EmbedProvider.match(source) {
+        return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: title, indent: indent)
+      }
+      return MediaDescriptor(key: key, kind: .image(url), title: title, indent: indent)
+    }
+    // A line that is only a link to a video file (older captures) plays too.
+    if let m = videoLinkLine.firstMatch(in: text, range: full) {
+      let source = ns.substring(with: m.range(at: 2))
+      if let url = URL(string: source), isPlayable(url) {
+        let alt = ns.substring(with: m.range(at: 1))
+        return MediaDescriptor(key: "\(source)#\(occurrence)", kind: .video(url), title: alt.isEmpty || alt == "Video" ? nil : alt, indent: indent)
+      }
+    }
+    if urlLine.firstMatch(in: text, range: full) != nil, let url = URL(string: text) {
+      let key = "\(text)#\(occurrence)"
+      if let (provider, groups) = EmbedProvider.match(text) {
+        return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: nil, indent: indent)
+      }
+      let ext = url.pathExtension.lowercased()
+      if isPlayable(url) { return MediaDescriptor(key: key, kind: .video(url), title: nil, indent: indent) }
+      if imageExtensions.contains(ext) { return MediaDescriptor(key: key, kind: .image(url), title: nil, indent: indent) }
+    }
+    return nil
+  }
+}
+
+// MARK: - Embed resolution
+
+struct EmbedResolution {
+  enum Target {
+    case page(URL)
+    case html(String)
+    case image(URL)
+  }
+
+  var target: Target
+  var title: String?
+  var sizing: EmbedProvider.Sizing
+}
+
+@MainActor
+enum EmbedService {
+  private static var cache: [String: EmbedResolution] = [:]
+
+  static func resolve(_ url: URL, provider: EmbedProvider, groups: [String], dark: Bool,
+                      completion: @escaping (EmbedResolution?) -> Void) {
+    let source = url.absoluteString
+    let cacheKey = source + (dark ? "#dark" : "")
+    if let cached = cache[cacheKey] {
+      completion(cached)
+      return
+    }
+    func finish(_ resolution: EmbedResolution?) {
+      if let resolution { cache[cacheKey] = resolution }
+      completion(resolution)
+    }
+
+    // Giphy: the animated GIF itself.
+    if provider.name == "Giphy", groups.count > 1 {
+      finish(EmbedResolution(target: .image(URL(string: "https://media.giphy.com/media/\(groups[1])/giphy.gif")!),
+                             title: nil, sizing: provider.sizing))
+      return
+    }
+    // Gists: their script renders the code.
+    if provider.name == "GitHub Gist", groups.count > 2 {
+      finish(EmbedResolution(target: .html("<script src=\"https://gist.github.com/\(groups[1])/\(groups[2]).js\"></script>"),
+                             title: nil, sizing: .dynamic))
+      return
+    }
+
+    guard let endpoint = provider.oembed?(source).appending(dark && provider.name == "X" ? "&theme=dark" : ""),
+          let oembedURL = URL(string: endpoint) else {
+      if let player = provider.player?(source, groups), let page = URL(string: player) {
+        finish(EmbedResolution(target: .page(page), title: nil,
+                               sizing: playerSizing(provider, source) ?? provider.sizing))
+      } else {
+        finish(nil)
+      }
+      return
+    }
+    URLSession.shared.dataTask(with: URLRequest(url: oembedURL, timeoutInterval: 12)) { data, _, _ in
+      let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+      DispatchQueue.main.async {
+        let title = json["title"] as? String
+        // A player URL is more reliable than oEmbed html when there is one.
+        if let player = provider.player?(source, groups), let page = URL(string: player) {
+          finish(EmbedResolution(target: .page(page), title: title,
+                                 sizing: playerSizing(provider, source) ?? sizing(provider, json)))
+          return
+        }
+        if (json["type"] as? String) == "photo", let photo = (json["url"] as? String).flatMap(URL.init(string:)) {
+          finish(EmbedResolution(target: .image(photo), title: title, sizing: sizing(provider, json)))
+          return
+        }
+        guard let html = json["html"] as? String else {
+          finish(nil)
+          return
+        }
+        if let src = singleIframeSource(html), let page = URL(string: src) {
+          finish(EmbedResolution(target: .page(page), title: title, sizing: sizing(provider, json)))
+        } else {
+          finish(EmbedResolution(target: .html(html), title: title, sizing: .dynamic))
+        }
+      }
+    }.resume()
+  }
+
+  private static func number(_ value: Any?) -> CGFloat? {
+    if let n = value as? NSNumber { return CGFloat(truncating: n) }
+    if let s = value as? String, let d = Double(s) { return CGFloat(d) }
+    return nil
+  }
+
+  /// Players whose height depends on what they show.
+  private static func playerSizing(_ provider: EmbedProvider, _ source: String) -> EmbedProvider.Sizing? {
+    // Apple Music: a song's player is compact, an album's or playlist's lists tracks.
+    if provider.name == "Apple Music", source.contains("?i=") || source.contains("&i=") || source.contains("/song/") {
+      return .fixed(175)
+    }
+    return nil
+  }
+
+  private static func sizing(_ provider: EmbedProvider, _ json: [String: Any]) -> EmbedProvider.Sizing {
+    switch provider.sizing {
+    case .aspect:
+      if let w = number(json["width"]), let h = number(json["height"]), w > 0, h > 0 { return .aspect(w / h) }
+      return provider.sizing
+    default:
+      return provider.sizing
+    }
+  }
+
+  private static func singleIframeSource(_ html: String) -> String? {
+    let lower = html.lowercased()
+    guard lower.components(separatedBy: "<iframe").count == 2, !lower.contains("<script") else { return nil }
+    let pattern = try! NSRegularExpression(pattern: "src=\"([^\"]+)\"")
+    let range = NSRange(html.startIndex..., in: html)
+    guard let m = pattern.firstMatch(in: html, range: range), let r = Range(m.range(at: 1), in: html) else { return nil }
+    var src = String(html[r]).replacingOccurrences(of: "&amp;", with: "&")
+    if src.hasPrefix("//") { src = "https:" + src }
+    return src
+  }
+
+  /// Where generated pages are served (answered locally, see
+  /// GleaBrowserView.servedHTML): embeds refuse to be framed by data: URLs.
+  static let hostURL = "https://embed.glea.app/embed"
+
+  /// A page hosting script-based embeds (tweets, posts, gists).
+  static func hostPage(_ html: String, dark: Bool) -> String {
+    let page = """
+      <!doctype html><html><head><meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="color-scheme" content="\(dark ? "dark" : "light")">
+      <style>
+        html, body { margin: 0; padding: 0; background: \(dark ? "#1c1c1f" : "#fff"); overflow: hidden; }
+        body { font: 14px -apple-system, sans-serif; }
+        body > * { margin: 0 auto !important; }
+        .twitter-tweet, .bluesky-embed, .reddit-embed-bq { margin: 0 auto !important; }
+        /* Tweets are rounded cards on an opaque white iframe backdrop, which
+           shows in their corners: clip the iframe to the card. */
+        .twitter-tweet iframe { border-radius: 12px; }
+      </style></head><body>\(html)</body></html>
+      """
+    return page
+  }
+
+  /// Reports the page height to the app (for dynamic embeds), and when the
+  /// embed is rendered: its script has replaced the fallback blockquote with
+  /// an iframe and sized it.
+  static let sizeReporter = """
+    (() => {
+      let last = 0, ready = false;
+      const isReady = () =>
+        !document.querySelector('blockquote.twitter-tweet, blockquote.bluesky-embed, blockquote.reddit-embed-bq') &&
+        // Visible iframes (not helpers) sized by the embed's script: a new
+        // iframe first has the default height (150px), before the embed
+        // reports its own.
+        [...document.querySelectorAll('iframe')].filter(f => f.offsetWidth > 0)
+          .every(f => f.offsetHeight > 20 && (f.style.height || f.hasAttribute('height')));
+      const report = () => {
+        const b = document.body;
+        if (!b) return;
+        // Embeds scroll themselves while the view is still small; the view
+        // grows to fit, so always show the top.
+        if (scrollY || scrollX) scrollTo(0, 0);
+        const h = Math.ceil(Math.max(b.scrollHeight, b.getBoundingClientRect().height));
+        if (h && Math.abs(h - last) > 1) { last = h; try { __gleaNative.post('embedSize', JSON.stringify({ height: h })); } catch (e) {} }
+        if (!ready && isReady()) { ready = true; try { __gleaNative.post('embedReady', '{}'); } catch (e) {} }
+      };
+      const start = () => {
+        new ResizeObserver(report).observe(document.body);
+        new MutationObserver(report).observe(document.body, { childList: true, subtree: true, attributes: true });
+        report();
+      };
+      if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+      addEventListener('load', report);
+      let n = 0;
+      const t = setInterval(() => { report(); if (++n > 40) clearInterval(t); }, 250);
+    })();
+    """
+}
+
+// MARK: - Collapsed state
+
+/// Remembers which blocks are collapsed, per note (outside the Markdown).
+@MainActor
+enum MediaState {
+  private static let file = AppPaths.support.appendingPathComponent("media-state.json")
+  private static var collapsed: Set<String> = {
+    guard let data = try? Data(contentsOf: file), let list = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+    return Set(list)
+  }()
+
+  static func isCollapsed(note: String, key: String) -> Bool { collapsed.contains(note + "|" + key) }
+
+  static func set(_ value: Bool, note: String, key: String) {
+    if value { collapsed.insert(note + "|" + key) } else { collapsed.remove(note + "|" + key) }
+    if let data = try? JSONEncoder().encode(Array(collapsed)) { try? data.write(to: file, options: .atomic) }
+  }
+}
+
+// MARK: - Easing
+
+/// cubic-bezier(x1, y1, x2, y2), evaluated like CSS.
+struct CubicBezier {
+  let x1, y1, x2, y2: Double
+
+  func callAsFunction(_ t: Double) -> Double {
+    guard t > 0 else { return 0 }
+    guard t < 1 else { return 1 }
+    func sample(_ a1: Double, _ a2: Double, _ s: Double) -> Double {
+      let inv = 1 - s
+      return 3 * inv * inv * s * a1 + 3 * inv * s * s * a2 + s * s * s
+    }
+    // Solve x(s) = t by bisection, then return y(s).
+    var lo = 0.0, hi = 1.0, s = t
+    for _ in 0..<24 {
+      let x = sample(x1, x2, s)
+      if abs(x - t) < 0.0005 { break }
+      if x < t { lo = s } else { hi = s }
+      s = (lo + hi) / 2
+    }
+    return sample(y1, y2, s)
+  }
+
+  /// hello-mat's --custom-ease.
+  static let media = CubicBezier(x1: 0.42, y1: 0, x2: 0.25, y2: 1)
+}
+
+// MARK: - Block view
+
+/// One media block. Its height drives the space reserved in the text.
+final class MediaBlockView: NSView, GleaBrowserViewDelegate {
+  static let rowHeight: CGFloat = 26
+  /// Room right of the text column for the expand/collapse toggle.
+  static let gutterWidth: CGFloat = 110
+  private static let loadingSize = NSSize(width: 224, height: 56)
+
+  let descriptor: MediaDescriptor
+  let noteID: String
+  var onHeightChange: (() -> Void)?
+  var onOpenURL: ((URL) -> Void)?
+
+  /// The height the text reserves for this block (animated).
+  private(set) var blockHeight: CGFloat = rowHeight
+
+  private var collapsed: Bool
+  private var loaded = false
+  private var naturalSize: NSSize?
+  private var dynamicHeight: CGFloat?
+  private var resolution: EmbedResolution?
+  /// The appearance a themed embed page (tweets, posts) was loaded in.
+  private var contentDark: Bool?
+  /// The embed reloading in a new appearance, behind the current one until
+  /// it's ready (so the block keeps its size), with its reported height.
+  private var pending: GleaBrowserView?
+  private var pendingHeight: CGFloat?
+  private var pendingReady = false
+  private var pendingSwap: DispatchWorkItem?
+  private var titleText: String?
+
+  private let row = NSView()
+  private let rowIcon = NSImageView()
+  private let rowTitle = NSTextField.label("", size: 14, color: Theme.secondaryText)
+  /// Flipped: content is pinned top-left, so it's revealed (and hidden)
+  /// from that corner as the block expands and collapses.
+  private let wrapper = FlippedView()
+  private let placeholder = PassthroughImageView()
+  private var content: NSView?
+  private let toggle = MediaToggleButton()
+  private var tracking: NSTrackingArea?
+
+  private var wrapperFrame = NSRect.zero
+  private var sizeObservation: NSKeyValueObservation?
+  // Sound: the embed's frames playing it, or the video file playing.
+  private var audibleFrames: Set<String> = []
+  private var playerPlaying = false
+  private var soundMuted = false
+  private var playbackObservation: NSKeyValueObservation?
+  private var statusObservation: NSKeyValueObservation?
+  private var animation: (start: CFTimeInterval, from: (NSRect, CGFloat), to: (NSRect, CGFloat))?
+  /// The running animation follows the content resizing itself (a post's
+  /// "Read more"): the media keeps its size and the wrapper reveals or hides
+  /// its bottom, instead of scaling it like expanding and collapsing do.
+  private var resizesWithContent = false
+  private var timer: Timer?
+
+  var availableWidth: CGFloat = 600 {
+    didSet { if abs(availableWidth - oldValue) > 0.5 { relayout(animated: false) } }
+  }
+
+  init(descriptor: MediaDescriptor, noteID: String) {
+    self.descriptor = descriptor
+    self.noteID = noteID
+    collapsed = MediaState.isCollapsed(note: noteID, key: descriptor.key)
+    titleText = descriptor.title
+    super.init(frame: .zero)
+    SoundMonitor.shared.register(self)
+    wantsLayer = true
+
+    rowIcon.imageScaling = .scaleProportionallyUpOrDown
+    rowIcon.wantsLayer = true
+    rowIcon.layer?.cornerRadius = 3
+    rowIcon.layer?.masksToBounds = true
+    let iconButton = ClickableView { [weak self] in self?.setCollapsed(!(self?.collapsed ?? true)) }
+    iconButton.addSubview(rowIcon)
+    row.addSubview(iconButton)
+    rowTitle.translatesAutoresizingMaskIntoConstraints = true
+    let titleButton = ClickableView { [weak self] in
+      guard let self else { return }
+      self.onOpenURL?(self.descriptor.sourceURL)
+    }
+    titleButton.addSubview(rowTitle)
+    row.addSubview(titleButton)
+    addSubview(row)
+
+    wrapper.wantsLayer = true
+    wrapper.layer?.cornerRadius = 6
+    wrapper.layer?.cornerCurve = .continuous
+    wrapper.layer?.masksToBounds = true
+    placeholder.imageScaling = .scaleProportionallyUpOrDown
+    placeholder.contentTintColor = Theme.tertiaryText
+    placeholder.wantsLayer = true
+    wrapper.addSubview(placeholder)
+    addSubview(wrapper)
+
+    toggle.onClick = { [weak self] in self?.setCollapsed(!(self?.collapsed ?? true)) }
+    toggle.collapsed = collapsed
+    toggle.alphaValue = 0
+    addSubview(toggle)
+
+    configureIcon()
+    updateTitle()
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override var isFlipped: Bool { true }
+
+  private var resizeObserver: NSObjectProtocol?
+  private var scrollObserver: NSObjectProtocol?
+  private var activeObservers: [NSObjectProtocol] = []
+
+  /// For automated checks: the toggle shown, its label animating in or out
+  /// (logging what's on screen every 50ms).
+  func debugToggleLabel(_ shows: Bool) {
+    toggle.alphaValue = 1
+    // (No relayout after: the page's own width would decide again.)
+    toggle.setShowsLabel(shows, animated: true)
+    for step in 0..<10 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.05) { [weak self] in
+        guard let self else { return }
+        NSLog("Glea label t=%.2f %@ toggleWidth=%.0f", Double(step) * 0.05, self.toggle.debugLabelState, self.toggle.frame.width)
+      }
+    }
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    // The toggle's label fits or not as the window resizes.
+    if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
+    resizeObserver = window.map {
+      NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification, object: $0, queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.needsLayout = true }
+      }
+    }
+    // The pointer isn't tracked while Glea is in the background: no hover
+    // then, and on coming back, wherever the pointer now is.
+    for observer in activeObservers { NotificationCenter.default.removeObserver(observer) }
+    activeObservers = []
+    if window != nil {
+      activeObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
+                                                                    queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.hovering = false }
+      })
+      activeObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil,
+                                                                    queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.syncHoverWithPointer() }
+      })
+    }
+    // Scrolled out from under the pointer, its toggle goes (and comes back).
+    if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+    scrollObserver = nil
+    if window != nil, let clip = enclosingScrollView?.contentView {
+      clip.postsBoundsChangedNotifications = true
+      scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { self?.syncHoverWithPointer() }
+      }
+    }
+    if window != nil {
+      // Collapsed too: the row shows the real title, and the media is ready
+      // when expanded.
+      if content == nil { loadContent() }
+      relayout(animated: false)
+    } else {
+      unloadContent()
+    }
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    wrapper.layer?.backgroundColor = resolvedCGColor(Theme.codeBackground)
+    // Themed embeds reload in the new appearance (once the app has it).
+    DispatchQueue.main.async { [weak self] in self?.reloadForAppearance() }
+  }
+
+  /// Loads a themed embed again in the current appearance. The current one
+  /// stays until the new one is ready, so the block doesn't resize.
+  private func reloadForAppearance() {
+    let dark = isDark
+    guard let contentDark, contentDark != dark, let current = content as? GleaBrowserView,
+          case .embed(let url, let provider, let groups) = descriptor.kind else { return }
+    guard loaded else {
+      unloadContent()
+      loadContent()
+      return
+    }
+    self.contentDark = dark
+    EmbedService.resolve(url, provider: provider, groups: groups, dark: dark) { [weak self] resolution in
+      guard let self, self.content === current, self.contentDark == dark,
+            case .html(let html)? = resolution?.target else { return }
+      self.discardPending()
+      let view = GleaBrowserView(url: EmbedService.hostURL, contentScript: EmbedService.sizeReporter)
+      view.audioMuted = self.soundMuted
+      view.servedHTML = EmbedService.hostPage(html, dark: dark)
+      view.delegate = self
+      view.referrerOverride = "https://glea.app/"
+      view.pageBackgroundColor = self.pageBackground
+      view.wantsLayer = true
+      view.alphaValue = 0
+      view.frame = NSRect(origin: .zero, size: self.targetMediaSize())
+      self.wrapper.addSubview(view, positioned: .below, relativeTo: current)
+      self.pending = view
+      // Whatever happens, don't keep the old theme forever.
+      self.schedulePendingSwap(after: 6)
+    }
+  }
+
+  /// Swaps in the reloaded embed once it's rendered: right away when it's as
+  /// tall as the one it replaces (the same post in another theme), otherwise
+  /// once its height settles.
+  private func schedulePendingSwapIfReady() {
+    guard pendingReady, let pendingHeight else { return }
+    if let dynamicHeight, abs(pendingHeight - dynamicHeight) <= 2 {
+      schedulePendingSwap(after: 0.15)
+    } else {
+      schedulePendingSwap(after: 0.8)
+    }
+  }
+
+  private func schedulePendingSwap(after delay: TimeInterval) {
+    pendingSwap?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.swapPending() }
+    pendingSwap = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private func swapPending() {
+    guard let pending else { return }
+    pendingSwap?.cancel()
+    pendingSwap = nil
+    if let old = content as? GleaBrowserView { old.close() }
+    content?.removeFromSuperview()
+    content = pending
+    self.pending = nil
+    if let pendingHeight { dynamicHeight = pendingHeight }
+    pendingHeight = nil
+    pendingReady = false
+    pending.alphaValue = 1
+    relayout(animated: true, followingContent: true)
+  }
+
+  private func discardPending() {
+    pendingSwap?.cancel()
+    pendingSwap = nil
+    pending?.close()
+    pending?.removeFromSuperview()
+    pending = nil
+    pendingHeight = nil
+    pendingReady = false
+  }
+
+  // MARK: Title and icon
+
+  private var displayTitle: String {
+    if let titleText, !titleText.isEmpty { return titleText }
+    switch descriptor.kind {
+    case .embed(let url, let provider, _):
+      if resolution == nil && !loaded { return "Loading \(provider.name)…" }
+      // No title from the service (e.g. Instagram): name the service.
+      let kind = url.path.contains("/reel/") ? "reel" : url.path.contains("/status") || url.path.contains("/post/") ? "post" : ""
+      return kind.isEmpty ? provider.name : "\(provider.name) \(kind)"
+    case .image(let url), .video(let url):
+      if !url.isFileURL && !loaded { return "Loading \(url.host ?? "media")…" }
+      return url.lastPathComponent
+    }
+  }
+
+  private func updateTitle() {
+    let title = NSMutableAttributedString(string: displayTitle, attributes: [
+      .font: Theme.bodyFont, .foregroundColor: Theme.text,
+      .underlineStyle: NSUnderlineStyle.single.rawValue, .underlineColor: Theme.tertiaryText,
+    ])
+    title.append(NSAttributedString(string: " ↗", attributes: [
+      .font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: Theme.tertiaryText, .baselineOffset: 3,
+    ]))
+    rowTitle.attributedStringValue = title
+    needsLayout = true
+  }
+
+  private func configureIcon() {
+    switch descriptor.kind {
+    case .image(let url):
+      if url.isFileURL, let image = NSImage(contentsOf: url) {
+        rowIcon.image = image
+        placeholder.image = image
+      } else {
+        rowIcon.image = Theme.symbol("photo", size: 12)
+      }
+      placeholder.image = Theme.symbol("photo", size: 22, weight: .regular)
+    case .video:
+      let symbol = descriptor.isAudio ? "waveform" : "film"
+      rowIcon.image = Theme.symbol(symbol, size: 12)
+      rowIcon.contentTintColor = Theme.secondaryText
+      placeholder.image = Theme.symbol(symbol, size: 22, weight: .regular)
+    case .embed(let url, let provider, _):
+      rowIcon.image = Theme.symbol(provider.symbol, size: 12)
+      rowIcon.contentTintColor = Theme.secondaryText
+      placeholder.image = Theme.symbol(provider.symbol, size: 24, weight: .regular)
+      // The site's own icon, when it has one.
+      if let host = url.host, let favicon = URL(string: "https://\(host)/favicon.ico") {
+        URLSession.shared.dataTask(with: favicon) { [weak self] data, _, _ in
+          guard let data, let image = NSImage(data: data), image.size.width > 0 else { return }
+          DispatchQueue.main.async {
+            self?.rowIcon.image = image
+            self?.rowIcon.contentTintColor = nil
+          }
+        }.resume()
+      }
+    }
+  }
+
+  // MARK: Loading content
+
+  /// From the app: a block may not know its own appearance yet when it loads.
+  private var isDark: Bool { NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
+
+  private func loadContent() {
+    switch descriptor.kind {
+    case .image(let url):
+      if url.isFileURL {
+        if let image = NSImage(contentsOf: url) { showImage(image, immediately: true) }
+      } else if let cached = ImageCache.shared.image(for: url) {
+        showImage(cached, immediately: true)
+      } else {
+        startLoading()
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+          let image = data.flatMap { NSImage(data: $0) }
+          DispatchQueue.main.async { if let image { self?.showImage(image, immediately: false) } }
+        }.resume()
+      }
+    case .video(let url):
+      let player = AVPlayer(url: url)
+      player.isMuted = soundMuted
+      playbackObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+        let playing = player.timeControlStatus == .playing && player.volume > 0
+        DispatchQueue.main.async {
+          guard let self, playing != self.playerPlaying else { return }
+          self.playerPlaying = playing
+          SoundMonitor.shared.sourceDidChange()
+        }
+      }
+      let view: NSView
+      if descriptor.isAudio {
+        // Sound only: the app's own compact player (see-through: no
+        // loading icon behind it).
+        view = AudioPlayerView(player: player)
+        if url.isFileURL { placeholder.isHidden = true }
+      } else {
+        let video = AVPlayerView()
+        video.player = player
+        video.controlsStyle = .floating
+        video.videoGravity = .resizeAspect
+        view = video
+      }
+      install(view)
+      // 16:9 until the player knows the real size. A local file has no
+      // loading state; a remote one pulses like other media until it's ready.
+      naturalSize = NSSize(width: 16, height: 9)
+      if url.isFileURL {
+        loaded = true
+        relayout(animated: false)
+      } else {
+        view.alphaValue = 0
+        startLoading()
+      }
+      sizeObservation = player.currentItem?.observe(\.presentationSize, options: [.initial, .new]) { [weak self] item, _ in
+        let size = item.presentationSize
+        guard size.width > 0 else { return }
+        DispatchQueue.main.async {
+          guard let self else { return }
+          self.naturalSize = size
+          if self.loaded { self.relayout(animated: true) } else { self.finishLoading(immediately: false) }
+        }
+      }
+      let audio = descriptor.isAudio
+      statusObservation = player.currentItem?.observe(\.status, options: [.new]) { [weak self] item, _ in
+        // Sound has no picture size to wait for: ready is loaded.
+        if audio, item.status == .readyToPlay {
+          DispatchQueue.main.async {
+            guard let self, !self.loaded else { return }
+            self.finishLoading(immediately: false)
+          }
+          return
+        }
+        guard item.status == .failed else { return }
+        DispatchQueue.main.async {
+          self?.placeholder.layer?.removeAnimation(forKey: "pulse")
+          self?.placeholder.image = Theme.symbol("exclamationmark.triangle", size: 22, weight: .regular)
+        }
+      }
+    case .embed(let url, let provider, let groups):
+      startLoading()
+      EmbedService.resolve(url, provider: provider, groups: groups, dark: isDark) { [weak self] resolution in
+        guard let self else { return }
+        guard let resolution else {
+          self.placeholder.image = Theme.symbol("exclamationmark.triangle", size: 22, weight: .regular)
+          return
+        }
+        self.resolution = resolution
+        if let title = resolution.title, self.titleText == nil { self.titleText = title }
+        self.updateTitle()
+        guard self.window != nil else { return }
+        switch resolution.target {
+        case .image(let image):
+          URLSession.shared.dataTask(with: image) { [weak self] data, _, _ in
+            let picture = data.flatMap { NSImage(data: $0) }
+            DispatchQueue.main.async { if let picture { self?.showImage(picture, immediately: false) } }
+          }.resume()
+        case .page(let page):
+          self.showBrowser(page.absoluteString, script: nil)
+        case .html(let html):
+          self.contentDark = self.isDark
+          self.showBrowser(EmbedService.hostURL, served: EmbedService.hostPage(html, dark: self.isDark),
+                           script: EmbedService.sizeReporter)
+        }
+      }
+    }
+  }
+
+  /// The player of a video or sound file.
+  private var contentPlayer: AVPlayer? {
+    (content as? AVPlayerView)?.player ?? (content as? AudioPlayerView)?.player
+  }
+
+  private func install(_ view: NSView) {
+    content?.removeFromSuperview()
+    content = view
+    view.wantsLayer = true
+    wrapper.addSubview(view, positioned: .below, relativeTo: nil)
+  }
+
+  private func showImage(_ image: NSImage, immediately: Bool) {
+    let view = NSImageView(image: image)
+    view.imageScaling = .scaleProportionallyUpOrDown
+    view.animates = true
+    install(view)
+    naturalSize = image.size
+    if descriptor.isLocal { rowIcon.image = image }
+    finishLoading(immediately: immediately)
+  }
+
+  private func showBrowser(_ url: String, served html: String? = nil, script: String?) {
+    let view = GleaBrowserView(url: url, contentScript: script)
+    view.audioMuted = soundMuted
+    view.servedHTML = html
+    view.delegate = self
+    view.referrerOverride = "https://glea.app/"
+    view.pageBackgroundColor = pageBackground
+    view.alphaValue = 0
+    view.frame = NSRect(origin: .zero, size: targetMediaSize())
+    install(view)
+  }
+
+  private var pageBackground: NSColor {
+    isDark ? NSColor(srgbRed: 0.11, green: 0.11, blue: 0.12, alpha: 1) : .white
+  }
+
+  private func unloadContent() {
+    discardPending()
+    playbackObservation = nil
+    if isPlayingSound {
+      audibleFrames = []
+      playerPlaying = false
+      SoundMonitor.shared.sourceDidChange()
+    }
+    if let browser = content as? GleaBrowserView { browser.close() }
+    contentPlayer?.pause()
+    content?.removeFromSuperview()
+    content = nil
+    loaded = false
+  }
+
+  private func startLoading() {
+    loaded = false
+    placeholder.isHidden = false
+    placeholder.alphaValue = 0.6
+    updateTitle()
+    relayout(animated: !collapsed)
+    // After layout: the pulse scales around the icon's center (its layer is
+    // anchored at a corner).
+    let pulse = CAKeyframeAnimation(keyPath: "transform")
+    pulse.values = [1, 1.12, 1, 1.1, 1].map { NSValue(caTransform3D: placeholder.centeredScale($0)) }
+    pulse.keyTimes = [0, 0.19, 0.375, 0.56, 1]
+    pulse.duration = 1.6
+    pulse.repeatCount = .infinity
+    placeholder.layer?.add(pulse, forKey: "pulse")
+  }
+
+  private func finishLoading(immediately: Bool) {
+    placeholder.layer?.removeAnimation(forKey: "pulse")
+    loaded = true
+    placeholder.alphaValue = 0
+    placeholder.isHidden = true
+    updateTitle()
+    relayout(animated: !immediately)
+    guard let content else { return }
+    if immediately {
+      content.alphaValue = 1
+    } else {
+      content.alphaValue = 1
+      content.fadeIn(0.3)
+    }
+  }
+
+  // MARK: Browser delegate
+
+  /// Script embeds (tweets, posts) show once rendered, not on page load:
+  /// before that they're plain text.
+  private var waitsForRender: Bool {
+    if case .html? = resolution?.target { return true }
+    return false
+  }
+
+  func browserViewDidChangeState(_ view: GleaBrowserView) {
+    guard view === content, !loaded, !view.isLoading, view.url != "about:blank" else { return }
+    // A script embed that never renders (offline, blocked) shows anyway.
+    DispatchQueue.main.asyncAfter(deadline: .now() + (waitsForRender ? 8 : 0.25)) { [weak self] in
+      guard let self, view === self.content, !self.loaded else { return }
+      self.finishLoading(immediately: false)
+    }
+  }
+
+  func browserView(_ view: GleaBrowserView, didReceiveMessage name: String, payload json: String) {
+    if name == "audible" {
+      guard view === content,
+            let payload = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
+            let frame = payload["frame"] as? String else { return }
+      let was = isPlayingSound
+      if payload["audible"] as? Bool == true { audibleFrames.insert(frame) } else { audibleFrames.remove(frame) }
+      if isPlayingSound != was { SoundMonitor.shared.sourceDidChange() }
+      return
+    }
+    if name == "embedReady" {
+      if view === pending {
+        pendingReady = true
+        schedulePendingSwapIfReady()
+      } else if view === content, !loaded {
+        // Let the rendered embed paint before it fades in.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+          guard let self, view === self.content, !self.loaded else { return }
+          self.finishLoading(immediately: false)
+        }
+      }
+      return
+    }
+    guard name == "embedSize",
+          let size = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Double],
+          let height = size["height"], height > 20 else { return }
+    if view === pending {
+      // Ready once it's as tall as the one it replaces (the same post in
+      // another theme), or once its height settles.
+      pendingHeight = CGFloat(height)
+      schedulePendingSwapIfReady()
+      return
+    }
+    guard view === content else { return }
+    dynamicHeight = CGFloat(height)
+    if loaded { relayout(animated: true, followingContent: true) }
+  }
+
+  func browserView(_ view: GleaBrowserView, requestsNewTabWithURL url: String, background: Bool) {
+    if let url = URL(string: url) { onOpenURL?(url) }
+  }
+
+  // MARK: Collapse
+
+  func setCollapsed(_ value: Bool) {
+    guard value != collapsed else { return }
+    collapsed = value
+    MediaState.set(value, note: noteID, key: descriptor.key)
+    toggle.collapsed = value
+    if value {
+      // Collapsing only hides the media: embeds stay loaded (and keep
+      // playing), like the demo.
+      content?.fadeOut(0.2)
+    } else if content == nil {
+      loadContent()
+    } else {
+      content?.fadeIn(0.25)
+    }
+    relayout(animated: true)
+  }
+
+  // MARK: Layout
+
+  private func targetMediaSize() -> NSSize {
+    let maxWidth = availableWidth
+    switch descriptor.kind {
+    case .video where descriptor.isAudio:
+      // A player bar.
+      return NSSize(width: min(maxWidth, 480), height: 54)
+    case .image, .video:
+      guard let natural = naturalSize, natural.width > 0, natural.height > 0 else { return NSSize(width: maxWidth, height: maxWidth * 9 / 16) }
+      var size = natural
+      if size.width > maxWidth { size = NSSize(width: maxWidth, height: size.height * maxWidth / size.width) }
+      if size.height > 520 { size = NSSize(width: size.width * 520 / size.height, height: 520) }
+      return NSSize(width: round(size.width), height: round(size.height))
+    case .embed(_, let provider, _):
+      if case .image = resolution?.target, let natural = naturalSize, natural.width > 0 {
+        let width = min(maxWidth, natural.width)
+        return NSSize(width: width, height: round(natural.height * width / natural.width))
+      }
+      let width = min(maxWidth, provider.maxWidth ?? maxWidth)
+      switch resolution?.sizing ?? provider.sizing {
+      case .aspect(let ratio): return NSSize(width: width, height: round(width / ratio))
+      case .fixed(let height): return NSSize(width: width, height: height)
+      case .dynamic: return NSSize(width: width, height: dynamicHeight ?? 220)
+      }
+    }
+  }
+
+  private func targetState() -> (NSRect, CGFloat) {
+    if collapsed {
+      let size = loaded ? targetMediaSize() : MediaBlockView.loadingSize
+      // Shrinks to nothing at the top-left, under the collapsed row.
+      return (NSRect(x: 0, y: 0, width: size.width * 0.4, height: 0), MediaBlockView.rowHeight)
+    }
+    let size = loaded ? targetMediaSize() : MediaBlockView.loadingSize
+    return (NSRect(origin: .zero, size: size), size.height)
+  }
+
+  func relayout(animated: Bool, followingContent: Bool = false) {
+    resizesWithContent = followingContent
+    let target = targetState()
+    guard animated, window != nil, !Motion.reduceMotion else {
+      timer?.invalidate()
+      timer = nil
+      animation = nil
+      apply(target.0, height: target.1)
+      return
+    }
+    animation = (CACurrentMediaTime(), (wrapperFrame, blockHeight), target)
+    if timer == nil {
+      let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+        MainActor.assumeIsolated { self?.tick() }
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      self.timer = timer
+    }
+    tick()
+  }
+
+  private func tick() {
+    guard let animation else { return }
+    let duration = 0.3
+    let t = min(1, (CACurrentMediaTime() - animation.start) / duration)
+    let e = CGFloat(CubicBezier.media(t))
+    func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * e }
+    let (fromRect, fromHeight) = animation.from
+    let (toRect, toHeight) = animation.to
+    let rect = NSRect(x: lerp(fromRect.minX, toRect.minX), y: lerp(fromRect.minY, toRect.minY),
+                      width: lerp(fromRect.width, toRect.width), height: lerp(fromRect.height, toRect.height))
+    apply(rect, height: lerp(fromHeight, toHeight))
+    if t >= 1 {
+      timer?.invalidate()
+      timer = nil
+      self.animation = nil
+    }
+  }
+
+  private func apply(_ rect: NSRect, height: CGFloat) {
+    wrapperFrame = rect
+    wrapper.frame = rect
+    wrapper.layer?.backgroundColor = resolvedCGColor(loaded ? .clear : Theme.codeBackground)
+    // The media is always laid out at its final size, so embedded pages never
+    // see a resize (their responsive layout stays put). Expanding and
+    // collapsing scale it from the top-left corner instead; the wrapper clips.
+    if let content {
+      let size = targetMediaSize()
+      if content.frame.size != size { content.frame = NSRect(origin: .zero, size: size) }
+      let scale = loaded && !resizesWithContent
+        ? max(0.001, min(1, min(rect.width / max(size.width, 1), rect.height / max(size.height, 1)))) : 1
+      Motion.withoutAnimation {
+        content.layer?.transform = scale >= 0.999 ? CATransform3DIdentity : content.topLeftScale(scale)
+      }
+    }
+    let iconSize: CGFloat = 26
+    placeholder.frame = NSRect(x: (rect.width - iconSize) / 2, y: (rect.height - iconSize) / 2, width: iconSize, height: iconSize)
+    wrapper.alphaValue = collapsed ? min(1, rect.height / 40) : 1
+
+    // The collapsed row fades in as the media leaves.
+    row.alphaValue = collapsed ? max(0, 1 - rect.height / 60) : 0
+    row.isHidden = row.alphaValue == 0
+
+    let changed = abs(height - blockHeight) > 0.25
+    blockHeight = height
+    needsLayout = true
+    if changed { onHeightChange?() }
+  }
+
+  override func layout() {
+    super.layout()
+    let rowY = (MediaBlockView.rowHeight - 18) / 2
+    rowIcon.superview?.frame = NSRect(x: 0, y: rowY, width: 18, height: 18)
+    rowIcon.frame = NSRect(x: 0, y: 0, width: 18, height: 18)
+    let titleWidth = min(bounds.width - 30, ceil(rowTitle.intrinsicContentSize.width) + 2)
+    rowTitle.superview?.frame = NSRect(x: 26, y: (MediaBlockView.rowHeight - 18) / 2, width: titleWidth, height: 18)
+    rowTitle.frame = NSRect(x: 0, y: 0, width: titleWidth, height: 18)
+    row.frame = NSRect(x: 0, y: 0, width: bounds.width, height: MediaBlockView.rowHeight)
+
+    // In the gutter, right of the text column, level with the first line;
+    // just its icon when the window is too narrow for its label.
+    let toggleX = availableWidth + 14
+    if let window {
+      let fits = convert(NSPoint(x: toggleX + toggle.labelledWidth, y: 0), to: nil).x <= window.contentLayoutRect.maxX - 8
+      toggle.setShowsLabel(fits, animated: window.isVisible) { [weak self] in self?.needsLayout = true }
+    }
+    let toggleSize = toggle.fittingSize
+    toggle.frame = NSRect(x: toggleX, y: (MediaBlockView.rowHeight - toggleSize.height) / 2 - 1,
+                          width: toggleSize.width, height: toggleSize.height)
+  }
+
+  // MARK: Hover (toggle visibility)
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    // Its own bounds (the visible rect would cover the whole page: views
+    // don't clip to their bounds). A new area starts where the hover is: if
+    // it thinks the pointer is outside while it's inside, leaving never
+    // sends an exit and the toggle stays.
+    var options: NSTrackingArea.Options = [.mouseEnteredAndExited, .activeInActiveApp]
+    if hovering { options.insert(.assumeInside) }
+    let area = NSTrackingArea(rect: bounds, options: options, owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  // Moved or resized (embeds loading, the page reflowing) under a still
+  // pointer: no enter or exit events, so check where it is.
+  override func setFrameSize(_ newSize: NSSize) {
+    super.setFrameSize(newSize)
+    updateTrackingAreas()
+    scheduleHoverSync()
+  }
+
+  override func setFrameOrigin(_ newOrigin: NSPoint) {
+    super.setFrameOrigin(newOrigin)
+    scheduleHoverSync()
+  }
+
+  private var hoverSyncPending = false
+
+  /// Once per run loop turn, after the moves and resizes of a layout pass.
+  private func scheduleHoverSync() {
+    guard !hoverSyncPending, window != nil else { return }
+    hoverSyncPending = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.hoverSyncPending = false
+      self.syncHoverWithPointer()
+    }
+  }
+
+  private var hovering = false {
+    didSet {
+      guard hovering != oldValue else { return }
+      let shown: CGFloat = hovering ? 1 : 0
+      Motion.animate(0.2, timing: Motion.easeInOut) { toggle.animator().alphaValue = shown }
+      // The tracking area follows (see updateTrackingAreas).
+      updateTrackingAreas()
+    }
+  }
+
+  override func mouseEntered(with event: NSEvent) { hovering = true }
+  override func mouseExited(with event: NSEvent) { hovering = false }
+
+  /// The page scrolled under a still pointer (no enter or exit events):
+  /// match the hover to where the pointer is now.
+  private func syncHoverWithPointer() {
+    guard let window, !isHiddenOrHasHiddenAncestor else {
+      hovering = false
+      return
+    }
+    let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    // (The visible rect isn't clipped to the bounds: views don't clip.)
+    hovering = bounds.intersection(visibleRect).contains(point)
+  }
+
+  /// The note scrolls when the wheel is over an embed (embeds are sized to
+  /// their content, so they have nothing to scroll themselves).
+  override func scrollWheel(with event: NSEvent) {
+    enclosingScrollView?.scrollWheel(with: event)
+  }
+
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let local = convert(point, from: superview)
+    if NSApp.currentEvent?.type == .scrollWheel {
+      return bounds.contains(local) ? self : nil
+    }
+    // Only the visible parts take clicks; the rest belongs to the text.
+    if toggle.alphaValue > 0.1, toggle.frame.contains(local) { return toggle.hitTest(convert(local, to: toggle.superview)) ?? toggle }
+    if collapsed { return NSRect(x: 0, y: 0, width: 26 + rowTitle.frame.width, height: MediaBlockView.rowHeight).contains(local) ? super.hitTest(point) : nil }
+    return wrapperFrame.contains(local) ? super.hitTest(point) : nil
+  }
+}
+
+/// Centered on a label's lowercase letters rather than on its line box,
+/// whose middle sits higher: `shift` moves it down by the difference.
+private final class LowercaseCenteredImageView: NSImageView {
+  var shift: CGFloat = 0 { didSet { invalidateIntrinsicContentSize() } }
+  override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: -shift, left: 0, bottom: shift, right: 0) }
+}
+
+/// "↘↖ collapse" / "↖↘ expand", shown on hover.
+private final class MediaToggleButton: NSView {
+  var onClick: (() -> Void)?
+  var collapsed = false { didSet { update() } }
+  private let icon = LowercaseCenteredImageView()
+  private let label = NSTextField.label("collapse", size: 12, weight: .regular, color: Theme.tertiaryText)
+
+  private var hovering = false { didSet { update() } }
+  private var tracking: NSTrackingArea?
+  /// Off where the window is too narrow for it: just the icon (its label
+  /// becomes a tooltip).
+  private(set) var showsLabel = true
+
+  /// Its width with the longer label ("collapse"): every toggle decides by
+  /// it, so they all show or hide their label at once.
+  var labelledWidth: CGFloat {
+    let text = ("collapse" as NSString).size(withAttributes: [.font: label.font ?? NSFont.systemFont(ofSize: 12)]).width + 4
+    return 2 + (icon.image?.size.width ?? 12) + 6 + ceil(text) + 4
+  }
+
+  /// Grows the label in from the icon (a short spring, a small bounce) as it
+  /// fades in, or shrinks it back as it fades out.
+  func setShowsLabel(_ shows: Bool, animated: Bool, completion: (() -> Void)? = nil) {
+    guard shows != showsLabel else { return }
+    showsLabel = shows
+    update()
+    guard animated, !Motion.reduceMotion, let layer = label.layer else {
+      labelGeneration += 1
+      label.layer?.removeAllAnimations()
+      label.isHidden = !shows
+      completion?()
+      return
+    }
+    // Around its left edge, next to the icon.
+    let mid = label.bounds.midY
+    func scale(_ s: CGFloat) -> CATransform3D {
+      CATransform3DTranslate(CATransform3DScale(CATransform3DMakeTranslation(0, mid, 0), s, s, 1), 0, -mid, 0)
+    }
+    // Back from hidden: from small and clear (its layer was reset).
+    let fromHidden = shows && label.isHidden
+    if shows { label.isHidden = false }
+    let current = fromHidden ? nil : layer.presentation()
+    let grow = Motion.spring("transform", stiffness: 520, damping: 20)
+    grow.fromValue = current?.transform ?? scale(shows ? 0.6 : 1)
+    grow.toValue = shows ? CATransform3DIdentity : scale(0.6)
+    // As long as the shrink (a quick fade would hide it before it shows).
+    let fade = Motion.basic("opacity", duration: shows ? 0.16 : 0.22, timing: shows ? Motion.easeOut : Motion.easeInOut)
+    fade.fromValue = current?.opacity ?? (shows ? 0 : 1)
+    fade.toValue = shows ? 1 : 0
+    for animation in [grow, fade] as [CAAnimation] {
+      animation.fillMode = .forwards
+      animation.isRemovedOnCompletion = shows
+    }
+    layer.add(grow, forKey: "glea.label.transform")
+    layer.add(fade, forKey: "glea.label.opacity")
+    // Done once the spring settles (a transaction's completion, begun during
+    // layout, can come at once).
+    labelGeneration += 1
+    let generation = labelGeneration
+    DispatchQueue.main.asyncAfter(deadline: .now() + grow.duration) { [weak self] in
+      guard let self, generation == self.labelGeneration else { return }
+      if !shows {
+        self.label.isHidden = true
+        self.label.layer?.removeAllAnimations()
+      }
+      completion?()
+    }
+  }
+
+  private var labelGeneration = 0
+
+  var debugLabelState: String {
+    let shown = label.layer?.presentation()
+    return String(format: "hidden=%d opacity=%.2f scale=%.2f", label.isHidden, shown?.opacity ?? -1, shown?.transform.m11 ?? -1)
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    // Its own layer from the start: made on the way out, it would have
+    // nothing drawn in it yet (the label would vanish, not shrink).
+    label.wantsLayer = true
+    let stack = NSStackView(views: [icon, label])
+    stack.spacing = 6
+    stack.edgeInsets = NSEdgeInsets(top: 3, left: 2, bottom: 3, right: 4)
+    if let font = label.font {
+      icon.shift = (font.ascender + font.descender) / 2 - font.xHeight / 2
+    }
+    addSubview(stack)
+    stack.pinEdges(to: self)
+    update()
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  override func mouseEntered(with event: NSEvent) { hovering = true }
+  override func mouseExited(with event: NSEvent) { hovering = false }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  private func update() {
+    icon.image = Theme.symbol(collapsed ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left", size: 10, weight: .semibold)
+    label.stringValue = collapsed ? "expand" : "collapse"
+    toolTip = showsLabel ? nil : (collapsed ? "Expand" : "Collapse")
+    let color = hovering ? Theme.text : Theme.tertiaryText
+    label.textColor = color
+    icon.contentTintColor = color
+  }
+
+  override func mouseDown(with event: NSEvent) {}
+  override func mouseUp(with event: NSEvent) {
+    if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+  }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
+private extension NSView {
+  func fadeIn(_ duration: TimeInterval) {
+    alphaValue = 0
+    Motion.animate(duration, timing: Motion.easeOut) { animator().alphaValue = 1 }
+  }
+
+  func fadeOut(_ duration: TimeInterval) {
+    Motion.animate(duration, timing: Motion.easeInOut) { animator().alphaValue = 0 }
+  }
+}
+
+/// An image view that never takes clicks (the loading icon sits over the
+/// embed; the player's own button is right under it).
+private final class PassthroughImageView: NSImageView {
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// A plain view that runs an action when clicked.
+private final class ClickableView: NSView {
+  let action: () -> Void
+  init(action: @escaping () -> Void) {
+    self.action = action
+    super.init(frame: .zero)
+  }
+  required init?(coder: NSCoder) { fatalError() }
+  override var isFlipped: Bool { true }
+  override func mouseDown(with event: NSEvent) {}
+  override func mouseUp(with event: NSEvent) {
+    if bounds.contains(convert(event.locationInWindow, from: nil)) { action() }
+  }
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    frame.contains(point) ? self : nil
+  }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+}
+
+extension MediaBlockView: SoundSource {
+  var isPlayingSound: Bool { !audibleFrames.isEmpty || playerPlaying }
+  var isSoundMuted: Bool { soundMuted }
+
+  func setSoundMuted(_ muted: Bool) {
+    soundMuted = muted
+    (content as? GleaBrowserView)?.audioMuted = muted
+    contentPlayer?.isMuted = muted
+    SoundMonitor.shared.sourceDidChange()
+  }
+}
+
+/// A sound file's player: play / pause, the time, a scrubber and the
+/// duration, on a pill like the search field's.
+final class AudioPlayerView: NSView {
+  let player: AVPlayer
+  private lazy var playButton = IconButton(symbol: "play.fill", size: 12, tooltip: "Play", target: self, action: #selector(togglePlay))
+  private let elapsed = NSTextField.label("0:00", size: 11.5, color: Theme.secondaryText)
+  private let remaining = NSTextField.label("0:00", size: 11.5, color: Theme.secondaryText)
+  private let scrubber = NSSlider(value: 0, minValue: 0, maxValue: 1, target: nil, action: nil)
+  private var timeObserver: Any?
+  private var statusObservation: NSKeyValueObservation?
+  private var loadedDuration: Double = 0
+  private var endObserver: NSObjectProtocol?
+  private var scrubbing = false
+
+  init(player: AVPlayer) {
+    self.player = player
+    super.init(frame: .zero)
+    wantsLayer = true
+    for label in [elapsed, remaining] {
+      label.font = .monospacedDigitSystemFont(ofSize: 11.5, weight: .regular)
+    }
+    scrubber.controlSize = .small
+    scrubber.target = self
+    scrubber.action = #selector(scrub)
+    scrubber.isContinuous = true
+    for view in [playButton, elapsed, scrubber, remaining] as [NSView] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+      addSubview(view)
+    }
+    NSLayoutConstraint.activate([
+      playButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+      playButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+      elapsed.leadingAnchor.constraint(equalTo: playButton.trailingAnchor, constant: 6),
+      elapsed.centerYAnchor.constraint(equalTo: centerYAnchor),
+      scrubber.leadingAnchor.constraint(equalTo: elapsed.trailingAnchor, constant: 10),
+      scrubber.centerYAnchor.constraint(equalTo: centerYAnchor),
+      remaining.leadingAnchor.constraint(equalTo: scrubber.trailingAnchor, constant: 10),
+      remaining.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+      remaining.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+    timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 10), queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.update() }
+    }
+    statusObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+      DispatchQueue.main.async { self?.update() }
+    }
+    // The length, read from the file.
+    if let asset = player.currentItem?.asset {
+      Task { @MainActor [weak self] in
+        guard let length = try? await asset.load(.duration), length.seconds.isFinite else { return }
+        self?.loadedDuration = length.seconds
+        self?.update()
+      }
+    }
+    // Played to the end: back to the start, ready to play again.
+    endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: player.currentItem,
+                                                         queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated {
+        self?.player.seek(to: .zero)
+        self?.update()
+      }
+    }
+    update()
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  deinit {
+    if let timeObserver { player.removeTimeObserver(timeObserver) }
+    if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+  }
+
+  private var duration: Double {
+    let seconds = player.currentItem?.duration.seconds ?? 0
+    return seconds.isFinite && seconds > 0 ? seconds : loadedDuration
+  }
+
+  private func update() {
+    let playing = player.timeControlStatus != .paused
+    playButton.setSymbol(playing ? "pause.fill" : "play.fill", size: 12, animated: false)
+    playButton.toolTip = playing ? "Pause" : "Play"
+    let now = player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0
+    elapsed.stringValue = Self.format(now)
+    // The length rounded up (a 0.9s clip lasts 0:01).
+    remaining.stringValue = Self.format(duration.rounded(.up))
+    if !scrubbing { scrubber.doubleValue = duration > 0 ? now / duration : 0 }
+  }
+
+  private static func format(_ seconds: Double) -> String {
+    let total = Int(seconds.rounded(.down))
+    return total >= 3600 ? String(format: "%d:%02d:%02d", total / 3600, total / 60 % 60, total % 60)
+      : String(format: "%d:%02d", total / 60, total % 60)
+  }
+
+  @objc private func togglePlay() {
+    if player.timeControlStatus == .paused { player.play() } else { player.pause() }
+    update()
+  }
+
+  @objc private func scrub() {
+    guard duration > 0 else { return }
+    let ended = NSApp.currentEvent?.type == .leftMouseUp
+    scrubbing = !ended
+    player.seek(to: CMTime(seconds: scrubber.doubleValue * duration, preferredTimescale: 600),
+                toleranceBefore: .zero, toleranceAfter: .zero)
+    elapsed.stringValue = Self.format(scrubber.doubleValue * duration)
+  }
+
+  // The arrow over the player (not the text's I-beam), like other embeds.
+  private var cursorArea: NSTrackingArea?
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let cursorArea { removeTrackingArea(cursorArea) }
+    let area = NSTrackingArea(rect: .zero, options: [.cursorUpdate, .activeInActiveApp, .inVisibleRect], owner: self)
+    addTrackingArea(area)
+    cursorArea = area
+  }
+
+  override func cursorUpdate(with event: NSEvent) { NSCursor.arrow.set() }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .arrow) }
+
+  override var wantsUpdateLayer: Bool { true }
+
+  override func updateLayer() {
+    layer?.cornerRadius = 10
+    layer?.cornerCurve = .continuous
+    layer?.borderWidth = 1
+    layer?.backgroundColor = resolvedCGColor(Theme.searchFill)
+    layer?.borderColor = resolvedCGColor(Theme.searchStroke)
+  }
+}

@@ -1,0 +1,131 @@
+diff --git a/chromium/config/Chrome/mac/arm64/config_components.h b/chromium/config/Chrome/mac/arm64/config_components.h
+index 7168328..659da8d 100644
+--- a/chromium/config/Chrome/mac/arm64/config_components.h
++++ b/chromium/config/Chrome/mac/arm64/config_components.h
+@@ -137,7 +137,7 @@
+ #define CONFIG_H263I_DECODER 0
+ #define CONFIG_H263P_DECODER 0
+ #define CONFIG_H263_V4L2M2M_DECODER 0
+-#define CONFIG_H264_DECODER 1
++#define CONFIG_H264_DECODER 0
+ #define CONFIG_H264_V4L2M2M_DECODER 0
+ #define CONFIG_H264_MEDIACODEC_DECODER 0
+ #define CONFIG_H264_MMAL_DECODER 0
+@@ -344,7 +344,7 @@
+ #define CONFIG_ZEROCODEC_DECODER 0
+ #define CONFIG_ZLIB_DECODER 0
+ #define CONFIG_ZMBV_DECODER 0
+-#define CONFIG_AAC_DECODER 1
++#define CONFIG_AAC_DECODER 0
+ #define CONFIG_AAC_FIXED_DECODER 0
+ #define CONFIG_AAC_LATM_DECODER 0
+ #define CONFIG_AC3_DECODER 0
+diff --git a/chromium/config/Chrome/mac/arm64/libavcodec/codec_list.c b/chromium/config/Chrome/mac/arm64/libavcodec/codec_list.c
+index fe5adb0..7d9debf 100644
+--- a/chromium/config/Chrome/mac/arm64/libavcodec/codec_list.c
++++ b/chromium/config/Chrome/mac/arm64/libavcodec/codec_list.c
+@@ -1,6 +1,4 @@
+ static const FFCodec * const codec_list[] = {
+-    &ff_h264_decoder,
+-    &ff_aac_decoder,
+     &ff_flac_decoder,
+     &ff_mp3_decoder,
+     &ff_vorbis_decoder,
+diff --git a/chromium/config/Chrome/mac/x64/config_components.asm b/chromium/config/Chrome/mac/x64/config_components.asm
+index 695266e..ad49fb7 100644
+--- a/chromium/config/Chrome/mac/x64/config_components.asm
++++ b/chromium/config/Chrome/mac/x64/config_components.asm
+@@ -135,7 +135,7 @@
+ %define CONFIG_H263I_DECODER 0
+ %define CONFIG_H263P_DECODER 0
+ %define CONFIG_H263_V4L2M2M_DECODER 0
+-%define CONFIG_H264_DECODER 1
++%define CONFIG_H264_DECODER 0
+ %define CONFIG_H264_V4L2M2M_DECODER 0
+ %define CONFIG_H264_MEDIACODEC_DECODER 0
+ %define CONFIG_H264_MMAL_DECODER 0
+@@ -342,7 +342,7 @@
+ %define CONFIG_ZEROCODEC_DECODER 0
+ %define CONFIG_ZLIB_DECODER 0
+ %define CONFIG_ZMBV_DECODER 0
+-%define CONFIG_AAC_DECODER 1
++%define CONFIG_AAC_DECODER 0
+ %define CONFIG_AAC_FIXED_DECODER 0
+ %define CONFIG_AAC_LATM_DECODER 0
+ %define CONFIG_AC3_DECODER 0
+diff --git a/chromium/config/Chrome/mac/x64/config_components.h b/chromium/config/Chrome/mac/x64/config_components.h
+index 7168328..659da8d 100644
+--- a/chromium/config/Chrome/mac/x64/config_components.h
++++ b/chromium/config/Chrome/mac/x64/config_components.h
+@@ -137,7 +137,7 @@
+ #define CONFIG_H263I_DECODER 0
+ #define CONFIG_H263P_DECODER 0
+ #define CONFIG_H263_V4L2M2M_DECODER 0
+-#define CONFIG_H264_DECODER 1
++#define CONFIG_H264_DECODER 0
+ #define CONFIG_H264_V4L2M2M_DECODER 0
+ #define CONFIG_H264_MEDIACODEC_DECODER 0
+ #define CONFIG_H264_MMAL_DECODER 0
+@@ -344,7 +344,7 @@
+ #define CONFIG_ZEROCODEC_DECODER 0
+ #define CONFIG_ZLIB_DECODER 0
+ #define CONFIG_ZMBV_DECODER 0
+-#define CONFIG_AAC_DECODER 1
++#define CONFIG_AAC_DECODER 0
+ #define CONFIG_AAC_FIXED_DECODER 0
+ #define CONFIG_AAC_LATM_DECODER 0
+ #define CONFIG_AC3_DECODER 0
+diff --git a/chromium/config/Chrome/mac/x64/libavcodec/codec_list.c b/chromium/config/Chrome/mac/x64/libavcodec/codec_list.c
+index fe5adb0..7d9debf 100644
+--- a/chromium/config/Chrome/mac/x64/libavcodec/codec_list.c
++++ b/chromium/config/Chrome/mac/x64/libavcodec/codec_list.c
+@@ -1,6 +1,4 @@
+ static const FFCodec * const codec_list[] = {
+-    &ff_h264_decoder,
+-    &ff_aac_decoder,
+     &ff_flac_decoder,
+     &ff_mp3_decoder,
+     &ff_vorbis_decoder,
+diff --git a/libavformat/aacdec.c b/libavformat/aacdec.c
+index 7968e52..16e48da 100644
+--- a/libavformat/aacdec.c
++++ b/libavformat/aacdec.c
+@@ -23,6 +23,9 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/intreadwrite.h"
+ #include "avformat.h"
++#include "libavcodec/adts_header.h"
++#include "libavutil/channel_layout.h"
++#include "libavutil/mem.h"
+ #include "avio_internal.h"
+ #include "demux.h"
+ #include "internal.h"
+@@ -129,6 +132,28 @@ static int adts_aac_read_header(AVFormatContext *s)
+     if (ret < 0)
+         return ret;
+ 
++    // Glea: its FFmpeg has no AAC decoder (macOS decodes AAC), and that
++    // decoder is what normally reports the stream's rate and channels. Read
++    // them from the first ADTS header, with a matching AudioSpecificConfig.
++    {
++        uint8_t buf[AV_AAC_ADTS_HEADER_SIZE + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
++        AACADTSHeaderInfo *hdr = NULL;
++        int64_t pos = avio_tell(s->pb);
++        if (avio_read(s->pb, buf, AV_AAC_ADTS_HEADER_SIZE) == AV_AAC_ADTS_HEADER_SIZE &&
++            avpriv_adts_header_parse(&hdr, buf, sizeof(buf)) >= 0 && hdr->chan_config) {
++            st->codecpar->sample_rate = hdr->sample_rate;
++            st->codecpar->frame_size  = hdr->samples;
++            av_channel_layout_default(&st->codecpar->ch_layout,
++                                      hdr->chan_config == 7 ? 8 : hdr->chan_config);
++            if (ff_alloc_extradata(st->codecpar, 2) >= 0) {
++                st->codecpar->extradata[0] = (hdr->object_type << 3) | (hdr->sampling_index >> 1);
++                st->codecpar->extradata[1] = ((hdr->sampling_index & 1) << 7) | (hdr->chan_config << 3);
++            }
++        }
++        av_free(hdr);
++        avio_seek(s->pb, pos, SEEK_SET);
++    }
++
+     // LCM of all possible ADTS sample rates
+     avpriv_set_pts_info(st, 64, 1, 28224000);
+ 
