@@ -67,6 +67,7 @@ Modelled on Beam and Kosmik.
 - **Click** to collect: the spotlight presses down, springs back and flashes. A picker then asks where the capture goes (today's journal, an existing note, or a new one).
 - **Drag** instead of clicking to capture any rectangular area as a screenshot.
 - If there's nothing to collect, the spotlight shakes.
+- **Posts and videos** on YouTube, X, Bluesky and Instagram (on those sites, or embedded in other pages) are spotlighted whole and collected as embeds: the note plays the video or shows the post. Hold **⌥⌘** instead of ⌥ to collect their text and images as usual.
 - Captures are converted to Markdown: headings, lists, links, code, tables and images, with citation markers removed. Images are downloaded into `assets/`.
 - Each capture is appended as a quote with a link back to the source page.
 - ⌘S (*Collect Page*) saves the page itself as a link. The page's context menu also offers *Collect Selection* and *Collect Image*.
@@ -136,6 +137,7 @@ Timings follow Beam's: short ease-in-outs for state changes and firm springs for
 | ⌘K | Omnibox (from anywhere) |
 | ⌥⌘⌫ | Move note to Trash |
 | ⌥ hold + click | Point and shoot |
+| ⌥⌘ hold + click | Point and shoot, posts and videos as text |
 | ⌘S | Collect page |
 | ⌘W / ⇧⌘T | Close tab (or the window, once it has none) / reopen closed tab |
 | ⌥⌘W | Close all tabs (pinned ones stay) and go back to the notes; ⇧⌘T reopens them all |

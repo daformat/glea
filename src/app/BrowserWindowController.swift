@@ -625,6 +625,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       MainActor.assumeIsolated { self?.positionTrafficLights() }
     }
     toast.translatesAutoresizingMaskIntoConstraints = false
+    toast.onHoverChange = { [weak self] _ in self?.updateOverlayInteractivity() }
     overlayRoot.addSubview(toast)
     NSLayoutConstraint.activate([
       toast.centerXAnchor.constraint(equalTo: overlayRoot.centerXAnchor),
@@ -875,7 +876,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   /// Clicks go through the overlay window unless an overlay wants them.
   private func updateOverlayInteractivity() {
-    overlayWindow.ignoresMouseEvents = !overlayRoot.subviews.contains { $0 is OverlayView || $0 is FindBar }
+    overlayWindow.ignoresMouseEvents = !overlayRoot.subviews.contains { $0 is OverlayView || $0 is FindBar } && !toast.isHovered
   }
 
   // MARK: Modes
@@ -1272,7 +1273,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       lines.append("- [\(name)](\(tab.url))")
     }
     NoteStore.shared.append(lines.joined(separator: "\n"), to: NoteStore.shared.today)
-    toast.show("Captured “\(title)” to Today")
+    toast.show("Captured “\(title)” to", linkTitle: "Today") { [weak self] in self?.openCollected(NoteStore.shared.today) }
   }
 
   /// Drag & drop from the tab bar: `index` is the tab's new position among
@@ -1758,6 +1759,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
   }
 
+  /// Where a capture went: today's journal, or the note.
+  private func openCollected(_ ref: NoteRef) {
+    if ref == NoteStore.shared.today { showJournal(nil) } else { openNote(ref) }
+  }
+
   private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from tab: Tab) {
     let root = rootView
     var anchor = NSRect(x: root.bounds.midX - 170, y: Theme.topBarHeight + 8, width: 0, height: 0)
@@ -1779,7 +1785,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       // The page just lets go of the target; the toast is the only confirmation.
       tab?.browserView?.executeJavaScript("window.__gleaPNS && __gleaPNS.done()")
       NoteStore.shared.collect(capture, into: ref) {
-        self.toast.show("Collected to \(name)")
+        self.toast.show("Collected to", linkTitle: name) { [weak self] in self?.openCollected(ref) }
       }
     }
     present(panel)
@@ -1799,11 +1805,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   private var pendingPointAndShoot: DispatchWorkItem?
 
+  /// ⌥ alone, or ⌥⌘ (Caps Lock aside).
+  private static func isPointAndShoot(_ flags: NSEvent.ModifierFlags) -> Bool {
+    flags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .command]) == .option
+  }
+
   func modifierFlagsChanged(_ flags: NSEvent.ModifierFlags) {
     topBar.dragModifiersChanged(flags)
     // ⌥ with the mouse down is ⌥-dragging (tabs): not point-and-shoot.
-    let optionOnly = flags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock) == .option
-      && NSEvent.pressedMouseButtons == 0
+    // ⌘ may join it: then posts and videos are collected as text, not embeds.
+    let optionOnly = BrowserWindowController.isPointAndShoot(flags) && NSEvent.pressedMouseButtons == 0
     pendingPointAndShoot?.cancel()
     pendingPointAndShoot = nil
     guard mode == .web, let view = activeTab?.browserView else { return }
@@ -1812,6 +1823,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(false)")
       return
     }
+    view.executeJavaScript("window.__gleaPNS && __gleaPNS.setTextOnly(\(flags.contains(.command)))")
     // Turning it on needs the page in front, and Option held on its own for a
     // moment: ⌥ on the way to ⌥⌘→ (switch tabs) never starts a capture.
     // The page has keyboard focus in its own window (Chrome style) or in ours.
@@ -1820,7 +1832,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     guard (NSApp.isActive && focused) || testing, overlay == nil, !isShowingNewTab else { return }
     let work = DispatchWorkItem { [weak self, weak view] in
       guard let self, let view, self.activeTab?.browserView === view else { return }
-      guard NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock) == .option
+      guard BrowserWindowController.isPointAndShoot(NSEvent.modifierFlags)
               || ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] != nil else { return }
       // Where the pointer is, in page (CSS) pixels, for pages that haven't seen it move.
       var args = "true"

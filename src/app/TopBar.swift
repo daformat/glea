@@ -1764,37 +1764,116 @@ final class FindBar: NSView, NSSearchFieldDelegate {
 
 final class ToastView: NSView {
   private let label = NSTextField.label("", size: 12, weight: .medium, color: .white)
+  /// A note's name after the message, clickable.
+  private let link = NSTextField.label("", size: 12, weight: .semibold, color: NSColor(srgbRed: 0.68, green: 0.7, blue: 1, alpha: 1))
+  private let stack = NSStackView()
   private var hideWork: DispatchWorkItem?
+  private var action: (() -> Void)?
+  private var hoverTimer: Timer?
+  /// The pointer is over it (only tracked while it has a link).
+  private(set) var isHovered = false {
+    didSet {
+      guard isHovered != oldValue else { return }
+      onHoverChange?(isHovered)
+      if isHovered {
+        hideWork?.cancel()
+        NSCursor.pointingHand.set()
+      } else {
+        NSCursor.arrow.set()
+        scheduleHide(after: ToastView.lingerAfterHover)
+      }
+    }
+  }
+  /// Called as the pointer comes over it and leaves (the window then takes
+  /// clicks there, or lets them through again).
+  var onHoverChange: ((Bool) -> Void)?
+
+  private static let plainDuration: TimeInterval = 2.2
+  private static let linkDuration: TimeInterval = 5
+  private static let lingerAfterHover: TimeInterval = 1.5
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     wantsLayer = true
     layer?.backgroundColor = NSColor(white: 0.12, alpha: 0.92).cgColor
     layer?.cornerRadius = 9
-    addSubview(label)
-    label.pinEdges(to: self, insets: NSEdgeInsets(top: 7, left: 14, bottom: 7, right: 14))
+    stack.orientation = .horizontal
+    stack.spacing = 4
+    stack.alignment = .firstBaseline
+    stack.addArrangedSubview(label)
+    stack.addArrangedSubview(link)
+    addSubview(stack)
+    stack.pinEdges(to: self, insets: NSEdgeInsets(top: 7, left: 14, bottom: 7, right: 14))
     alphaValue = 0
   }
 
   required init?(coder: NSCoder) { fatalError() }
 
-  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+  /// Clickable only while it shows a link.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    action != nil && alphaValue > 0 && frame.contains(point) ? self : nil
+  }
 
-  func show(_ message: String) {
+  override func mouseDown(with event: NSEvent) {
+    guard let action else { return }
+    // After the click (opening the note changes what's on screen), and the
+    // toast goes at once.
+    DispatchQueue.main.async { action() }
+    stopTracking()
+    scheduleHide(after: 0)
+  }
+
+  /// `message`, then `linkTitle` in the link color when there's an action:
+  /// clicking the toast runs it. A toast with a link stays longer, and as
+  /// long as the pointer is over it.
+  func show(_ message: String, linkTitle: String? = nil, action: (() -> Void)? = nil) {
     label.stringValue = message
+    link.stringValue = linkTitle ?? ""
+    link.isHidden = linkTitle == nil
+    self.action = action
     hideWork?.cancel()
     layer?.removeAllAnimations()
     alphaValue = 1
     // Rise from just below its resting place.
     animateIn(scale: 0.92, offsetY: -10, fade: 0.12, duration: 0.42, timing: Motion.easeOut)
+    stopTracking()
+    if action != nil { startTracking() }
+    scheduleHide(after: action == nil ? ToastView.plainDuration : ToastView.linkDuration)
+  }
+
+  private func scheduleHide(after delay: TimeInterval) {
+    hideWork?.cancel()
     let work = DispatchWorkItem { [weak self] in
-      self?.animateOut(scale: 0.96, offsetY: -4, fade: 0.2, duration: 0.2) {
+      guard let self, !self.isHovered else { return }
+      self.stopTracking()
+      self.action = nil
+      self.animateOut(scale: 0.96, offsetY: -4, fade: 0.2, duration: 0.2) { [weak self] in
         self?.alphaValue = 0
         self?.layer?.removeAllAnimations()
       }
     }
     hideWork = work
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: work)
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  // The window it's in lets clicks through to the page below, so it gets no
+  // mouse events of its own until the pointer is over it: watch the pointer.
+  private func startTracking() {
+    let timer = Timer(timeInterval: 1 / 20, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self, let window = self.window else { return }
+        let point = self.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        self.isHovered = self.bounds.contains(point)
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    hoverTimer = timer
+  }
+
+  private func stopTracking() {
+    hoverTimer?.invalidate()
+    hoverTimer = nil
+    isHovered = false
   }
 }
 

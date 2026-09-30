@@ -41,6 +41,7 @@
   let hideTimer = 0;
   let scrollTimer = 0;
   let swallowClick = 0;
+  let textOnly = false;     // ⌘ is held too: posts and videos are plain content
 
   // ---------------------------------------------------------------- overlay
 
@@ -449,7 +450,9 @@
     }
     if (!(target instanceof Element) || !target.isConnected) return null;
     const own = plain(target.getBoundingClientRect());
-    const content = (!isWhole(target) && contentBounds(target)) || own;
+    // A post or video is taken whole, like media.
+    const whole = isWhole(target) || (!textOnly && embedTargets.has(target));
+    const content = (!whole && contentBounds(target)) || own;
     if (content.width <= 0 || content.height <= 0) return null;
     const outer = ancestorClip(target);
     // Clipped away entirely: better the unclipped box than nothing.
@@ -494,8 +497,112 @@
     return current;
   }
 
+  // ------------------------------------------------------------- embeds
+
+  // Posts and videos the notes can embed again (YouTube, X, Bluesky,
+  // Instagram): pointing anywhere over one spotlights all of it, and
+  // collecting it keeps its address, which the note shows as an embed.
+  const embedTargets = new WeakMap();  // element → its post or video URL
+
+  const YOUTUBE_ITEMS = 'ytd-rich-item-renderer, ytd-video-renderer, ytd-compact-video-renderer, ' +
+    'ytd-grid-video-renderer, ytd-playlist-video-renderer, ytd-reel-item-renderer, yt-lockup-view-model, ' +
+    'ytm-shorts-lockup-view-model, ytm-video-with-context-renderer, ytm-compact-video-renderer';
+
+  function siteHost() {
+    return location.hostname.replace(/^(?:www|mobile|m)\./, '');
+  }
+
+  // The first link inside `node` to a page of `hosts` whose path matches.
+  function linkIn(node, hosts, path) {
+    for (const a of node.querySelectorAll('a[href]')) {
+      let url;
+      try { url = new URL(a.getAttribute('href'), location.href); } catch (err) { continue; }
+      if (hosts.test(url.hostname) && path.test(url.pathname)) return url;
+    }
+    return null;
+  }
+
+  function youtubeURL(url) {
+    if (!url) return null;
+    const shorts = url.pathname.match(/^\/shorts\/([\w-]+)/);
+    if (shorts) return `https://www.youtube.com/shorts/${shorts[1]}`;
+    const id = url.searchParams.get('v');
+    return id ? `https://www.youtube.com/watch?v=${id}` : null;
+  }
+
+  // The post or video `node` is, on these sites or embedded elsewhere.
+  function embedOf(node) {
+    const tag = node.tagName;
+    // Embeds on other sites, before (or without) their script: the quote.
+    if (tag === 'BLOCKQUOTE') {
+      if (node.classList.contains('twitter-tweet')) {
+        const links = Array.from(node.querySelectorAll('a[href*="/status/"]'));
+        return links.length ? links[links.length - 1].href.split('?')[0] : null;
+      }
+      if (node.classList.contains('bluesky-embed')) {
+        const m = (node.dataset.blueskyUri || '').match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/(\w+)/);
+        if (m) return `https://bsky.app/profile/${m[1]}/post/${m[2]}`;
+        const link = linkIn(node, /(^|\.)bsky\.app$/, /^\/profile\/[^/]+\/post\/\w+\/?$/);
+        return link ? link.href : null;
+      }
+      if (node.classList.contains('instagram-media')) {
+        const permalink = node.dataset.instgrmPermalink;
+        return permalink ? permalink.split('?')[0] : null;
+      }
+      return null;
+    }
+    const host = siteHost();
+    if ((host === 'x.com' || host === 'twitter.com') && tag === 'ARTICLE') {
+      // The post's own address is the link around its timestamp.
+      const time = node.querySelector('a[href*="/status/"] time');
+      if (time) return time.closest('a').href.split('?')[0];
+      const link = linkIn(node, /(^|\.)(x|twitter)\.com$/, /^\/\w+\/status\/\d+\/?$/);
+      if (link) return link.href;
+      // The post a status page is about has no link to itself.
+      return /^\/\w+\/status\/\d+\/?$/.test(location.pathname) ? location.origin + location.pathname : null;
+    }
+    if (host === 'bsky.app' && node.matches('[data-testid^="feedItem-by-"], [data-testid^="postThreadItem-by-"]')) {
+      const link = linkIn(node, /(^|\.)bsky\.app$/, /^\/profile\/[^/]+\/post\/\w+\/?$/);
+      if (link) return link.href;
+      return /^\/profile\/[^/]+\/post\/\w+\/?$/.test(location.pathname) ? location.origin + location.pathname : null;
+    }
+    if (host === 'instagram.com' && tag === 'ARTICLE') {
+      const link = linkIn(node, /(^|\.)instagram\.com$/, /^\/(?:[\w.]+\/)?(?:p|reel|tv)\/[\w-]+\/?$/);
+      const path = link ? link.pathname : location.pathname;
+      const m = path.match(/\/(p|reel|tv)\/([\w-]+)/);
+      return m ? `https://www.instagram.com/${m[1]}/${m[2]}/` : null;
+    }
+    if (host === 'youtube.com') {
+      // The player: the video being watched. A thumbnail or list item: its video.
+      if (node.matches('#movie_player, .html5-video-player, #player-container-id')) return youtubeURL(new URL(location.href));
+      if (node.matches(YOUTUBE_ITEMS)) return youtubeURL(linkIn(node, /(^|\.)youtube\.com$/, /^\/(?:watch|shorts\/)/));
+    }
+    return null;
+  }
+
+  // The post or video around `start` (itself or an ancestor), if any.
+  function findEmbed(start) {
+    for (let node = start, depth = 0; node && node !== document.body && depth < 40; node = parentOf(node), depth++) {
+      if (!(node instanceof Element)) continue;
+      const url = embedOf(node);
+      if (url) return { node, url };
+    }
+    return null;
+  }
+
   function elementAtPointer() {
-    const meaningful = elementsAtPointer().filter(isMeaningful);
+    const stack = elementsAtPointer();
+    // Through empty layers (a dialog's backdrop, a transparent link), up to
+    // the first element with something of its own to show.
+    for (const node of textOnly ? [] : stack) {
+      const hit = findEmbed(node);
+      if (hit && hit.node.getBoundingClientRect().width > 0) {
+        embedTargets.set(hit.node, hit.url);
+        return hit.node;
+      }
+      if (isMeaningful(node)) break;
+    }
+    const meaningful = stack.filter(isMeaningful);
     // Prefer images under the pointer (an <img> over other image-likes).
     const images = meaningful.filter(isImage).sort((a, b) => (a.tagName === 'IMG' ? -1 : 1) - (b.tagName === 'IMG' ? -1 : 1));
     const pick = images[0] || meaningful.find((n) => MEDIA_TAGS.has(n.tagName)) || meaningful[0];
@@ -875,6 +982,12 @@
     if (m) return `https://vimeo.com/${m[1]}`;
     m = src.match(/open\.spotify\.com\/embed\/(\w+)\/(\w+)/);
     if (m) return `https://open.spotify.com/${m[1]}/${m[2]}`;
+    m = src.match(/platform\.twitter\.com\/embed\/Tweet\.html\?(?:.*&)?id=(\d+)/);
+    if (m) return `https://twitter.com/i/status/${m[1]}`;
+    m = src.match(/embed\.bsky\.app\/embed\/([^/]+)\/app\.bsky\.feed\.post\/(\w+)/);
+    if (m) return `https://bsky.app/profile/${decodeURIComponent(m[1])}/post/${m[2]}`;
+    m = src.match(/instagram\.com\/(p|reel|tv)\/([\w-]+)/);
+    if (m) return `https://www.instagram.com/${m[1]}/${m[2]}/`;
     return src;
   }
 
@@ -900,6 +1013,11 @@
       return true;
     }
     const node = target;
+    const embed = !textOnly && embedTargets.get(node);
+    if (embed) {
+      post('capture', { kind: 'element', markdown: embed, text: (textOf(node) || '').trim().slice(0, 600), rect: rectPayload(rect) });
+      return true;
+    }
     if (node.tagName === 'IFRAME') {
       // An embedded player or post: its address (the notes embed it again).
       const src = node.src || node.getAttribute('src') || '';
@@ -930,8 +1048,9 @@
 
   // ----------------------------------------------------------------- events
 
+  // ⌥, alone or with ⌘ (text only).
   function optionAlone(e) {
-    return e.altKey && !e.metaKey && !e.ctrlKey;
+    return e.altKey && !e.ctrlKey;
   }
 
   function stop(e) {
@@ -948,6 +1067,7 @@
       api.setActive(false);
       return;
     }
+    if (active && !locked && e.metaKey !== textOnly) api.setTextOnly(e.metaKey);
     if (!active || locked || !container) return;
     if (pressed && pressPoint && Math.hypot(pointer.x - pressPoint.x, pointer.y - pressPoint.y) > 4) {
       // Dragging draws a free-form area to capture as an image.
@@ -1057,7 +1177,8 @@
   });
 
   addEventListener('keydown', (e) => {
-    if (active && !locked && (e.metaKey || e.ctrlKey)) {
+    // A shortcut (⌥⌘→...), not ⌘ joining ⌥: leave the mode.
+    if (active && !locked && (e.ctrlKey || (e.metaKey && e.key !== 'Meta'))) {
       api.setActive(false);
       return;
     }
@@ -1078,6 +1199,15 @@
       if (locked || !!on === active) return;
       active = !!on;
       if (active) activate(); else deactivate();
+    },
+    // ⌘ held with ⌥: posts and videos are collected as text and images.
+    setTextOnly(on) {
+      if (textOnly === !!on) return;
+      textOnly = !!on;
+      if (active && !locked && container) {
+        target = null;
+        update();
+      }
     },
     done(message) {
       locked = false;

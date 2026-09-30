@@ -562,9 +562,10 @@ final class NoteStore {
     let source = "[\(title)](\(url))"
     if capture.kind == .page { return "- \(source)" }
 
-    // A lone image or video stands as a media block, credited below.
+    // A lone image or video, or a post or video the notes embed (its bare
+    // address), stands as a media block, credited below.
     let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-    if !trimmed.contains("\n"), trimmed.hasPrefix("!["), trimmed.hasSuffix(")") {
+    if !trimmed.contains("\n"), (trimmed.hasPrefix("![") && trimmed.hasSuffix(")")) || EmbedProvider.match(trimmed) != nil {
       return "\(trimmed)\n— \(source)"
     }
     let quoted = trimmed
