@@ -16,7 +16,7 @@ enum Theme {
   /// The top bar on the web: light gray in light mode (like Beam), the page's
   /// color in dark mode (like the notes).
   static let webBar = dynamic(
-    light: NSColor(srgbRed: 0.975, green: 0.975, blue: 0.98, alpha: 1),
+    light: NSColor(srgbRed: 0.951, green: 0.951, blue: 0.956, alpha: 1),
     dark: NSColor(srgbRed: 0.11, green: 0.11, blue: 0.12, alpha: 1))
   /// The same while the window isn't focused (a slightly darker gray in light mode, like Beam).
   static let inactiveWebBar = dynamic(
@@ -40,7 +40,7 @@ enum Theme {
     light: NSColor(white: 0, alpha: 0.1),
     dark: NSColor(white: 1, alpha: 0.2))
   static let activeTabStroke = dynamic(
-    light: NSColor(white: 0, alpha: 0.1),
+    light: NSColor(white: 0, alpha: 0.1225),
     dark: NSColor(white: 1, alpha: 0.25))
   static let pressedTabStroke = dynamic(
     light: NSColor(white: 0, alpha: 0.1),

@@ -807,7 +807,14 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
 }
 
 /// The width of the Glea window's border, left visible around the page.
-static const CGFloat kChromeWindowBorderInset = 1;
+/// How far a page window stays inside the Glea window's edges: clear of
+/// its hairline border in dark mode, which a child window would draw over.
+/// In light mode the border is outside the content, and the gap would show
+/// as a white line around the page.
+static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
+  NSAppearanceName name = [parent.effectiveAppearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua, NSAppearanceNameDarkAqua ]];
+  return [name isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
+}
 
 /// The page area (this view, or the part docked DevTools leave), on screen.
 - (NSRect)chromeWindowFrame {
@@ -822,9 +829,16 @@ static const CGFloat kChromeWindowBorderInset = 1;
   // Stay inside the Glea window's hairline border: a child window draws
   // over it.
   if (_chromeCornerRadius <= 0 && !(parent.styleMask & NSWindowStyleMaskFullScreen)) {
-    frame = NSIntersectionRect(frame, NSInsetRect(parent.frame, kChromeWindowBorderInset, kChromeWindowBorderInset));
+    CGFloat inset = ChromeWindowBorderInset(parent);
+    frame = NSIntersectionRect(frame, NSInsetRect(parent.frame, inset, inset));
   }
   return frame;
+}
+
+// Light and dark mode keep the page window at different insets.
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  [self updateChromePlacement];
 }
 
 /// Keeps the browser's window over this view, shown only while it's visible.
@@ -880,7 +894,8 @@ static const CGFloat kChromeWindowBorderInset = 1;
   if (!parent || !frameView) return;
   frameView.wantsLayer = YES;
   CALayer* layer = frameView.layer;
-  BOOL atBottom = NSMinY(_chromeWindow.window.frame) <= NSMinY(parent.frame) + kChromeWindowBorderInset + 1 &&
+  CGFloat inset = ChromeWindowBorderInset(parent);
+  BOOL atBottom = NSMinY(_chromeWindow.window.frame) <= NSMinY(parent.frame) + inset + 1 &&
                   !(parent.styleMask & NSWindowStyleMaskFullScreen);
   // The Glea window's own corner radius (larger on recent macOS).
   CGFloat windowRadius = 10;
@@ -889,7 +904,7 @@ static const CGFloat kChromeWindowBorderInset = 1;
     CGFloat value = ((CGFloat(*)(id, SEL))objc_msgSend)(parent, cornerRadius);
     if (value > 0) windowRadius = value;
   }
-  CGFloat radius = _chromeCornerRadius > 0 ? _chromeCornerRadius : (atBottom ? windowRadius - kChromeWindowBorderInset : 0);
+  CGFloat radius = _chromeCornerRadius > 0 ? _chromeCornerRadius : (atBottom ? windowRadius - inset : 0);
   CACornerMask all = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
   CACornerMask bottom = layer.geometryFlipped ? (kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner)
                                               : (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
