@@ -24,6 +24,11 @@ extension NSAttributedString.Key {
   static let gleaMediaBelow = NSAttributedString.Key("gleaMediaBelow")
   /// MarkdownTableRow: set on each rendered table row.
   static let gleaTableRow = NSAttributedString.Key("gleaTableRow")
+  /// A row of a table too wide for one line per row: its text shrinks to
+  /// nothing and the layout manager draws its cells, wrapped.
+  static let gleaTableWrapped = NSAttributedString.Key("gleaTableWrapped")
+  /// A link inside a wrapped table cell (drawn by the layout manager).
+  static let gleaCellLink = NSAttributedString.Key("gleaCellLink")
   /// Set on the content of a collapsed section: it takes no space.
   static let gleaFolded = NSAttributedString.Key("gleaFolded")
   /// The line break after a collapsed section's content. It still breaks the
@@ -59,12 +64,40 @@ final class MarkdownTableRow: NSObject {
   let isHeader: Bool
   let isFirst: Bool
   let isLast: Bool
+  /// In a wrapped table, the cells' styled text, drawn inside their column
+  /// (inset by `padding`), since the row's own text shrinks to nothing.
+  var cells: [NSAttributedString]?
+  var padding = NSSize(width: 12, height: 7)
 
   init(columnX: [CGFloat], isHeader: Bool, isFirst: Bool, isLast: Bool) {
     self.columnX = columnX
     self.isHeader = isHeader
     self.isFirst = isFirst
     self.isLast = isLast
+  }
+
+  /// Where cell `column`'s text goes, given the row's rect.
+  func cellRect(_ column: Int, in row: NSRect) -> NSRect {
+    NSRect(x: row.minX + columnX[column] - columnX[0] + padding.width, y: row.minY + padding.height,
+           width: columnX[column + 1] - columnX[column] - padding.width * 2, height: row.height - padding.height * 2)
+  }
+
+  /// The link at `point` (relative to the cell's text rect) in a wrapped cell.
+  func link(inCell column: Int, at point: NSPoint, width: CGFloat) -> Any? {
+    guard let cells, cells.indices.contains(column) else { return nil }
+    let storage = NSTextStorage(attributedString: cells[column])
+    let layout = NSLayoutManager()
+    let container = NSTextContainer(size: NSSize(width: width, height: .greatestFiniteMagnitude))
+    container.lineFragmentPadding = 0
+    layout.addTextContainer(container)
+    storage.addLayoutManager(layout)
+    layout.ensureLayout(for: container)
+    guard layout.usedRect(for: container).contains(point) else { return nil }
+    var fraction: CGFloat = 0
+    let glyph = layout.glyphIndex(for: point, in: container, fractionOfDistanceThroughGlyph: &fraction)
+    let index = layout.characterIndexForGlyph(at: glyph)
+    guard index < storage.length else { return nil }
+    return storage.attribute(.gleaCellLink, at: index, effectiveRange: nil)
   }
 }
 
@@ -95,6 +128,12 @@ struct MarkdownStyler {
   var mediaHeight: (String) -> CGFloat? = { _ in nil }
   /// Keys of the collapsed sections.
   var folded: Set<String> = []
+  /// The table the cursor is in shows as Markdown (the table / Markdown
+  /// toggle), not as a table.
+  var tableAsMarkdown = false
+  /// The wrapped table cell being edited (by its row's location and its
+  /// column): measured with its raw text, which its editor shows.
+  var editingCell: (row: Int, column: Int)?
 
   private static func regex(_ pattern: String, _ options: NSRegularExpression.Options = []) -> NSRegularExpression {
     try! NSRegularExpression(pattern: pattern, options: options)
@@ -669,6 +708,14 @@ struct MarkdownStyler {
 
   private func styleTable(_ storage: NSTextStorage, string: NSString, lines: [(line: NSRange, enclosing: NSRange)],
                           indent: CGFloat) {
+    // Switched to Markdown while the cursor is in it.
+    let editing = selection.map { sel in
+      lines.contains { NSLocationInRange(sel.location, $0.enclosing) || NSIntersectionRange(sel, $0.enclosing).length > 0 }
+    } ?? false
+    if editing && tableAsMarkdown {
+      for entry in lines { storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line) }
+      return
+    }
     let pad: CGFloat = 12
     let separatorLine = string.substring(with: lines[1].line) as NSString
     let alignments: [NSTextAlignment] = MarkdownStyler.tableCells(in: separatorLine).map { r in
@@ -696,10 +743,18 @@ struct MarkdownStyler {
         widths[c] = max(widths[c], ceil(storage.attributedSubstring(from: cell).size().width) + pad * 2)
       }
     }
-    // Too wide for the column: leave it as plain Markdown.
+    // Too wide for one line per row: cells wrap in narrower columns (and
+    // are edited one at a time, over the cell). With too little room even
+    // for that, it stays Markdown.
     let total = widths.reduce(0, +)
-    guard total <= width - indent else {
-      for entry in lines { storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line) }
+    let available = width - indent
+    guard total <= available else {
+      if available < CGFloat(columnCount) * 56 {
+        for entry in lines { storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line) }
+      } else {
+        styleWrappedTable(storage, lines: lines, rows: rows, natural: widths, available: available,
+                          alignments: alignments, indent: indent, pad: pad)
+      }
       return
     }
     var columnX: [CGFloat] = [indent]
@@ -758,6 +813,138 @@ struct MarkdownStyler {
       let tail = NSRange(location: previousEnd, length: NSMaxRange(entry.line) - previousEnd)
       if tail.length > 0 { storage.addAttributes(hidden, range: tail) }
     }
+  }
+
+  /// A table too wide for one line per row, drawn with its cells wrapping:
+  /// each row's text takes no room and its line is as tall as its tallest
+  /// cell, which the layout manager draws in its column.
+  private func styleWrappedTable(_ storage: NSTextStorage, lines: [(line: NSRange, enclosing: NSRange)],
+                                 rows: [(index: Int, cells: [NSRange])], natural: [CGFloat], available: CGFloat,
+                                 alignments: [NSTextAlignment], indent: CGFloat, pad: CGFloat) {
+    // No column narrower than its longest word (words don't break).
+    var longestWord = [CGFloat](repeating: 0, count: natural.count)
+    for row in rows {
+      for (c, cell) in row.cells.prefix(natural.count).enumerated() {
+        let text = storage.attributedSubstring(from: cell)
+        (text.string as NSString).enumerateSubstrings(in: NSRange(location: 0, length: text.length), options: .byWords) { _, word, _, _ in
+          longestWord[c] = max(longestWord[c], ceil(text.attributedSubstring(from: word).size().width) + pad * 2 + 2)
+        }
+      }
+    }
+    let minimums = longestWord.map { min(max($0, 56), available / 2) }
+    let widths = MarkdownStyler.fitColumns(natural, into: available, minimums: minimums)
+    var columnX: [CGFloat] = [indent]
+    for w in widths { columnX.append(columnX.last! + w) }
+    let vertical: CGFloat = 7
+    let lineHeight = ceil(NSLayoutManager().defaultLineHeight(for: Theme.bodyFont))
+
+    // The separator row collapses to nothing.
+    storage.addAttributes(hidden, range: lines[1].line)
+    let collapsed = NSMutableParagraphStyle()
+    collapsed.minimumLineHeight = 0.01
+    collapsed.maximumLineHeight = 0.01
+    storage.addAttribute(.paragraphStyle, value: collapsed, range: lines[1].enclosing)
+
+    for (n, row) in rows.enumerated() {
+      let entry = lines[row.index]
+      var heights: [CGFloat] = []
+      var texts: [NSAttributedString] = []
+      for c in 0..<widths.count {
+        let text = c < row.cells.count ? MarkdownStyler.cellText(storage.attributedSubstring(from: row.cells[c]),
+                                                               alignment: alignments.indices.contains(c) ? alignments[c] : .left)
+          : NSAttributedString()
+        texts.append(text)
+        // The cell being edited is as tall as its raw text, in its editor.
+        let measured = editingCell.map { $0.row == entry.line.location && $0.column == c } == true && c < row.cells.count
+          ? MarkdownStyler.cellEditingText((storage.string as NSString).substring(with: row.cells[c]), header: row.index == 0)
+          : text
+        let size = measured.boundingRect(with: NSSize(width: widths[c] - pad * 2, height: .greatestFiniteMagnitude),
+                                         options: [.usesLineFragmentOrigin, .usesFontLeading])
+        heights.append(ceil(size.height))
+      }
+      let height = max(heights.max() ?? 0, lineHeight) + vertical * 2
+      let style = NSMutableParagraphStyle()
+      style.minimumLineHeight = height
+      style.maximumLineHeight = height
+      style.firstLineHeadIndent = indent
+      style.headIndent = indent
+      storage.addAttribute(.paragraphStyle, value: style, range: entry.enclosing)
+      storage.addAttribute(.gleaSectionIndent, value: indent, range: entry.enclosing)
+      // The row's own text shrinks to nothing (it stays on its line, which
+      // keeps the row's height; null glyphs would lose their line).
+      storage.addAttributes([.gleaTableWrapped: true, .foregroundColor: NSColor.clear,
+                             .font: NSFont.systemFont(ofSize: 0.01)], range: entry.line)
+      storage.removeAttribute(.kern, range: entry.line)
+      storage.removeAttribute(.link, range: entry.line)
+      let info = MarkdownTableRow(columnX: columnX, isHeader: row.index == 0, isFirst: n == 0, isLast: n == rows.count - 1)
+      info.cells = texts
+      info.padding = NSSize(width: pad, height: vertical)
+      storage.addAttribute(.gleaTableRow, value: info, range: entry.line)
+    }
+  }
+
+  /// Column widths that fit `available`: columns narrower than an even
+  /// share keep their width, the others share what's left in proportion,
+  /// none below its minimum (its longest word).
+  static func fitColumns(_ natural: [CGFloat], into available: CGFloat, minimums: [CGFloat]) -> [CGFloat] {
+    var widths = natural
+    var open = Array(natural.indices)
+    var remaining = available
+    while !open.isEmpty {
+      let share = remaining / CGFloat(open.count)
+      let narrow = open.filter { natural[$0] <= share }
+      if narrow.isEmpty {
+        // In proportion, but a column below its minimum takes its minimum
+        // and the rest share again without it.
+        let sum = open.reduce(0) { $0 + natural[$1] }
+        let squeezed = open.filter { remaining * natural[$0] / sum < minimums[$0] }
+        if squeezed.isEmpty || squeezed.count == open.count {
+          for i in open { widths[i] = max(minimums[i], floor(remaining * natural[i] / sum)) }
+          break
+        }
+        for i in squeezed {
+          widths[i] = minimums[i]
+          remaining -= minimums[i]
+        }
+        open.removeAll { squeezed.contains($0) }
+        continue
+      }
+      for i in narrow { remaining -= natural[i] }
+      open.removeAll { narrow.contains($0) }
+    }
+    return widths
+  }
+
+  /// A wrapped cell's raw Markdown as its editor shows it.
+  static func cellEditingText(_ raw: String, header: Bool) -> NSAttributedString {
+    NSAttributedString(string: raw.isEmpty ? " " : raw, attributes: cellEditingAttributes(header: header))
+  }
+
+  static func cellEditingAttributes(header: Bool) -> [NSAttributedString.Key: Any] {
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineBreakMode = .byWordWrapping
+    paragraph.lineSpacing = 2
+    return [.font: header ? NSFont.systemFont(ofSize: Theme.bodySize, weight: .semibold) : Theme.bodyFont,
+            .foregroundColor: Theme.text, .paragraphStyle: paragraph]
+  }
+
+  /// A cell's styled text for drawing: its own paragraph (alignment, word
+  /// wrapping), links drawn in the accent color and kept for clicks.
+  static func cellText(_ styled: NSAttributedString, alignment: NSTextAlignment) -> NSAttributedString {
+    let text = NSMutableAttributedString(attributedString: styled)
+    let full = NSRange(location: 0, length: text.length)
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.alignment = alignment
+    paragraph.lineBreakMode = .byWordWrapping
+    paragraph.lineSpacing = 2
+    text.addAttribute(.paragraphStyle, value: paragraph, range: full)
+    text.enumerateAttribute(.link, in: full) { value, range, _ in
+      guard let value else { return }
+      text.removeAttribute(.link, range: range)
+      text.addAttributes([.gleaCellLink: value, .foregroundColor: Theme.accent], range: range)
+    }
+    for key in [NSAttributedString.Key.gleaTableRow, .gleaTableWrapped, .gleaSectionIndent] { text.removeAttribute(key, range: full) }
+    return text
   }
 
   /// Styles links, emphasis, code and images inside one line. Returns the
@@ -832,20 +1019,26 @@ struct MarkdownStyler {
       }
     }
 
-    for m in MarkdownStyler.bold.matches(in: line, range: local) where free(m.range) {
+    // Emphasis may wrap links and code (**[[Note]]**), as long as they sit
+    // wholly inside it, clear of its markers.
+    func wraps(_ outer: NSRange, inner: NSRange) -> Bool {
+      taken.allSatisfy { NSIntersectionRange($0, outer).length == 0 || NSIntersectionRange($0, inner) == $0 }
+    }
+    for m in MarkdownStyler.bold.matches(in: line, range: local) where wraps(m.range, inner: m.range(at: 2)) {
       construct = m.range
       addTrait(.boldFontMask, to: storage, range: abs(m.range(at: 2)))
       let markerLength = m.range(at: 1).length
       syntax(NSRange(location: m.range.location, length: markerLength))
       syntax(NSRange(location: m.range.upperBound - markerLength, length: markerLength))
     }
-    for m in MarkdownStyler.italic.matches(in: line, range: local) where free(m.range) {
+    for m in MarkdownStyler.italic.matches(in: line, range: local)
+      where wraps(m.range, inner: NSRange(location: m.range.location + 1, length: m.range.length - 2)) {
       construct = m.range
       addTrait(.italicFontMask, to: storage, range: abs(NSRange(location: m.range.location + 1, length: m.range.length - 2)))
       syntax(NSRange(location: m.range.location, length: 1))
       syntax(NSRange(location: m.range.upperBound - 1, length: 1))
     }
-    for m in MarkdownStyler.strike.matches(in: line, range: local) where free(m.range) {
+    for m in MarkdownStyler.strike.matches(in: line, range: local) where wraps(m.range, inner: m.range(at: 1)) {
       construct = m.range
       storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: abs(m.range(at: 1)))
       syntax(NSRange(location: m.range.location, length: 2))
@@ -873,6 +1066,10 @@ struct MarkdownStyler {
 // MARK: - Layout manager
 
 final class MarkdownLayoutManager: NSLayoutManager {
+  /// The wrapped table cell being edited (its editor shows it instead), by
+  /// its row's location and its column.
+  var hiddenCell: (row: Int, column: Int)?
+
   override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
     super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
     guard let storage = textStorage, let container = textContainers.first else { return }
@@ -981,6 +1178,13 @@ final class MarkdownLayoutManager: NSLayoutManager {
       enumerateLineFragments(forGlyphRange: glyphs) { lineRect, _, _, _, _ in rect = rect.union(lineRect) }
       guard !rect.isNull else { return }
       rect = NSRect(x: origin.x + left, y: origin.y + rect.minY, width: right - left, height: rect.height)
+      let cells = rect
+      // The outline's stroke is centered on its path: inset the table's outer
+      // edges by half of it, or the text view clips that half (the left and
+      // right borders, flush with the column, looked cropped).
+      rect = rect.insetBy(dx: 0.5, dy: 0)
+      if row.isFirst { rect.origin.y += 0.5; rect.size.height -= 0.5 }
+      if row.isLast { rect.size.height -= 0.5 }
       let radius: CGFloat = 6
       NSGraphicsContext.saveGraphicsState()
       // Clip rows to the table's rounded outline.
@@ -1007,6 +1211,11 @@ final class MarkdownLayoutManager: NSLayoutManager {
       for x in row.columnX.dropFirst().dropLast() {
         NSRect(x: origin.x + x - 0.5, y: rect.minY, width: 1, height: rect.height).fill()
       }
+      // A wrapped table's cells (the row's own text takes no room).
+      for (column, text) in (row.cells ?? []).enumerated() where column + 1 < row.columnX.count {
+        if let hidden = hiddenCell, hidden.row == range.location, hidden.column == column { continue }
+        text.draw(with: row.cellRect(column, in: cells), options: [.usesLineFragmentOrigin, .usesFontLeading])
+      }
       NSGraphicsContext.restoreGraphicsState()
     }
 
@@ -1030,10 +1239,6 @@ final class MarkdownLayoutManager: NSLayoutManager {
 /// null, their line breaks don't break, and the one line fragment they end
 /// up in has no height.
 final class FoldingLayoutDelegate: NSObject, NSLayoutManagerDelegate {
-  /// Height for a collapsed section while it animates, added below its
-  /// heading's line, by the heading's location.
-  var animatedHeights: [Int: CGFloat] = [:]
-
   private func isFolded(_ layoutManager: NSLayoutManager, _ index: Int) -> Bool {
     guard let storage = layoutManager.textStorage, index < storage.length else { return false }
     return storage.attribute(.gleaFolded, at: index, effectiveRange: nil) != nil
@@ -1062,10 +1267,6 @@ final class FoldingLayoutDelegate: NSObject, NSLayoutManagerDelegate {
                      lineFragmentUsedRect: UnsafeMutablePointer<NSRect>, baselineOffset: UnsafeMutablePointer<CGFloat>,
                      in textContainer: NSTextContainer, forGlyphRange glyphRange: NSRange) -> Bool {
     let start = layoutManager.characterIndexForGlyph(at: glyphRange.location)
-    if let extra = animatedHeights[start] {
-      lineFragmentRect.pointee.size.height += extra
-      return true
-    }
     let height: CGFloat
     if isFolded(layoutManager, start) {
       height = 0
@@ -1095,9 +1296,6 @@ final class NoteGutterView: NSView {
     var indent: CGFloat = 0
     /// How open the section is, from 0 to 1: turns the chevron.
     var openness: CGFloat = 1
-    var alpha: CGFloat = 1
-    /// Drawn only above this (inside a section that is opening or closing).
-    var clipBottom: CGFloat = .greatestFiniteMagnitude
   }
 
   /// A draggable block: the band of lines it covers, and the center of its
@@ -1150,6 +1348,41 @@ final class NoteGutterView: NSView {
 
   override var isFlipped: Bool { true }
 
+  /// Chevrons turning as their section folds or unfolds: from how open, to
+  /// how open, since when.
+  private var turns: [String: (from: CGFloat, to: CGFloat, start: CFTimeInterval)] = [:]
+  private var turnTimer: Timer?
+
+  func turnChevron(_ key: String, open: Bool) {
+    let to: CGFloat = open ? 1 : 0
+    turns[key] = (turnedOpenness(key) ?? 1 - to, to, CACurrentMediaTime())
+    guard turnTimer == nil, !Motion.reduceMotion else { return }
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.stepTurns() }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    turnTimer = timer
+  }
+
+  private func turnedOpenness(_ key: String) -> CGFloat? {
+    guard let turn = turns[key] else { return nil }
+    let t = min(1, (CACurrentMediaTime() - turn.start) / Motion.foldDuration)
+    return turn.from + (turn.to - turn.from) * CGFloat(CubicBezier.fold(t))
+  }
+
+  /// Redraws just the turning chevrons.
+  private func stepTurns() {
+    let now = CACurrentMediaTime()
+    for item in items where turns[item.key] != nil {
+      setNeedsDisplay(chevronRect(item).insetBy(dx: -4, dy: -4))
+    }
+    turns = turns.filter { now - $0.value.start < Motion.foldDuration + 0.05 }
+    if turns.isEmpty {
+      turnTimer?.invalidate()
+      turnTimer = nil
+    }
+  }
+
   private func chevronRect(_ item: Item) -> NSRect {
     NSRect(x: NoteGutterView.width - 23 + item.indent, y: item.centerY - 9, width: 18, height: 18)
   }
@@ -1159,7 +1392,7 @@ final class NoteGutterView: NSView {
   }
 
   private func chevron(at point: NSPoint) -> Item? {
-    items.first { $0.alpha == 1 && chevronRect($0).insetBy(dx: -3, dy: -3).contains(point) }
+    items.first { chevronRect($0).insetBy(dx: -3, dy: -3).contains(point) }
   }
 
   private func grip(at point: NSPoint) -> Handle? {
@@ -1289,6 +1522,28 @@ final class NoteGutterView: NSView {
     NSCursor.arrow.set()
   }
 
+  /// The chevron, plain and hovered (made once: making symbol images is
+  /// slow, and pages have many headings).
+  private var chevronImages: [Bool: NSImage] = [:]
+  private var chevronAppearance: NSAppearance.Name?
+
+  private func chevronImage(over: Bool) -> NSImage? {
+    let appearance = effectiveAppearance.name
+    if chevronAppearance != appearance {
+      chevronImages = [:]
+      chevronAppearance = appearance
+    }
+    if let image = chevronImages[over] { return image }
+    var image: NSImage?
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        .applying(.init(paletteColors: [(over ? Theme.text : Theme.secondaryText).usingColorSpace(.sRGB) ?? .gray]))
+      image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    }
+    chevronImages[over] = image
+    return image
+  }
+
   override func draw(_ dirtyRect: NSRect) {
     let mouse = window.map { convert($0.mouseLocationOutsideOfEventStream, from: nil) }
     if let dropY {
@@ -1311,21 +1566,18 @@ final class NoteGutterView: NSView {
     }
     for item in items where !(hiddenBand?.contains(item.centerY) ?? false) {
       let rect = chevronRect(item)
+      guard rect.insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
       let over = mouse.map { rect.insetBy(dx: -3, dy: -3).contains($0) } ?? false
-      let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-        .applying(.init(paletteColors: [over ? Theme.text : Theme.secondaryText]))
-      guard let image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: item.collapsed ? "Expand" : "Collapse")?
-        .withSymbolConfiguration(config) else { continue }
+      guard let image = chevronImage(over: over) else { continue }
       let size = image.size
       NSGraphicsContext.saveGraphicsState()
-      NSRect(x: 0, y: 0, width: bounds.width, height: min(bounds.height, max(0, item.clipBottom))).clip()
       // Turns from right (collapsed) to down (open) as the section opens.
       let turn = NSAffineTransform()
       turn.translateX(by: rect.midX, yBy: rect.midY)
-      turn.rotate(byDegrees: 90 * item.openness)
+      turn.rotate(byDegrees: 90 * (turnedOpenness(item.key) ?? item.openness))
       turn.concat()
       image.draw(in: NSRect(x: -size.width / 2, y: -size.height / 2, width: size.width, height: size.height),
-                 from: .zero, operation: .sourceOver, fraction: item.alpha, respectFlipped: true, hints: nil)
+                 from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
       NSGraphicsContext.restoreGraphicsState()
     }
   }
@@ -1334,6 +1586,10 @@ final class NoteGutterView: NSView {
 // MARK: - Text view
 
 final class MarkdownTextView: NSTextView {
+  /// A click in a wrapped table's cell (its row's location, its column):
+  /// the cell's own field takes it.
+  var onEditCell: ((_ row: Int, _ column: Int, _ event: NSEvent) -> Void)?
+
   /// Kept between the cursor and the page's top or bottom edge as it moves.
   private static let caretMargin: CGFloat = 40
 
@@ -1470,10 +1726,34 @@ final class MarkdownTextView: NSTextView {
     if text.hasSuffix("\n") { text.removeLast() }
     let cells = MarkdownStyler.tableCells(in: text as NSString).map { NSRange(location: $0.location + line.location, length: $0.length) }
     guard column < cells.count else { return false }
+    // A link in a wrapped cell opens; elsewhere the click edits the table.
+    if row.cells != nil {
+      let rowRect = NSRect(x: row.columnX[0], y: lineRect.minY, width: (row.columnX.last ?? 0) - row.columnX[0], height: lineRect.height)
+      let cellRect = row.cellRect(column, in: rowRect)
+      let local = NSPoint(x: p.x - cellRect.minX, y: p.y - cellRect.minY)
+      if let link = row.link(inCell: column, at: local, width: cellRect.width) {
+        _ = delegate?.textView?(self, clickedOnLink: link, at: rowRange.location)
+        return true
+      }
+    }
+    // A wrapped cell: its field places the cursor where it was clicked (and
+    // drags select), without this view's cursor showing in the row first.
+    if row.cells != nil, let onEditCell {
+      onEditCell(line.location, column, event)
+      return true
+    }
     let cell = cells[column]
     window?.makeFirstResponder(self)
     let hit = characterIndexForInsertion(at: point)
-    setSelectedRange(NSRange(location: hit >= cell.location && hit <= NSMaxRange(cell) ? hit : NSMaxRange(cell), length: 0))
+    let inCell = NSRange(location: hit >= cell.location && hit <= NSMaxRange(cell) ? hit : NSMaxRange(cell), length: 0)
+    if row.cells == nil {
+      // A table that fits: AppKit's own click handling, so dragging selects
+      // text; a plain click then lands in the cell that was clicked.
+      super.mouseDown(with: event)
+      if selectedRange().length == 0 { setSelectedRange(inCell) }
+      return true
+    }
+    setSelectedRange(inCell)
     return true
   }
 
@@ -1813,53 +2093,10 @@ enum BlockDragDebug {
   static var liftDuration: CFTimeInterval = 0.2
 }
 
-@MainActor
-final class FoldAnimation {
-  let body: NSRange
-  /// The heading's location: its line takes the animated height.
-  let heading: Int
-  let height: CGFloat
-  let overlay: NSView
-  var timer: Timer?
-  /// Chevrons of the headings inside, and frames of its media blocks, where
-  /// they are open.
-  var nestedItems: [NoteGutterView.Item] = []
-  var mediaFrames: [String: NSRect] = [:]
-  /// How much of the content shows, from 0 to 1.
-  var shown: CGFloat
-  /// The current leg: from `from` to open or closed. Toggling again starts
-  /// a new leg from wherever the content is.
-  private(set) var collapsing: Bool
-  private var from: CGFloat
-  private var began = CACurrentMediaTime()
-  private var duration: CFTimeInterval = FoldAnimation.fullDuration
-  /// A variable so automated checks can slow it down.
-  static var fullDuration: CFTimeInterval = 0.28
-
-  init(heading: Int, body: NSRange, height: CGFloat, collapsing: Bool, overlay: NSView) {
-    self.heading = heading
-    self.body = body
-    shown = collapsing ? 1 : 0
-    from = shown
-    self.height = height
-    self.collapsing = collapsing
-    self.overlay = overlay
-  }
-
-  func reverse() {
-    collapsing.toggle()
-    from = shown
-    began = CACurrentMediaTime()
-    duration = FoldAnimation.fullDuration * Double(collapsing ? shown : 1 - shown)
-  }
-
-  /// Where the content should be now, and whether the leg is over.
-  func step() -> (shown: CGFloat, done: Bool) {
-    let t = duration > 0 ? min(1, (CACurrentMediaTime() - began) / duration) : 1
-    let eased = CGFloat(1 - pow(1 - t, 3))
-    let to: CGFloat = collapsing ? 0 : 1
-    return (from + (to - from) * eased, t >= 1)
-  }
+/// What covers the page while it slides (see `slidePage`): only seen, the
+/// pointer goes through to the text under it.
+final class SlideOverlayView: FlippedView {
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 private extension NSView {
@@ -1898,9 +2135,11 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     get { MarkdownEditorView.foldedByNote[ref.id] ?? [] }
     set { MarkdownEditorView.foldedByNote[ref.id] = newValue }
   }
-  /// Sections animating open or closed: laid out as collapsed, with a
-  /// changing height, under a snapshot of their content.
-  private var foldAnimations: [String: FoldAnimation] = [:]
+  /// What follows a change of height sliding into place (see `slidePage`).
+  private var slide: Slide?
+  /// Media blocks of a section closing, kept where they were open (in the
+  /// page) until it's closed.
+  private var closingMedia: [String: NSRect] = [:]
   private var saveWork: DispatchWorkItem?
   private var styledSelection: NSRange?
   /// Floating formatting bar, hosted in the window's content view.
@@ -1922,6 +2161,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     container.lineFragmentPadding = 0
     storage.addLayoutManager(layoutManager)
     layoutManager.delegate = foldingDelegate
+    // Only what changed is laid out again: an embed growing or a section
+    // folding doesn't retypeset the whole note below it.
+    layoutManager.allowsNonContiguousLayout = true
     layoutManager.addTextContainer(container)
     textView = MarkdownTextView(frame: NSRect(x: 0, y: 0, width: 600, height: 30), textContainer: container)
     super.init(frame: NSRect(x: 0, y: 0, width: 600, height: 30))
@@ -1945,13 +2187,20 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     textView.linkTextAttributes = [.foregroundColor: Theme.accent, .cursor: NSCursor.pointingHand]
     textView.typingAttributes = MarkdownStyler.baseAttributes
     textView.delegate = self
+    textView.onEditCell = { [weak self] row, column, event in self?.editCell(row: row, column: column, clicked: event) }
     // (Not this note: a link to itself goes nowhere.)
     textView.noteNames = { [weak self] in NoteStore.shared.noteNames.filter { $0 != self?.ref.name } }
     textView.onFocusChange = { [weak self] focused in
       // Once focus has moved: while resigning, the window still counts the
       // text view as focused, and restyling then restarts its caret (two
       // would blink in the journal).
-      DispatchQueue.main.async { self?.restyle() }
+      // Only around the cursor, where syntax shows or hides (the whole of a
+      // long note took a while).
+      DispatchQueue.main.async {
+        guard let self else { return }
+        let current = self.textView.selectedRange()
+        self.restyle(limit: self.styledSelection.map { NSUnionRange($0, current) } ?? current)
+      }
       if !focused { self?.formatBar.hide() }
     }
     formatBar.textView = textView
@@ -1984,6 +2233,19 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    // The table toggle shows while the pointer is over a table, or over the
+    // toggle itself (in the page's gutter, outside this view).
+    if let hoverArea {
+      hoverAreaHost?.removeTrackingArea(hoverArea)
+      self.hoverArea = nil
+    }
+    if window != nil, let host = mediaHost {
+      let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                owner: self)
+      host.addTrackingArea(area)
+      hoverArea = area
+      hoverAreaHost = host
+    }
     if window == nil {
       for view in mediaViews.values { view.removeFromSuperview() }
       mediaViews = [:]
@@ -2009,6 +2271,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     } else {
       formatBar.removeFromSuperview()
     }
+    // Selected blocks go gray with the text's selection when the window
+    // isn't key.
+    for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+      NotificationCenter.default.removeObserver(self, name: name, object: nil)
+      if let window { NotificationCenter.default.addObserver(self, selector: #selector(windowKeyChanged), name: name, object: window) }
+    }
     // The bar follows the text when the page scrolls.
     NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
     if let clip = enclosingScrollView?.contentView {
@@ -2019,7 +2287,16 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   @objc private func pageScrolled() {
     formatBar.reposition(animated: false)
+    // Scrolled under a still pointer.
+    if let window, hoverArea != nil { updateTableHover(window.mouseLocationOutsideOfEventStream) }
   }
+
+  private var hoverArea: NSTrackingArea?
+  private weak var hoverAreaHost: NSView?
+
+  override func mouseMoved(with event: NSEvent) { updateTableHover(event.locationInWindow) }
+  override func mouseEntered(with event: NSEvent) { updateTableHover(event.locationInWindow) }
+  override func mouseExited(with event: NSEvent) { updateTableHover(nil) }
 
   var content: String { textView.string }
 
@@ -2085,12 +2362,14 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     let length = storage.length
     var clampedLimit = limit.map { NSRange(location: min($0.location, length), length: min($0.length, length - min($0.location, length))) }
     // Layout can't restart inside a collapsed section (its line breaks
-    // don't break): restyle whole when the lines touch one.
-    let collapsed = folded.union(foldAnimations.keys)
+    // don't break): restyle whole when the lines start or end in one.
+    let collapsed = folded
     if let limit = clampedLimit, !collapsed.isEmpty {
       let lines = (storage.string as NSString).paragraphRange(for: limit)
       if MarkdownStyler.headingSections(in: storage.string as NSString).contains(where: {
-        collapsed.contains($0.key) && NSIntersectionRange(NSRange(location: $0.body.location, length: $0.body.length + 1), lines).length > 0
+        let body = NSRange(location: $0.body.location, length: $0.body.length + 1)
+        return collapsed.contains($0.key) && NSIntersectionRange(body, lines).length > 0
+          && !(lines.location <= $0.heading.location && NSMaxRange(lines) >= NSMaxRange(body))
       }) {
         clampedLimit = nil
       }
@@ -2100,7 +2379,10 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       width: max(100, bounds.width),
       selection: selection)
     styler.mediaHeight = { [weak self] key in self?.mediaViews[key]?.blockHeight }
-    styler.folded = folded.union(foldAnimations.keys)
+    styler.folded = folded
+    styler.tableAsMarkdown = tableAsMarkdown
+    styler.editingCell = cellEditing
+    layoutManager.hiddenCell = cellEditing
     styler.apply(to: storage, limit: clampedLimit)
     textView.typingAttributes = MarkdownStyler.baseAttributes
     updateHeight()
@@ -2112,72 +2394,88 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     }
     layoutFoldGutter()
     textView.needsDisplay = true
+    layoutTableEditing()
+    placedFrame = mediaHost.map { convert(bounds, to: $0) }
+    updateMediaSelection()
   }
+
+  /// Media blocks whose line is in the selection show selected.
+  private func updateMediaSelection() {
+    let selection = textView.selectedRange()
+    let emphasized = window?.isKeyWindow == true && window?.firstResponder === textView
+    for (key, view) in mediaViews {
+      view.setSelected(selection.length > 0 && mediaLines[key].map { NSIntersectionRange(selection, $0).length > 0 } == true,
+                       emphasized: emphasized)
+    }
+  }
+
+  @objc private func windowKeyChanged() { updateMediaSelection() }
 
   // MARK: Folding
 
   func toggleFold(_ key: String) {
     let collapsing = !folded.contains(key)
-    if collapsing { folded.insert(key) } else { folded.remove(key) }
-    // Toggled again mid-animation: turn back from where it is.
-    if let running = foldAnimations[key] {
-      running.reverse()
-      layoutFoldGutter()
-      return
-    }
-    guard !Motion.reduceMotion,
-          let section = MarkdownStyler.headingSections(in: storage.string as NSString).first(where: { $0.key == key }),
-          section.body.length > 0 else {
+    let section = MarkdownStyler.headingSections(in: storage.string as NSString).first(where: { $0.key == key })
+    gutter.turnChevron(key, open: !collapsing)
+    guard !Motion.reduceMotion, window != nil, let host = mediaHost, let section, section.body.length > 0,
+          let before = lineTopAfter(section, in: screenLayout) else {
+      if collapsing { folded.insert(key) } else { folded.remove(key) }
       restyle()
       return
     }
-    // Measure and snapshot the section open in a copy laid out off screen:
-    // laying out the page itself open, even briefly, can reach the screen.
-    let others = folded.union(foldAnimations.keys).subtracting([key])
-    guard let layout = offscreenLayout(collapsed: others),
-          let open = bodyRect(section, in: layout),
-          let closed = offscreenLayout(collapsed: others.union([key])),
-          let belowOpen = lineTopAfter(section, in: layout),
-          let belowClosed = lineTopAfter(section, in: closed) else {
-      restyle()
-      return
-    }
-    let snapshot = NSImageView(image: layout.textView.snapshot(of: open))
-    snapshot.imageScaling = .scaleNone
-    snapshot.imageAlignment = .alignTop
-    snapshot.frame = NSRect(origin: .zero, size: open.size)
-    let clip = FlippedView(frame: open)
-    clip.wantsLayer = true
-    clip.layer?.masksToBounds = true
-    clip.addSubview(snapshot)
-    textView.addSubview(clip)
-
-    // The height to add under the heading: what the section's content moves
-    // the next line by (the heading's own line isn't quite the same open and
-    // collapsed).
-    let animation = FoldAnimation(heading: section.heading.location, body: section.body, height: belowOpen - belowClosed,
-                                  collapsing: collapsing, overlay: clip)
-    animation.nestedItems = gutterItems(within: section.body, in: layout)
-    animation.mediaFrames = mediaFrames(within: section.body, in: layout)
-    foldAnimations[key] = animation
-    foldingDelegate.animatedHeights[animation.heading] = collapsing ? animation.height : 0
-    restyle()
-    // Start from where the content is (closed when expanding), before the
-    // first frame can show the snapshot whole.
-    setFoldAnimationHeight(animation, shown: animation.shown)
-    animation.timer = Timer.scheduledTimer(withTimeInterval: 1 / 120, repeats: true) { [weak self] timer in
-      MainActor.assumeIsolated {
-        guard let self else { return timer.invalidate() }
-        let (shown, done) = animation.step()
-        if done {
-          timer.invalidate()
-          self.finishFoldAnimation(key)
-        } else {
-          self.setFoldAnimationHeight(animation, shown: shown)
-        }
+    // Closing: what the section shows stays as a snapshot over the page,
+    // fading, its blocks where they are, until what follows slides over it.
+    var overlays: [NSView] = []
+    var cut: [MediaBlockView] = []
+    if collapsing, let open = bodyRect(section, in: screenLayout) {
+      let rect = textView.convert(open, to: host)
+      overlays.append(pageSnapshot(of: NSRect(x: gutter.frame.minX, y: rect.minY, width: gutter.frame.width, height: rect.height),
+                                   in: host, opaque: false))
+      for (key, view) in mediaViews where view.alphaValue > 0 {
+        guard let line = mediaLines[key], NSLocationInRange(line.location, section.body) else { continue }
+        closingMedia[key] = view.frame
+        cut.append(view)
       }
     }
-    RunLoop.main.add(animation.timer!, forMode: .common)
+    if collapsing { folded.insert(key) } else { folded.remove(key) }
+    // Just the section: the rest of the page doesn't change.
+    restyle(limit: NSRange(location: section.heading.location,
+                           length: min(storage.length, NSMaxRange(section.body) + 1) - section.heading.location))
+    host.layoutSubtreeIfNeeded()
+    guard let after = lineTopAfter(section, in: screenLayout) else {
+      closingMedia = [:]
+      layoutMediaViews()
+      return
+    }
+    // Opening: the section shows where it goes, under a veil that fades, its
+    // blocks revealed as what follows slides down past them.
+    if !collapsing, let open = bodyRect(section, in: screenLayout) {
+      let rect = textView.convert(open, to: host)
+      let veil = SlideOverlayView(frame: NSRect(x: gutter.frame.minX, y: rect.minY, width: gutter.frame.width, height: rect.height))
+      veil.wantsLayer = true
+      veil.layer?.backgroundColor = resolvedCGColor(Theme.background)
+      overlays.append(veil)
+      for (key, view) in mediaViews {
+        guard let line = mediaLines[key], NSLocationInRange(line.location, section.body) else { continue }
+        cut.append(view)
+      }
+    }
+    for overlay in overlays {
+      overlay.wantsLayer = true
+      overlay.alphaValue = 0
+      let fade = CABasicAnimation(keyPath: "opacity")
+      fade.fromValue = 1
+      fade.toValue = 0
+      fade.duration = Motion.foldDuration
+      fade.timingFunction = CubicBezier.fold.timingFunction
+      overlay.layer?.add(fade, forKey: "glea.fold.fade")
+    }
+    slidePage(below: after, from: before - after, duration: Motion.foldDuration, curve: .fold,
+              overlays: overlays, cut: cut, fadingIn: !collapsing) { [weak self] in
+      guard let self, !self.closingMedia.isEmpty else { return }
+      self.closingMedia = [:]
+      self.layoutMediaViews()
+    }
   }
 
   /// The page's text as laid out: on screen, or a copy off screen.
@@ -2191,34 +2489,6 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   private var screenLayout: TextLayout {
     TextLayout(storage: storage, layoutManager: layoutManager, textView: textView)
-  }
-
-  /// A copy of the text styled and laid out with `keys` collapsed, in a text
-  /// view that isn't on screen: what the page will look like.
-  private func offscreenLayout(collapsed keys: Set<String>) -> TextLayout? {
-    guard let source = textView.textContainer else { return nil }
-    let copy = NSTextStorage(string: storage.string)
-    let manager = MarkdownLayoutManager()
-    let delegate = FoldingLayoutDelegate()
-    manager.delegate = delegate
-    copy.addLayoutManager(manager)
-    let container = NSTextContainer(size: NSSize(width: source.size.width, height: CGFloat.greatestFiniteMagnitude))
-    container.lineFragmentPadding = source.lineFragmentPadding
-    manager.addTextContainer(container)
-    let view = MarkdownTextView(frame: textView.frame, textContainer: container)
-    view.drawsBackground = false
-    view.textContainerInset = textView.textContainerInset
-    view.appearance = textView.effectiveAppearance
-    var styler = MarkdownStyler(
-      baseDirectory: NoteStore.shared.fileURL(for: ref).deletingLastPathComponent(),
-      width: max(100, bounds.width),
-      selection: styledSelection)
-    styler.mediaHeight = { [weak self] key in self?.mediaViews[key]?.blockHeight }
-    styler.folded = keys
-    styler.apply(to: copy)
-    manager.ensureLayout(for: container)
-    view.frame.size.height = max(textView.frame.height, manager.usedRect(for: container).maxY + 200)
-    return TextLayout(storage: copy, layoutManager: manager, textView: view, delegate: delegate)
   }
 
   /// The section's content, laid out open, in text view coordinates: from
@@ -2251,29 +2521,6 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   }
 
 
-  private func setFoldAnimationHeight(_ animation: FoldAnimation, shown: CGFloat) {
-    let height = animation.height * shown
-    animation.shown = shown
-    foldingDelegate.animatedHeights[animation.heading] = height
-    // The whole text: partial layout arranges a collapsed section's lines
-    // differently, which would make the height land elsewhere.
-    layoutManager.invalidateLayout(forCharacterRange: NSRange(location: 0, length: storage.length), actualCharacterRange: nil)
-    animation.overlay.frame.size.height = height
-    animation.overlay.alphaValue = shown
-    updateHeight()
-    _ = layoutMediaViews()
-    layoutFoldGutter()
-    textView.needsDisplay = true
-  }
-
-
-  private func finishFoldAnimation(_ key: String) {
-    guard let animation = foldAnimations.removeValue(forKey: key) else { return }
-    foldingDelegate.animatedHeights[animation.heading] = nil
-    animation.overlay.removeFromSuperview()
-    restyle()
-  }
-
   /// Expands the collapsed sections containing the character at `index`.
   func reveal(_ index: Int) {
     unfold(around: NSRange(location: index, length: 0))
@@ -2298,29 +2545,18 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       gutter.removeFromSuperview()
       return
     }
-    if gutter.superview !== host { host.addSubview(gutter) }
+    if gutter.superview !== host {
+      // Over the page's column, under the blocks (and what slides, see
+      // `slidePage`).
+      var column: NSView = self
+      while let superview = column.superview, superview !== host { column = superview }
+      host.addSubview(gutter, positioned: .above, relativeTo: column.superview === host ? column : nil)
+    }
     let rect = convert(bounds, to: host)
     gutter.frame = NSRect(x: rect.minX - NoteGutterView.width, y: rect.minY,
                               width: rect.width + NoteGutterView.width, height: rect.height)
     layoutManager.ensureLayout(for: container)
-    var items = gutterItems().map { item in
-      var item = item
-      item.openness = foldAnimations[item.key]?.shown ?? (item.collapsed ? 0 : 1)
-      return item
-    }
-    // Headings inside an animating section keep their place from the open
-    // layout, fading and cut off with the section.
-    for animation in foldAnimations.values {
-      let bottom = textView.frame.minY + animation.overlay.frame.maxY
-      items += animation.nestedItems.map { item in
-        var item = item
-        item.openness = item.collapsed ? 0 : 1
-        item.alpha = animation.shown
-        item.clipBottom = bottom
-        return item
-      }
-    }
-    gutter.items = items
+    gutter.items = gutterItems()
     layoutBlockHandles()
   }
 
@@ -2421,7 +2657,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     guard blockDrag == nil else { return }
     lineRanges = computeLineRanges()
     blocks = MarkdownStyler.blocks(in: storage.string)
-    guard storage.length > 0, foldAnimations.isEmpty else {
+    guard storage.length > 0 else {
       gutter.handles = []
       return
     }
@@ -2756,7 +2992,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         line: NSRect(x: 0, y: y + line.minY, width: gutter.frame.width, height: line.height),
         centerY: y + baseline - font.capHeight / 2,
         collapsed: current.contains(section.key),
-        indent: indent)
+        indent: indent,
+        openness: current.contains(section.key) ? 0 : 1)
     }
   }
 
@@ -2780,7 +3017,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       } else {
         view = MediaBlockView(descriptor: media, noteID: ref.id)
         let key = media.key
-        view.onHeightChange = { [weak self] in self?.mediaHeightChanged(key) }
+        view.onHeightChange = { [weak self] old in self?.mediaHeightChanged(key, from: old) }
         view.onOpenURL = { [weak self] url in
           // (After the event: opening a note may free this editor and its embeds.)
           guard let open = self?.onOpenLink else { return }
@@ -2792,34 +3029,17 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       }
       // In a collapsed section the block stays loaded, transparent and out of
       // the way (not hidden: a hidden embed stops drawing, and would take a
-      // moment to show again). While the section opens or closes, it stays
-      // where it is open, fading and cut off with the text.
+      // moment to show again). While the section closes, it stays where it
+      // was, fading and cut off with the text (see `toggleFold`).
       let isFolded = storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) != nil
-      if isFolded, let closing = foldAnimations.values.first(where: { NSLocationInRange(range.location, $0.body) }) {
-        view.alphaValue = closing.shown
-        if let open = closing.mediaFrames[media.key] {
-          view.frame = mediaHost.map { textView.convert(open, to: $0) } ?? open
-        }
-        // Cut off where the closing section ends, like its text.
-        if let host = view.superview, let layer = view.layer {
-          let bottom = closing.overlay.convert(closing.overlay.bounds, to: host).maxY
-          let visible = min(view.frame.height, max(0, bottom - view.frame.minY))
-          let mask = layer.mask ?? CALayer()
-          mask.backgroundColor = NSColor.black.cgColor
-          CATransaction.begin()
-          CATransaction.setDisableActions(true)
-          mask.frame = layer.contentsAreFlipped()
-            ? CGRect(x: 0, y: 0, width: view.frame.width, height: visible)
-            : CGRect(x: 0, y: view.frame.height - visible, width: view.frame.width, height: visible)
-          layer.mask = mask
-          CATransaction.commit()
-        }
+      if isFolded, let open = closingMedia[media.key] {
+        view.alphaValue = 0
+        view.frame = open
         return
       }
       // Being dragged: it follows the pointer.
       if blockDrag?.media[media.key] != nil { return }
       view.alphaValue = isFolded ? 0 : 1
-      view.layer?.mask = nil
       let rect = mediaFrame(media, line: range, in: screenLayout)
       let top = rect.minY - textView.textContainerOrigin.y
       view.availableWidth = rect.width - MediaBlockView.gutterWidth
@@ -2856,28 +3076,52 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
                   height: max(mediaViews[media.key]?.blockHeight ?? 0, MediaBlockView.rowHeight))
   }
 
-  /// Where the media blocks inside `range` go in `layout`, by key.
-  private func mediaFrames(within range: NSRange, in layout: TextLayout) -> [String: NSRect] {
-    var frames: [String: NSRect] = [:]
-    layout.storage.enumerateAttribute(.gleaMedia, in: range) { value, line, _ in
-      guard let media = value as? MediaDescriptor, frames[media.key] == nil else { return }
-      frames[media.key] = mediaFrame(media, line: line, in: layout)
-    }
-    return frames
-  }
-
   /// Blocks live in the page (not the text view) so their gutter toggle isn't
   /// clipped; they follow the editor as it moves.
   private var mediaHost: NSView? { enclosingScrollView?.documentView }
 
+  /// Where this editor was in the page when its blocks, gutter and table
+  /// toggle were last placed.
+  private var placedFrame: NSRect?
+
   @objc private func editorMoved() {
+    guard let host = mediaHost else { return }
+    let frame = convert(bounds, to: host)
+    // Only moved (something above it changed height): its views move along,
+    // nothing is laid out again.
+    if let placed = placedFrame, placed.size == frame.size, slide == nil {
+      let dx = frame.minX - placed.minX, dy = frame.minY - placed.minY
+      guard dx != 0 || dy != 0 else { return }
+      for view in mediaViews.values where view.frame.minX > -50_000 {
+        view.frame = view.frame.offsetBy(dx: dx, dy: dy)
+      }
+      gutter.frame = gutter.frame.offsetBy(dx: dx, dy: dy)
+      tableToggle.frame = tableToggle.frame.offsetBy(dx: dx, dy: dy)
+      placedFrame = frame
+      return
+    }
     _ = layoutMediaViews()
     layoutFoldGutter()
+    layoutTableEditing()
+    placedFrame = frame
   }
 
-  /// A block resized (animating, loaded, measured): reflow just its line,
-  /// once per run loop turn.
-  private func mediaHeightChanged(_ key: String) {
+  /// A block resized. Animating: the page is laid out at its new height at
+  /// once, and what follows slides there (see `slidePage`). Otherwise
+  /// (loaded, measured): its line reflows, once per run loop turn.
+  private func mediaHeightChanged(_ key: String, from old: CGFloat?) {
+    if old != nil, let host = mediaHost, let view = mediaViews[key], view.superview === host,
+       let range = mediaLines[key], range.location < storage.length,
+       storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil {
+      pendingMediaRestyle.remove(key)
+      let before = view.frame
+      restyle(limit: range)
+      host.layoutSubtreeIfNeeded()
+      let after = view.frame
+      slidePage(below: textView.convert(after, from: host).maxY, from: before.maxY - after.maxY,
+                duration: MediaBlockView.resizeDuration, curve: .media)
+      return
+    }
     let first = pendingMediaRestyle.isEmpty
     pendingMediaRestyle.insert(key)
     guard first else { return }
@@ -2893,8 +3137,242 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     }
   }
 
+  // MARK: Sliding
+
+  /// Where what follows a change of height starts (text view coordinates,
+  /// in the final layout), and how much lower it was (negative: higher).
+  private struct SlideBreak {
+    var top: CGFloat
+    var offset: CGFloat
+  }
+
+  /// A change of height animating. The page is laid out in its final state
+  /// at once, and what follows each change slides there from where it was,
+  /// run by the render server, so it stays smooth however long the note:
+  /// the text and gutter as snapshots, the blocks and what's below the
+  /// editor as themselves.
+  private final class Slide {
+    let breaks: [SlideBreak]
+    let duration: CFTimeInterval
+    let curve: CubicBezier
+    let start = CACurrentMediaTime()
+    /// Snapshots and covers over the page, removed at the end.
+    var overlays: [NSView] = []
+    /// Views sliding, and blocks cut off where what slides begins.
+    var moved: [NSView] = []
+    var cut: [NSView] = []
+    var completion: (() -> Void)?
+
+    init(breaks: [SlideBreak], duration: CFTimeInterval, curve: CubicBezier) {
+      self.breaks = breaks
+      self.duration = duration
+      self.curve = curve
+    }
+
+    /// How much of the way is left, from 1 to 0.
+    var remaining: CGFloat {
+      CGFloat(1 - curve(min(1, (CACurrentMediaTime() - start) / duration)))
+    }
+  }
+
+  /// Slides what follows `top` (text view coordinates, in the final layout)
+  /// from `offset` points lower (negative: higher) into place. `overlays`
+  /// (in the page) go between the text and what slides; the `cut` blocks
+  /// show only above what slides, fading in or out.
+  private func slidePage(below top: CGFloat, from offset: CGFloat, duration: CFTimeInterval, curve: CubicBezier,
+                         overlays: [NSView] = [], cut: [MediaBlockView] = [], fadingIn: Bool = false,
+                         completion: (() -> Void)? = nil) {
+    var breaks = [SlideBreak(top: top, offset: offset)]
+    // A slide under way goes on from where things are on screen.
+    if let running = slide {
+      let left = running.remaining
+      for old in running.breaks where abs(old.offset * left) > 0.5 {
+        // Where it is now: past the change it moved with what follows, in
+        // a part that went away it's where that part was.
+        let moved = old.top >= top + offset - 0.5 ? old.top - offset : old.top > top ? top : old.top
+        breaks.append(SlideBreak(top: moved, offset: old.offset * left))
+      }
+      endSlide(running)
+    }
+    guard let host = mediaHost, window != nil, !Motion.reduceMotion, breaks.contains(where: { abs($0.offset) > 0.5 }) else {
+      overlays.forEach { $0.removeFromSuperview() }
+      completion?()
+      return
+    }
+    // (One break per place: what follows it moves by their sum.)
+    breaks.sort { $0.top < $1.top }
+    breaks = breaks.reduce(into: []) { merged, next in
+      if let last = merged.last, abs(last.top - next.top) < 0.5 {
+        merged[merged.count - 1].offset += next.offset
+      } else {
+        merged.append(next)
+      }
+    }
+    let slide = Slide(breaks: breaks, duration: duration, curve: curve)
+    slide.completion = completion
+    self.slide = slide
+
+    let editor = convert(bounds, to: host)
+    let left = gutter.superview === host ? min(gutter.frame.minX, editor.minX) : editor.minX
+    let width = editor.maxX - left
+    // Each break in the page, and how far what follows it is from its place.
+    var tops: [CGFloat] = [], offsets: [CGFloat] = []
+    for b in breaks {
+      tops.append(textView.convert(NSPoint(x: 0, y: b.top), to: host).y)
+      offsets.append((offsets.last ?? 0) + b.offset)
+    }
+    func shift(at y: CGFloat) -> CGFloat {
+      Array(zip(tops, offsets)).last(where: { y >= $0.0 - 0.5 })?.1 ?? 0
+    }
+    // What can show while it slides: what's on screen, and what slides
+    // into it (from above when it moves down, from below when it moves up).
+    let screen = host.visibleRect
+    let above = max(0, offsets.max() ?? 0), below = max(0, -(offsets.min() ?? 0))
+    let visible = NSRect(x: screen.minX, y: screen.minY - above - 40, width: screen.width, height: screen.height + above + below + 80)
+
+    func move(_ view: NSView, by dy: CGFloat) {
+      guard let layer = view.layer, let superview = view.superview else { return }
+      let shift = superview.convert(NSPoint(x: 0, y: dy), from: host).y - superview.convert(NSPoint.zero, from: host).y
+      let animation = CABasicAnimation(keyPath: "position")
+      animation.isAdditive = true
+      animation.fromValue = NSValue(point: NSPoint(x: 0, y: shift))
+      animation.toValue = NSValue(point: .zero)
+      animation.duration = duration
+      animation.timingFunction = curve.timingFunction
+      layer.add(animation, forKey: "glea.slide")
+      slide.moved.append(view)
+    }
+    // Over the gutter (over the text), under the blocks: covers first, then
+    // the overlays, then what slides, top to bottom.
+    var anchor: NSView = gutter
+    func place(_ view: NSView) {
+      host.addSubview(view, positioned: .above, relativeTo: anchor)
+      anchor = view
+      slide.overlays.append(view)
+    }
+    // Where what follows moves up, the final layout stays covered until it
+    // gets there.
+    var previous: CGFloat = 0
+    for (index, (top, offset)) in zip(tops, offsets).enumerated() {
+      defer { previous = offset }
+      guard offset > previous else { continue }
+      // Up to where the content before starts (above it, the page is as is).
+      let minY = max(top + min(previous, 0), index > 0 ? tops[index - 1] : top)
+      let gap = NSRect(x: left, y: minY, width: width, height: min(top + max(offset, 0), editor.maxY) - minY).intersection(visible)
+      guard !gap.isEmpty else { continue }
+      let cover = SlideOverlayView(frame: gap)
+      cover.wantsLayer = true
+      cover.layer?.backgroundColor = resolvedCGColor(Theme.background)
+      place(cover)
+    }
+    overlays.forEach(place)
+    // The text and gutter after each break, as laid out now.
+    for (index, (top, offset)) in zip(tops, offsets).enumerated() where abs(offset) > 0.5 {
+      let bottom = index + 1 < tops.count ? tops[index + 1] : editor.maxY
+      let band = NSRect(x: left, y: top, width: width, height: bottom - top).intersection(visible)
+      guard !band.isEmpty else { continue }
+      let snapshot = pageSnapshot(of: band, in: host, opaque: true)
+      place(snapshot)
+      move(snapshot, by: offset)
+    }
+    // Blocks and what's below the editor, as themselves.
+    var column: NSView = self
+    while let superview = column.superview, superview !== host { column = superview }
+    let skipped = Set((slide.overlays + cut + [column, gutter]).map(ObjectIdentifier.init))
+    for view in host.subviews where !skipped.contains(ObjectIdentifier(view)) && view.frame.minX > -50_000 {
+      let offset = shift(at: view.frame.minY)
+      if abs(offset) > 0.5, view.frame.intersects(visible) { move(view, by: offset) }
+    }
+    var child: NSView = self
+    while let parent = child.superview, parent !== host {
+      for sibling in parent.subviews where sibling !== child {
+        let frame = sibling.convert(sibling.bounds, to: host)
+        let offset = shift(at: frame.minY)
+        if frame.minY >= editor.maxY - 0.5, abs(offset) > 0.5, frame.intersects(visible) { move(sibling, by: offset) }
+      }
+      child = parent
+    }
+    // Blocks of a section opening or closing: cut off where what follows it
+    // is, fading.
+    let edge = textView.convert(NSPoint(x: 0, y: top), to: host).y
+    let edgeOffset = shift(at: edge)
+    for view in cut {
+      guard let layer = view.layer else { continue }
+      let frame = view.frame
+      let flipped = layer.contentsAreFlipped()
+      var bounds: [NSValue] = [], positions: [NSValue] = []
+      let steps = 30
+      for step in 0...steps {
+        let left = CGFloat(1 - curve(Double(step) / Double(steps)))
+        let shown = min(frame.height, max(0, edge + edgeOffset * left - frame.minY))
+        let rect = CGRect(x: 0, y: flipped ? 0 : frame.height - shown, width: frame.width, height: shown)
+        bounds.append(NSValue(rect: CGRect(origin: .zero, size: rect.size)))
+        positions.append(NSValue(point: CGPoint(x: rect.midX, y: rect.midY)))
+      }
+      let mask = CALayer()
+      mask.backgroundColor = NSColor.black.cgColor
+      Motion.withoutAnimation {
+        mask.bounds = bounds.last!.rectValue
+        mask.position = positions.last!.pointValue
+      }
+      for (key, values) in [("bounds", bounds), ("position", positions)] {
+        let animation = CAKeyframeAnimation(keyPath: key)
+        animation.values = values
+        animation.duration = duration
+        mask.add(animation, forKey: key)
+      }
+      layer.mask = mask
+      let fade = CABasicAnimation(keyPath: "opacity")
+      fade.fromValue = fadingIn ? 0 : 1
+      fade.toValue = fadingIn ? 1 : 0
+      fade.duration = duration
+      fade.timingFunction = curve.timingFunction
+      layer.add(fade, forKey: "glea.slide.fade")
+      slide.cut.append(view)
+    }
+    // (A little after: the render server starts a moment after this.)
+    DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.05) { [weak self, weak slide] in
+      guard let self, let slide, self.slide === slide else { return }
+      self.endSlide(slide)
+    }
+  }
+
+  private func endSlide(_ slide: Slide) {
+    if self.slide === slide { self.slide = nil }
+    for view in slide.moved { view.layer?.removeAnimation(forKey: "glea.slide") }
+    for view in slide.cut {
+      view.layer?.mask = nil
+      view.layer?.removeAnimation(forKey: "glea.slide.fade")
+    }
+    slide.overlays.forEach { $0.removeFromSuperview() }
+    let completion = slide.completion
+    slide.completion = nil
+    completion?()
+  }
+
+  /// What the text and gutter show in `rect` (in the page), as a view to
+  /// put over it.
+  private func pageSnapshot(of rect: NSRect, in host: NSView, opaque: Bool) -> NSView {
+    let view = SlideOverlayView(frame: rect)
+    view.wantsLayer = true
+    if opaque { view.layer?.backgroundColor = resolvedCGColor(Theme.background) }
+    for source in [gutter, textView] as [NSView] where source.superview != nil {
+      let part = source.convert(rect, from: host).intersection(source.bounds)
+      guard !part.isEmpty else { continue }
+      let inHost = source.convert(part, to: host)
+      let image = NSImageView(frame: inHost.offsetBy(dx: -rect.minX, dy: -rect.minY))
+      image.imageScaling = .scaleAxesIndependently
+      image.image = source.snapshot(of: part)
+      view.addSubview(image)
+    }
+    return view
+  }
+
   func textDidChange(_ notification: Notification) {
     isDirty = true
+    if let slide { endSlide(slide) }
+    hoveredTable = nil
+    if let window { updateTableHover(window.mouseLocationOutsideOfEventStream) }
     restyle()
     onTextChange?()
     saveWork?.cancel()
@@ -2903,10 +3381,45 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
   }
 
+  // Tables: the wrapped cell being edited (by its row's location and column)
+  // in its field, and the table / Markdown toggle.
+  private var cellField: TableCellField?
+  private var cellEditing: (row: Int, column: Int)?
+  private var cellGeneration = 0
+  private var tableAsMarkdown = false
+  /// The table under the pointer (its first row's location): its toggle
+  /// shows.
+  private var hoveredTable: Int?
+  /// The cell's text when its editing began (its change becomes one undo
+  /// step in the note once it's left).
+  private var cellOriginal: String?
+  private lazy var tableToggle: MediaToggleButton = {
+    let toggle = MediaToggleButton()
+    toggle.looks = (collapsed: .init(symbol: "tablecells", label: "table", tooltip: "Edit as a table"),
+                    expanded: .init(symbol: "chevron.left.forwardslash.chevron.right", label: "markdown", tooltip: "Edit as Markdown"))
+    toggle.centersIconOnCapitals = true
+    // (After the click: it changes what the page shows.)
+    toggle.onClick = { [weak self] in DispatchQueue.main.async { self?.toggleTableMode() } }
+    toggle.alphaValue = 0
+    toggle.isHidden = true
+    return toggle
+  }()
+
+  /// Its own undo history, which goes away with it. In the window's shared
+  /// one, typing in a note left there after the note closed would point at
+  /// a freed editor: ⌘Z then crashed.
+  private let undoHistory = UndoManager()
+
+  func undoManager(for view: NSTextView) -> UndoManager? { undoHistory }
+
   /// Syntax follows the cursor: restyle the lines it left and entered.
   func textViewDidChangeSelection(_ notification: Notification) {
     guard window?.firstResponder === textView, !textView.hasMarkedText() else { return }
     let selection = textView.selectedRange()
+    updateMediaSelection()
+    // Out of the table shown as Markdown: back to tables.
+    if tableAsMarkdown, textView.tableRowAtCursor() == nil { tableAsMarkdown = false }
+    defer { beginCellEditingIfNeeded() }
     guard selection != styledSelection else { return }
     if selection.length == 0 { unfold(around: selection) }
     let previous = styledSelection
@@ -2979,5 +3492,528 @@ extension MarkdownStyler {
     guard let url = NSURL(string: string) else { return nil }
     links[string] = url
     return url
+  }
+}
+
+// MARK: - Table editing
+
+/// Edits one cell of a wrapped table, over the cell: its raw Markdown,
+/// wrapping at the cell's width. What it holds goes straight into the note.
+final class TableCellField: NSTextView {
+  weak var owner: MarkdownEditorView?
+
+  /// The typing in this cell, undone in runs like any text. Once it's left,
+  /// the cell's change is one step in the note's own history; ⌘Z with
+  /// nothing left here goes on there.
+  let typing = UndoManager()
+  override var undoManager: UndoManager? { typing }
+
+  @objc func undo(_ sender: Any?) {
+    if typing.canUndo { typing.undo() } else { owner?.cellUndo(redo: false) }
+  }
+
+  @objc func redo(_ sender: Any?) {
+    if typing.canRedo { typing.redo() } else { owner?.cellUndo(redo: true) }
+  }
+
+  override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+    switch item.action {
+    case #selector(undo(_:))?: return typing.canUndo || (owner?.textView.undoManager?.canUndo ?? false)
+    case #selector(redo(_:))?: return typing.canRedo || (owner?.textView.undoManager?.canRedo ?? false)
+    default: return super.validateUserInterfaceItem(item)
+    }
+  }
+
+  override func doCommand(by selector: Selector) {
+    if owner?.cellCommand(selector) == true { return }
+    super.doCommand(by: selector)
+  }
+
+  override func didChangeText() {
+    super.didChangeText()
+    owner?.cellTextDidChange()
+  }
+
+  override func resignFirstResponder() -> Bool {
+    let result = super.resignFirstResponder()
+    if result { owner?.cellFieldDidResign() }
+    return result
+  }
+}
+
+extension MarkdownEditorView {
+  private static let tableSeparator = try! NSRegularExpression(pattern: "^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)*\\|?\\s*$")
+
+  /// The line at `location` without its line break.
+  private func line(at location: Int) -> NSRange {
+    let s = storage.string as NSString
+    let range = s.lineRange(for: NSRange(location: min(location, s.length), length: 0))
+    var length = range.length
+    if length > 0, s.character(at: NSMaxRange(range) - 1) == 0x0A { length -= 1 }
+    return NSRange(location: range.location, length: length)
+  }
+
+  private func cells(ofRow row: NSRange) -> [NSRange] {
+    let text = (storage.string as NSString).substring(with: row) as NSString
+    return MarkdownStyler.tableCells(in: text).map { NSRange(location: $0.location + row.location, length: $0.length) }
+  }
+
+  /// The table's rows around `location` (the separator row left out), top
+  /// to bottom.
+  private func tableRows(around location: Int) -> [NSRange] {
+    let s = storage.string as NSString
+    func isRow(_ line: NSRange) -> Bool { s.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("|") }
+    var start = line(at: location)
+    guard isRow(start) else { return [] }
+    while start.location > 0 {
+      let previous = line(at: start.location - 1)
+      guard isRow(previous) else { break }
+      start = previous
+    }
+    var rows: [NSRange] = []
+    var current = start
+    while isRow(current) {
+      let text = s.substring(with: current)
+      if MarkdownEditorView.tableSeparator.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) == nil {
+        rows.append(current)
+      }
+      let next = NSMaxRange(current) + 1
+      guard next < s.length else { break }
+      current = line(at: next)
+    }
+    return rows
+  }
+
+  /// The wrapped table cell at `location`: its row and column.
+  private func wrappedCell(at location: Int) -> (row: NSRange, column: Int)? {
+    guard storage.length > 0 else { return nil }
+    let row = line(at: location)
+    guard row.length > 0, storage.attribute(.gleaTableWrapped, at: row.location, effectiveRange: nil) != nil else { return nil }
+    let cells = cells(ofRow: row)
+    guard !cells.isEmpty else { return nil }
+    return (row, cells.lastIndex { $0.location <= location } ?? 0)
+  }
+
+  /// The range of the cell being edited, in the note.
+  private var editedCellRange: NSRange? {
+    guard let editing = cellEditing, editing.row < storage.length else { return nil }
+    let cells = cells(ofRow: line(at: editing.row))
+    return cells.indices.contains(editing.column) ? cells[editing.column] : nil
+  }
+
+  private func isHeaderRow(_ row: NSRange) -> Bool {
+    tableRows(around: row.location).first == row
+  }
+
+  // MARK: Editing a wrapped cell
+
+  /// The cursor landed in a wrapped table (a click, an arrow key): edit
+  /// that cell over it.
+  func beginCellEditingIfNeeded() {
+    guard !tableAsMarkdown, cellEditing == nil, window?.firstResponder === textView else { return }
+    let selection = textView.selectedRange()
+    guard let cell = wrappedCell(at: selection.location) else { return }
+    beginCellEditing(row: cell.row.location, column: cell.column, selection: selection)
+  }
+
+  /// A click in a wrapped cell: its field opens over it and takes the
+  /// click.
+  private func editCell(row: Int, column: Int, clicked event: NSEvent) {
+    if cellEditing.map({ $0.row != row || $0.column != column }) ?? false { endCellEditing(focusText: false) }
+    if cellEditing == nil {
+      beginCellEditing(row: row, column: column, selection: NSRange(location: 0, length: 0))
+      // The note's own selection follows, out of sight (it isn't focused).
+      if let range = editedCellRange { textView.setSelectedRange(NSRange(location: range.location, length: 0)) }
+    }
+    guard let field = cellField, cellEditing != nil else { return }
+    window?.makeFirstResponder(field)
+    field.mouseDown(with: event)
+  }
+
+  private func beginCellEditing(row: Int, column: Int, selection: NSRange) {
+    cellGeneration += 1
+    cellEditing = (row, column)
+    guard let range = editedCellRange else {
+      cellEditing = nil
+      return
+    }
+    let field = cellField ?? makeCellField()
+    let attributes = MarkdownStyler.cellEditingAttributes(header: isHeaderRow(line(at: row)))
+    cellOriginal = (storage.string as NSString).substring(with: range)
+    field.typing.removeAllActions()
+    field.textStorage?.setAttributedString(NSAttributedString(string: cellOriginal ?? "", attributes: attributes))
+    field.typingAttributes = attributes
+    field.isHidden = false
+    restyle(limit: tableRange(around: row))
+    let start = max(range.location, min(selection.location, NSMaxRange(range)))
+    let end = max(start, min(NSMaxRange(selection), NSMaxRange(range)))
+    window?.makeFirstResponder(field)
+    field.setSelectedRange(NSRange(location: start - range.location, length: end - start))
+  }
+
+  private func makeCellField() -> TableCellField {
+    let field = TableCellField(frame: .zero)
+    field.owner = self
+    field.isRichText = false
+    field.allowsUndo = true
+    field.drawsBackground = false
+    field.textContainerInset = .zero
+    field.textContainer?.lineFragmentPadding = 0
+    field.textContainer?.widthTracksTextView = true
+    field.insertionPointColor = Theme.accent
+    field.focusRingType = .none
+    field.isAutomaticQuoteSubstitutionEnabled = false
+    field.isAutomaticDashSubstitutionEnabled = false
+    field.isAutomaticTextReplacementEnabled = false
+    field.isContinuousSpellCheckingEnabled = false
+    textView.addSubview(field)
+    cellField = field
+    return field
+  }
+
+  /// Puts the field over its cell (the row may have grown or moved), and
+  /// takes in changes made to the cell from elsewhere (undo).
+  private func layoutCellField() {
+    guard let editing = cellEditing, let field = cellField else { return }
+    guard editing.row < storage.length, let container = textView.textContainer,
+          let row = storage.attribute(.gleaTableRow, at: editing.row, effectiveRange: nil) as? MarkdownTableRow,
+          row.cells != nil, editing.column + 1 < row.columnX.count, let range = editedCellRange else {
+      endCellEditing(focusText: false)
+      return
+    }
+    layoutManager.ensureLayout(for: container)
+    let glyphs = layoutManager.glyphRange(forCharacterRange: line(at: editing.row), actualCharacterRange: nil)
+    var lineRect = NSRect.null
+    layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, _, _ in lineRect = lineRect.union(rect) }
+    guard !lineRect.isNull else { return }
+    let origin = textView.textContainerOrigin
+    let rowRect = NSRect(x: origin.x + row.columnX[0], y: origin.y + lineRect.minY,
+                         width: (row.columnX.last ?? 0) - row.columnX[0], height: lineRect.height)
+    let cell = row.cellRect(editing.column, in: rowRect)
+    field.frame = NSRect(x: cell.minX, y: cell.minY, width: cell.width, height: max(cell.height, 18))
+    // A cell's range leaves out its padding spaces: the field's leading or
+    // trailing space (typed between words) isn't a difference.
+    let raw = (storage.string as NSString).substring(with: range)
+    if field.string.trimmingCharacters(in: .whitespaces) != raw, !field.hasMarkedText() {
+      let selection = field.selectedRange()
+      field.textStorage?.setAttributedString(NSAttributedString(string: raw, attributes: field.typingAttributes))
+      // Its typing history no longer matches its text.
+      field.typing.removeAllActions()
+      let length = (raw as NSString).length
+      field.setSelectedRange(NSRange(location: min(selection.location, length), length: 0))
+    }
+  }
+
+  private func endCellEditing(focusText: Bool) {
+    guard cellEditing != nil else { return }
+    commitCellSession()
+    let table = cellEditing.flatMap { tableRange(around: $0.row) }
+    cellOriginal = nil
+    cellField?.typing.removeAllActions()
+    cellEditing = nil
+    cellGeneration += 1
+    layoutManager.hiddenCell = nil
+    cellField?.isHidden = true
+    if focusText { window?.makeFirstResponder(textView) }
+    restyle(limit: table)
+  }
+
+  /// The table's lines around `location` (restyling just the table: the
+  /// rest of a long note doesn't change).
+  private func tableRange(around location: Int) -> NSRange? {
+    let s = storage.string as NSString
+    func isRow(_ line: NSRange) -> Bool { s.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("|") }
+    var first = line(at: location)
+    guard isRow(first) else { return nil }
+    while first.location > 0 {
+      let previous = line(at: first.location - 1)
+      guard isRow(previous) else { break }
+      first = previous
+    }
+    var last = first
+    while NSMaxRange(last) + 1 < s.length {
+      let next = line(at: NSMaxRange(last) + 1)
+      guard isRow(next) else { break }
+      last = next
+    }
+    return NSRange(location: first.location, length: NSMaxRange(last) - first.location)
+  }
+
+  /// The field changed: write it into its cell (a "|" typed in a cell is
+  /// escaped, so it doesn't split it).
+  func cellTextDidChange() {
+    guard let field = cellField, let range = editedCellRange, !field.hasMarkedText() else { return }
+    var text = field.string.replacingOccurrences(of: "\n", with: " ")
+    text = text.replacingOccurrences(of: "(?<!\\\\)\\|", with: "\\\\|", options: .regularExpression)
+    var caret = field.selectedRange().location
+    if text != field.string {
+      caret += (text as NSString).length - (field.string as NSString).length
+      field.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: field.typingAttributes))
+      // Its typing history no longer matches its text.
+      field.typing.removeAllActions()
+      field.setSelectedRange(NSRange(location: max(0, min(caret, (text as NSString).length)), length: 0))
+    }
+    guard (storage.string as NSString).substring(with: range) != text else { return }
+    // Straight into the note: the cell's whole change becomes one undo step
+    // when it's left (commitCellSession).
+    storage.replaceCharacters(in: range, with: text)
+    textView.didChangeText()
+    textView.setSelectedRange(NSRange(location: range.location + max(0, caret), length: 0))
+  }
+
+  /// The cell's change since its editing began, as one undo step in the
+  /// note (redo puts it back).
+  private func commitCellSession() {
+    guard let editing = cellEditing, let original = cellOriginal, let range = editedCellRange else { return }
+    let current = (storage.string as NSString).substring(with: range)
+    guard current != original else { return }
+    registerCellChange(row: editing.row, column: editing.column, undoTo: original, redoTo: current)
+    cellOriginal = current
+  }
+
+  private func registerCellChange(row: Int, column: Int, undoTo old: String, redoTo new: String) {
+    guard let manager = textView.undoManager else { return }
+    manager.registerUndo(withTarget: self) { editor in
+      editor.setCell(row: row, column: column, to: old)
+      editor.registerCellChange(row: row, column: column, undoTo: new, redoTo: old)
+    }
+    manager.setActionName("Typing")
+  }
+
+  private func setCell(row: Int, column: Int, to text: String) {
+    let cells = cells(ofRow: line(at: row))
+    guard cells.indices.contains(column) else { return }
+    storage.replaceCharacters(in: cells[column], with: text)
+    textView.didChangeText()
+    textView.setSelectedRange(NSRange(location: cells[column].location + (text as NSString).length, length: 0))
+  }
+
+  /// Undo and redo run in the note's text view (AppKit applies them to the
+  /// text view in front), then editing resumes in the cell they land in.
+  func cellUndo(redo: Bool) {
+    guard let manager = textView.undoManager else { return }
+    endCellEditing(focusText: true)
+    if redo { manager.redo() } else { manager.undo() }
+    beginCellEditingIfNeeded()
+  }
+
+  func cellFieldDidResign() {
+    let generation = cellGeneration
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.cellGeneration == generation, self.window?.firstResponder !== self.cellField else { return }
+      self.endCellEditing(focusText: false)
+    }
+  }
+
+  /// Keys in the field: Tab, ⇧Tab and Enter work as in any table; Esc and
+  /// the arrows past the cell's edges leave it.
+  func cellCommand(_ selector: Selector) -> Bool {
+    guard let field = cellField, let editing = cellEditing, let range = editedCellRange else { return false }
+    let selection = field.selectedRange()
+    let length = (field.string as NSString).length
+    let rows = tableRows(around: editing.row)
+    let rowIndex = rows.firstIndex { $0.location == editing.row } ?? 0
+
+    // The note's own table commands, from the matching place in the note.
+    func asTable(_ command: (MarkdownTextView) -> Void) {
+      commitCellSession()
+      textView.setSelectedRange(NSRange(location: range.location + selection.location, length: selection.length))
+      command(textView)
+      followTextSelection()
+    }
+    func moveTo(row: Int, column: Int, atEnd: Bool) {
+      let cells = cells(ofRow: rows[row])
+      guard !cells.isEmpty else { return }
+      let target = cells[min(column, cells.count - 1)]
+      endCellEditing(focusText: false)
+      beginCellEditing(row: rows[row].location, column: min(column, cells.count - 1),
+                       selection: NSRange(location: atEnd ? NSMaxRange(target) : target.location, length: 0))
+    }
+    func leave(down: Bool) {
+      let s = storage.string as NSString
+      let location: Int
+      if down {
+        location = min(s.length, NSMaxRange(rows.last ?? range) + 1)
+      } else {
+        location = max(0, (rows.first ?? range).location - 1)
+      }
+      endCellEditing(focusText: true)
+      textView.setSelectedRange(NSRange(location: location, length: 0))
+    }
+    func onFirstLine() -> Bool {
+      guard let manager = field.layoutManager, length > 0 else { return true }
+      let glyph = manager.glyphIndexForCharacter(at: min(selection.location, length - 1))
+      return manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY < 1
+        || (selection.location == length && manager.lineFragmentRect(forGlyphAt: max(0, glyph), effectiveRange: nil).minY < 1)
+    }
+    func onLastLine() -> Bool {
+      guard let manager = field.layoutManager, length > 0 else { return true }
+      var last = NSRange()
+      manager.lineFragmentRect(forGlyphAt: manager.numberOfGlyphs - 1, effectiveRange: &last)
+      return manager.glyphIndexForCharacter(at: min(selection.location, length - 1)) >= last.location || selection.location == length
+    }
+
+    switch selector {
+    case #selector(NSResponder.insertTab(_:)):
+      asTable { $0.insertTab(nil) }
+    case #selector(NSResponder.insertBacktab(_:)):
+      asTable { $0.insertBacktab(nil) }
+    case #selector(NSResponder.insertNewline(_:)):
+      asTable { $0.insertNewline(nil) }
+    case #selector(NSResponder.cancelOperation(_:)):
+      leave(down: true)
+    case #selector(NSResponder.moveUp(_:)) where onFirstLine():
+      if rowIndex > 0 { moveTo(row: rowIndex - 1, column: editing.column, atEnd: true) } else { leave(down: false) }
+    case #selector(NSResponder.moveDown(_:)) where onLastLine():
+      if rowIndex + 1 < rows.count { moveTo(row: rowIndex + 1, column: editing.column, atEnd: false) } else { leave(down: true) }
+    case #selector(NSResponder.moveLeft(_:)) where selection.length == 0 && selection.location == 0:
+      if editing.column > 0 {
+        moveTo(row: rowIndex, column: editing.column - 1, atEnd: true)
+      } else if rowIndex > 0 {
+        moveTo(row: rowIndex - 1, column: Int.max, atEnd: true)
+      } else {
+        leave(down: false)
+      }
+    case #selector(NSResponder.moveRight(_:)) where selection.length == 0 && selection.location == length:
+      if editing.column + 1 < cells(ofRow: rows[rowIndex]).count {
+        moveTo(row: rowIndex, column: editing.column + 1, atEnd: false)
+      } else if rowIndex + 1 < rows.count {
+        moveTo(row: rowIndex + 1, column: 0, atEnd: false)
+      } else {
+        leave(down: true)
+      }
+    default:
+      return false
+    }
+    return true
+  }
+
+  /// After a table command ran in the note: edit the cell it moved to, or
+  /// go back to the note's text when it left the table.
+  private func followTextSelection() {
+    let selection = textView.selectedRange()
+    endCellEditing(focusText: false)
+    if !tableAsMarkdown, let cell = wrappedCell(at: selection.location) {
+      beginCellEditing(row: cell.row.location, column: cell.column, selection: selection)
+    } else {
+      window?.makeFirstResponder(textView)
+      textView.setSelectedRange(selection)
+    }
+  }
+
+  // MARK: Table / Markdown toggle
+
+  private func toggleTableMode() {
+    // Another table than the cursor's: the cursor goes there, to edit it as
+    // Markdown.
+    if let hovered = hoveredTable, !isActiveTable(hovered) {
+      if cellField != nil { endCellEditing(focusText: true) }
+      window?.makeFirstResponder(textView)
+      tableAsMarkdown = false
+      textView.setSelectedRange(NSRange(location: hovered, length: 0))
+    } else if tableAsMarkdown {
+      tableAsMarkdown = false
+      restyle(limit: tableRange(around: textView.selectedRange().location))
+      beginCellEditingIfNeeded()
+      return
+    }
+    do {
+      if let field = cellField, let range = editedCellRange {
+        let caret = range.location + min(field.selectedRange().location, range.length)
+        endCellEditing(focusText: true)
+        textView.setSelectedRange(NSRange(location: caret, length: 0))
+      }
+      tableAsMarkdown = true
+      window?.makeFirstResponder(textView)
+      restyle(limit: tableRange(around: textView.selectedRange().location))
+    }
+  }
+
+  /// Whether the cursor (or the cell being edited) is in the table at
+  /// `location`.
+  private func isActiveTable(_ location: Int) -> Bool {
+    guard let table = tableRange(around: location) else { return false }
+    if let editing = cellEditing { return NSLocationInRange(editing.row, table) }
+    return window?.firstResponder === textView && textView.tableRowAtCursor() != nil
+      && NSLocationInRange(textView.selectedRange().location, NSRange(location: table.location, length: table.length + 1))
+  }
+
+  /// The table under a point in the window: over its rows, from the text's
+  /// left edge to past the toggle in the gutter on the right, or over its
+  /// toggle.
+  private func updateTableHover(_ point: NSPoint?) {
+    var table: Int?
+    if let point, let host = mediaHost, let container = textView.textContainer, storage.length > 0,
+       NSPointInRect(convert(point, from: nil), bounds.insetBy(dx: 0, dy: -4).union(NSRect(x: 0, y: 0, width: bounds.width + 14 + MediaBlockView.gutterWidth, height: bounds.height))) {
+      if let current = hoveredTable, !tableToggle.isHidden,
+         tableToggle.frame.insetBy(dx: -8, dy: -8).contains(host.convert(point, from: nil)) {
+        table = current
+      } else {
+        let origin = textView.textContainerOrigin
+        let local = textView.convert(point, from: nil)
+        let inContainer = NSPoint(x: min(max(local.x - origin.x, 0), container.size.width - 1), y: local.y - origin.y)
+        let glyph = layoutManager.glyphIndex(for: inContainer, in: container)
+        let index = layoutManager.characterIndexForGlyph(at: glyph)
+        if let first = tableRows(around: index).first,
+           layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).contains(NSPoint(x: 1, y: inContainer.y)) {
+          table = first.location
+        }
+      }
+    }
+    guard table != hoveredTable else { return }
+    hoveredTable = table
+    layoutTableEditing()
+  }
+
+  /// For automated checks: the pointer over the nth table's first row (or
+  /// away from tables, when there's none).
+  func debugHoverTable(_ n: Int) {
+    let text = storage.string as NSString
+    var tables: [Int] = []
+    var location = 0
+    while location < text.length {
+      let line = text.lineRange(for: NSRange(location: location, length: 0))
+      if let first = tableRows(around: line.location).first, tables.last != first.location { tables.append(first.location) }
+      location = NSMaxRange(line)
+    }
+    guard tables.indices.contains(n) else { return updateTableHover(nil) }
+    let glyph = layoutManager.glyphIndexForCharacter(at: tables[n])
+    let rect = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+    let origin = textView.textContainerOrigin
+    updateTableHover(textView.convert(NSPoint(x: origin.x + 40, y: origin.y + rect.midY), to: nil))
+  }
+
+  func debugClickTableToggle() { tableToggle.onClick?() }
+
+  /// The field over its cell, and the toggle next to the table under the
+  /// pointer.
+  func layoutTableEditing() {
+    layoutCellField()
+    guard let anchor = hoveredTable, anchor < storage.length, let host = mediaHost, let container = textView.textContainer,
+          let top = tableRows(around: anchor).first else {
+      if !tableToggle.isHidden { tableToggle.fade(in: false) }
+      return
+    }
+    layoutManager.ensureLayout(for: container)
+    let glyphs = layoutManager.glyphRange(forCharacterRange: top, actualCharacterRange: nil)
+    var lineRect = NSRect.null
+    layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, _, _ in lineRect = lineRect.union(rect) }
+    guard !lineRect.isNull else { return }
+    // Level with a header row, at the same place whether the table shows as
+    // a table or as Markdown (its first line's height differs).
+    let origin = textView.textContainerOrigin
+    let rowInHost = textView.convert(NSRect(x: origin.x, y: origin.y + lineRect.minY, width: 1, height: 34), to: host)
+    // In the gutter right of the text column, like an embed's toggle; just
+    // its icon when the window is too narrow for its label.
+    let x = convert(NSPoint(x: bounds.width + 14, y: 0), to: host).x
+    tableToggle.collapsed = tableAsMarkdown && isActiveTable(anchor)
+    if tableToggle.superview !== host { host.addSubview(tableToggle) }
+    if let window {
+      let fits = host.convert(NSPoint(x: x + tableToggle.labelledWidth, y: 0), to: nil).x <= window.contentLayoutRect.maxX - 8
+      tableToggle.setShowsLabel(fits, animated: window.isVisible && !tableToggle.isHidden) { [weak self] in self?.layoutTableEditing() }
+    }
+    let size = tableToggle.fittingSize
+    tableToggle.frame = NSRect(x: x, y: rowInHost.midY - size.height / 2, width: size.width, height: size.height)
+    if tableToggle.isHidden || tableToggle.alphaValue < 1 { tableToggle.fade(in: true) }
   }
 }

@@ -481,6 +481,73 @@ struct CubicBezier {
 
   /// hello-mat's --custom-ease.
   static let media = CubicBezier(x1: 0.42, y1: 0, x2: 0.25, y2: 1)
+  /// The cubic ease-out sections fold with.
+  static let fold = CubicBezier(x1: 0.33, y1: 1, x2: 0.68, y2: 1)
+
+  var timingFunction: CAMediaTimingFunction {
+    CAMediaTimingFunction(controlPoints: Float(x1), Float(y1), Float(x2), Float(y2))
+  }
+}
+
+// MARK: - Loading order
+
+/// Media blocks load what's on screen first. Blocks on or near the visible
+/// part of their page start right away; the others wait their turn, a few at
+/// a time, nearest first (and move up as the page scrolls).
+@MainActor
+final class MediaLoadQueue {
+  static let shared = MediaLoadQueue()
+
+  private let waiting = NSHashTable<MediaBlockView>.weakObjects()
+  /// Loads under way, by when they started (a load that never reports back
+  /// gives its turn up after a while).
+  private var active: [ObjectIdentifier: CFTimeInterval] = [:]
+  private var scheduled = false
+  private static let offscreenAtOnce = 2
+  private static let patience: CFTimeInterval = 6
+
+  func request(_ block: MediaBlockView) {
+    waiting.add(block)
+    schedule()
+  }
+
+  func finished(_ block: MediaBlockView) {
+    waiting.remove(block)
+    if active.removeValue(forKey: ObjectIdentifier(block)) != nil { schedule() }
+  }
+
+  /// Looks again soon (the page scrolled, a load finished).
+  func schedule() {
+    guard !scheduled, waiting.count > 0 else { return }
+    scheduled = true
+    // (After this turn: new blocks get their place in the page first.)
+    DispatchQueue.main.async { [self] in
+      scheduled = false
+      pump()
+    }
+  }
+
+  private func pump() {
+    let now = CACurrentMediaTime()
+    active = active.filter { now - $0.value < Self.patience }
+    let candidates = waiting.allObjects
+      .map { ($0, $0.distanceFromView) }
+      .sorted { $0.1 < $1.1 }
+    for (block, distance) in candidates {
+      guard block.window != nil else {
+        waiting.remove(block)
+        continue
+      }
+      if distance > 0 && active.count >= Self.offscreenAtOnce { break }
+      waiting.remove(block)
+      active[ObjectIdentifier(block)] = now
+      block.startQueuedLoad()
+    }
+    // Turns given up after a while free their place.
+    if waiting.count > 0, !active.isEmpty {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.schedule() }
+    }
+  }
 }
 
 // MARK: - Block view
@@ -494,7 +561,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   let descriptor: MediaDescriptor
   let noteID: String
-  var onHeightChange: (() -> Void)?
+  /// The reserved height changed: animating from the old one (given), or
+  /// at once.
+  var onHeightChange: ((_ animatedFrom: CGFloat?) -> Void)?
   var onOpenURL: ((URL) -> Void)?
 
   /// The height the text reserves for this block (animated).
@@ -524,6 +593,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   private let placeholder = PassthroughImageView()
   private var content: NSView?
   private let toggle = MediaToggleButton()
+  /// Over the media while its line is in the note's selection.
+  private let selectionTint = PassthroughView()
   private var tracking: NSTrackingArea?
 
   private var wrapperFrame = NSRect.zero
@@ -534,12 +605,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   private var soundMuted = false
   private var playbackObservation: NSKeyValueObservation?
   private var statusObservation: NSKeyValueObservation?
-  private var animation: (start: CFTimeInterval, from: (NSRect, CGFloat), to: (NSRect, CGFloat))?
   /// The running animation follows the content resizing itself (a post's
   /// "Read more"): the media keeps its size and the wrapper reveals or hides
   /// its bottom, instead of scaling it like expanding and collapsing do.
   private var resizesWithContent = false
-  private var timer: Timer?
+  private var rowGeneration = 0
 
   var availableWidth: CGFloat = 600 {
     didSet { if abs(availableWidth - oldValue) > 0.5 { relayout(animated: false) } }
@@ -553,6 +623,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     super.init(frame: .zero)
     SoundMonitor.shared.register(self)
     wantsLayer = true
+    // A collapsing block's media shrinks past its new, smaller frame.
+    if #available(macOS 14, *) { clipsToBounds = false }
+    layer?.masksToBounds = false
 
     rowIcon.imageScaling = .scaleProportionallyUpOrDown
     rowIcon.wantsLayer = true
@@ -579,6 +652,12 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     placeholder.wantsLayer = true
     wrapper.addSubview(placeholder)
     addSubview(wrapper)
+
+    selectionTint.wantsLayer = true
+    selectionTint.layer?.cornerRadius = 6
+    selectionTint.layer?.cornerCurve = .continuous
+    selectionTint.alphaValue = 0
+    addSubview(selectionTint)
 
     toggle.onClick = { [weak self] in self?.setCollapsed(!(self?.collapsed ?? true)) }
     toggle.collapsed = collapsed
@@ -611,8 +690,64 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     }
   }
 
+  private var focusObservation: NSKeyValueObservation?
+
+  /// Its line is in the note's selection: it shows selected, tinted like
+  /// selected text.
+  /// (`emphasized`: the note has the focus, so the selection is colored, not gray.)
+  func setSelected(_ selected: Bool, emphasized: Bool) {
+    let color = emphasized ? NSColor.selectedTextBackgroundColor : NSColor.unemphasizedSelectedTextBackgroundColor
+    selectionTint.layer?.backgroundColor = resolvedCGColor(color.withAlphaComponent(0.5))
+    guard selected != isSelected else { return }
+    isSelected = selected
+    needsLayout = true
+    // At once, like the text's selection as it's dragged.
+    Motion.withoutAnimation { selectionTint.alphaValue = selected ? 1 : 0 }
+  }
+
+  private var isSelected = false
+
+  /// Whether `view` is in an embed that wasn't just clicked.
+  static func takesFocusUnasked(_ view: NSView) -> Bool {
+    var block: MediaBlockView?
+    var current: NSView? = view.superview
+    while let next = current, block == nil {
+      block = next as? MediaBlockView
+      current = next.superview
+    }
+    guard let block, view.isDescendant(of: block.wrapper) else { return false }
+    return !block.wasJustClicked
+  }
+
+  private var wasJustClicked: Bool {
+    guard let event = NSApp.currentEvent, [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(event.type),
+          event.window === window else { return false }
+    return bounds.contains(convert(event.locationInWindow, from: nil))
+  }
+
+  /// An embedded page can take the keyboard focus on its own as it loads
+  /// (autofocus, scripts): the focus goes back where it was (typing in the
+  /// note, ⌘A) unless the embed was clicked.
+  private func guardFocus() {
+    focusObservation = window?.observe(\.firstResponder, options: [.old, .new]) { [weak self] window, change in
+      MainActor.assumeIsolated {
+        guard let self, let taken = change.newValue as? NSView, taken.isDescendant(of: self.wrapper), !self.wasJustClicked else { return }
+        let previous = change.oldValue ?? nil
+        DispatchQueue.main.async {
+          guard window.firstResponder === taken else { return }
+          if let previous, (previous as? NSView)?.window === window || previous === window {
+            window.makeFirstResponder(previous)
+          } else {
+            window.makeFirstResponder(nil)
+          }
+        }
+      }
+    }
+  }
+
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    guardFocus()
     // The toggle's label fits or not as the window resizes.
     if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
     resizeObserver = window.map {
@@ -640,7 +775,10 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     if window != nil, let clip = enclosingScrollView?.contentView {
       clip.postsBoundsChangedNotifications = true
       scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { [weak self] _ in
-        MainActor.assumeIsolated { self?.syncHoverWithPointer() }
+        MainActor.assumeIsolated {
+          self?.syncHoverWithPointer()
+          MediaLoadQueue.shared.schedule()
+        }
       }
     }
     if window != nil {
@@ -801,7 +939,41 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   /// From the app: a block may not know its own appearance yet when it loads.
   private var isDark: Bool { NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
 
+  /// Loads now when it's at hand (a local or cached image), otherwise when
+  /// its turn comes (see MediaLoadQueue), showing that it's loading.
   private func loadContent() {
+    switch descriptor.kind {
+    case .image(let url) where url.isFileURL || ImageCache.shared.image(for: url) != nil:
+      performLoad()
+    case .video(let url) where url.isFileURL:
+      performLoad()
+    default:
+      if !waitingToLoad { startLoading() }
+      waitingToLoad = true
+      MediaLoadQueue.shared.request(self)
+    }
+  }
+
+  private var waitingToLoad = false
+
+  func startQueuedLoad() {
+    guard waitingToLoad, content == nil, window != nil else { return }
+    waitingToLoad = false
+    performLoad()
+  }
+
+  /// How far it is from the visible part of its page: 0 on screen or close
+  /// to it.
+  var distanceFromView: CGFloat {
+    guard !isHiddenOrHasHiddenAncestor, frame.minX > -50_000 else { return .greatestFiniteMagnitude }
+    guard let clip = enclosingScrollView?.contentView else { return 0 }
+    let visible = clip.convert(clip.bounds, to: nil).insetBy(dx: 0, dy: -clip.bounds.height / 2)
+    let rect = convert(bounds, to: nil)
+    if rect.maxY >= visible.minY && rect.minY <= visible.maxY { return 0 }
+    return rect.minY > visible.maxY ? rect.minY - visible.maxY : visible.minY - rect.maxY
+  }
+
+  private func performLoad() {
     switch descriptor.kind {
     case .image(let url):
       if url.isFileURL {
@@ -873,6 +1045,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
         DispatchQueue.main.async {
           self?.placeholder.layer?.removeAnimation(forKey: "pulse")
           self?.placeholder.image = Theme.symbol("exclamationmark.triangle", size: 22, weight: .regular)
+          if let self { MediaLoadQueue.shared.finished(self) }
         }
       }
     case .embed(let url, let provider, let groups):
@@ -881,6 +1054,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
         guard let self else { return }
         guard let resolution else {
           self.placeholder.image = Theme.symbol("exclamationmark.triangle", size: 22, weight: .regular)
+          MediaLoadQueue.shared.finished(self)
           return
         }
         self.resolution = resolution
@@ -943,6 +1117,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   private func unloadContent() {
+    waitingToLoad = false
+    MediaLoadQueue.shared.finished(self)
     discardPending()
     playbackObservation = nil
     if isPlayingSound {
@@ -958,6 +1134,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   private func startLoading() {
+    // Already showing it (it waited its turn to load): it carries on.
+    if !loaded, placeholder.layer?.animation(forKey: "pulse") != nil { return }
     loaded = false
     placeholder.isHidden = false
     placeholder.alphaValue = 0.6
@@ -974,6 +1152,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   private func finishLoading(immediately: Bool) {
+    MediaLoadQueue.shared.finished(self)
     placeholder.layer?.removeAnimation(forKey: "pulse")
     loaded = true
     placeholder.alphaValue = 0
@@ -1108,71 +1287,86 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   func relayout(animated: Bool, followingContent: Bool = false) {
     resizesWithContent = followingContent
-    let target = targetState()
-    guard animated, window != nil, !Motion.reduceMotion else {
-      timer?.invalidate()
-      timer = nil
-      animation = nil
-      apply(target.0, height: target.1)
-      return
-    }
-    animation = (CACurrentMediaTime(), (wrapperFrame, blockHeight), target)
-    if timer == nil {
-      let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
-        MainActor.assumeIsolated { self?.tick() }
-      }
-      RunLoop.main.add(timer, forMode: .common)
-      self.timer = timer
-    }
-    tick()
+    let (rect, height) = targetState()
+    apply(rect, height: height, animated: animated && window != nil && !Motion.reduceMotion)
   }
 
-  private func tick() {
-    guard let animation else { return }
-    let duration = 0.3
-    let t = min(1, (CACurrentMediaTime() - animation.start) / duration)
-    let e = CGFloat(CubicBezier.media(t))
-    func lerp(_ a: CGFloat, _ b: CGFloat) -> CGFloat { a + (b - a) * e }
-    let (fromRect, fromHeight) = animation.from
-    let (toRect, toHeight) = animation.to
-    let rect = NSRect(x: lerp(fromRect.minX, toRect.minX), y: lerp(fromRect.minY, toRect.minY),
-                      width: lerp(fromRect.width, toRect.width), height: lerp(fromRect.height, toRect.height))
-    apply(rect, height: lerp(fromHeight, toHeight))
-    if t >= 1 {
-      timer?.invalidate()
-      timer = nil
-      self.animation = nil
-    }
-  }
+  /// How long a block takes to resize. The render server runs it, so it
+  /// stays smooth however busy the page is. (A variable so automated checks
+  /// can slow it down.)
+  static var resizeDuration: CFTimeInterval = 0.3
 
-  private func apply(_ rect: NSRect, height: CGFloat) {
-    wrapperFrame = rect
-    wrapper.frame = rect
-    wrapper.layer?.backgroundColor = resolvedCGColor(loaded ? .clear : Theme.codeBackground)
-    // The media is always laid out at its final size, so embedded pages never
-    // see a resize (their responsive layout stays put). Expanding and
-    // collapsing scale it from the top-left corner instead; the wrapper clips.
-    if let content {
-      let size = targetMediaSize()
-      if content.frame.size != size { content.frame = NSRect(origin: .zero, size: size) }
-      let scale = loaded && !resizesWithContent
-        ? max(0.001, min(1, min(rect.width / max(size.width, 1), rect.height / max(size.height, 1)))) : 1
-      Motion.withoutAnimation {
+  private func apply(_ rect: NSRect, height: CGFloat, animated: Bool) {
+    let animatable: [(CALayer?, String)] = [
+      (wrapper.layer, "position"), (wrapper.layer, "bounds"), (wrapper.layer, "opacity"), (content?.layer, "transform"),
+      (row.layer, "opacity"), (placeholder.layer, "position"), (placeholder.layer, "bounds"),
+    ]
+    // A resize under way turns from where things are on screen.
+    let from = animatable.map { layer, key in (layer?.presentation() ?? layer)?.value(forKeyPath: key) }
+
+    Motion.withoutAnimation {
+      wrapperFrame = rect
+      wrapper.frame = rect
+      if !collapsed { selectionTint.frame = rect }
+      wrapper.layer?.backgroundColor = resolvedCGColor(loaded ? .clear : Theme.codeBackground)
+      // The media is always laid out at its final size, so embedded pages
+      // never see a resize (their responsive layout stays put). Expanding and
+      // collapsing scale it from the top-left corner instead; the wrapper
+      // clips.
+      if let content {
+        let size = targetMediaSize()
+        if content.frame.size != size { content.frame = NSRect(origin: .zero, size: size) }
+        let scale = loaded && !resizesWithContent
+          ? max(0.001, min(1, min(rect.width / max(size.width, 1), rect.height / max(size.height, 1)))) : 1
         content.layer?.transform = scale >= 0.999 ? CATransform3DIdentity : content.topLeftScale(scale)
       }
+      let iconSize: CGFloat = 26
+      placeholder.frame = NSRect(x: (rect.width - iconSize) / 2, y: (rect.height - iconSize) / 2, width: iconSize, height: iconSize)
+      wrapper.alphaValue = collapsed ? min(1, rect.height / 40) : 1
+      // The collapsed row shows as the media leaves.
+      row.alphaValue = collapsed ? 1 : 0
     }
-    let iconSize: CGFloat = 26
-    placeholder.frame = NSRect(x: (rect.width - iconSize) / 2, y: (rect.height - iconSize) / 2, width: iconSize, height: iconSize)
-    wrapper.alphaValue = collapsed ? min(1, rect.height / 40) : 1
+    // Hidden once faded out (and not shown again since).
+    rowGeneration += 1
+    if row.alphaValue > 0 {
+      row.isHidden = false
+    } else if !animated {
+      row.isHidden = true
+    } else {
+      let generation = rowGeneration
+      DispatchQueue.main.asyncAfter(deadline: .now() + MediaBlockView.resizeDuration) { [weak self] in
+        guard let self, self.rowGeneration == generation else { return }
+        self.row.isHidden = true
+      }
+    }
+    if animated {
+      for ((layer, key), value) in zip(animatable, from) {
+        guard let layer, var value else { continue }
+        // The media scales with the wrapper from where it is, like expanding
+        // (it was at full size while loading, behind the placeholder).
+        if let content, layer === content.layer, loaded, !resizesWithContent,
+           let bounds = (from[1] as? NSValue)?.rectValue {
+          let size = content.frame.size
+          let scale = max(0.001, min(1, min(bounds.width / max(size.width, 1), bounds.height / max(size.height, 1))))
+          value = NSValue(caTransform3D: scale >= 0.999 ? CATransform3DIdentity : content.topLeftScale(scale))
+        }
+        let animation = CABasicAnimation(keyPath: key)
+        animation.fromValue = value
+        animation.toValue = layer.value(forKeyPath: key)
+        animation.duration = MediaBlockView.resizeDuration
+        animation.timingFunction = CubicBezier.media.timingFunction
+        // The row fades in late and out early, as the media leaves and comes.
+        if layer === row.layer {
+          animation.timingFunction = collapsed ? CAMediaTimingFunction(controlPoints: 0.7, 0, 0.84, 0) : CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
+        }
+        layer.add(animation, forKey: "glea.block.\(key)")
+      }
+    }
 
-    // The collapsed row fades in as the media leaves.
-    row.alphaValue = collapsed ? max(0, 1 - rect.height / 60) : 0
-    row.isHidden = row.alphaValue == 0
-
-    let changed = abs(height - blockHeight) > 0.25
+    let old = blockHeight
     blockHeight = height
     needsLayout = true
-    if changed { onHeightChange?() }
+    if abs(height - old) > 0.25 { onHeightChange?(animated ? old : nil) }
   }
 
   override func layout() {
@@ -1184,6 +1378,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     rowTitle.superview?.frame = NSRect(x: 26, y: (MediaBlockView.rowHeight - 18) / 2, width: titleWidth, height: 18)
     rowTitle.frame = NSRect(x: 0, y: 0, width: titleWidth, height: 18)
     row.frame = NSRect(x: 0, y: 0, width: bounds.width, height: MediaBlockView.rowHeight)
+    selectionTint.frame = collapsed
+      ? NSRect(x: -3, y: 0, width: min(bounds.width, rowTitle.frame.maxX + 32), height: MediaBlockView.rowHeight)
+      : wrapperFrame
 
     // In the gutter, right of the text column, level with the first line;
     // just its icon when the window is too narrow for its label.
@@ -1289,10 +1486,32 @@ private final class LowercaseCenteredImageView: NSImageView {
   override var alignmentRectInsets: NSEdgeInsets { NSEdgeInsets(top: -shift, left: 0, bottom: shift, right: 0) }
 }
 
-/// "↘↖ collapse" / "↖↘ expand", shown on hover.
-private final class MediaToggleButton: NSView {
+/// "↘↖ collapse" / "↖↘ expand", shown on hover. Also a table's
+/// "markdown" / "table" (other `looks`).
+final class MediaToggleButton: NSView {
+  struct Look {
+    let symbol: String
+    let label: String
+    let tooltip: String
+  }
+
   var onClick: (() -> Void)?
   var collapsed = false { didSet { update() } }
+  /// Centers the icon on the label's capitals instead of its lowercase
+  /// letters (labels with tall letters, like "markdown" and "table").
+  var centersIconOnCapitals = false { didSet { updateIconShift() } }
+
+  private func updateIconShift() {
+    guard let font = label.font else { return }
+    let middle = centersIconOnCapitals ? font.capHeight / 2 : font.xHeight / 2
+    icon.shift = (font.ascender + font.descender) / 2 - middle
+  }
+
+  /// What it shows when `collapsed`, and when not.
+  var looks = (collapsed: Look(symbol: "arrow.up.left.and.arrow.down.right", label: "expand", tooltip: "Expand"),
+               expanded: Look(symbol: "arrow.down.right.and.arrow.up.left", label: "collapse", tooltip: "Collapse")) {
+    didSet { update() }
+  }
   private let icon = LowercaseCenteredImageView()
   private let label = NSTextField.label("collapse", size: 12, weight: .regular, color: Theme.tertiaryText)
 
@@ -1305,7 +1524,8 @@ private final class MediaToggleButton: NSView {
   /// Its width with the longer label ("collapse"): every toggle decides by
   /// it, so they all show or hide their label at once.
   var labelledWidth: CGFloat {
-    let text = ("collapse" as NSString).size(withAttributes: [.font: label.font ?? NSFont.systemFont(ofSize: 12)]).width + 4
+    let longer = looks.collapsed.label.count > looks.expanded.label.count ? looks.collapsed.label : looks.expanded.label
+    let text = (longer as NSString).size(withAttributes: [.font: label.font ?? NSFont.systemFont(ofSize: 12)]).width + 4
     return 2 + (icon.image?.size.width ?? 12) + 6 + ceil(text) + 4
   }
 
@@ -1373,9 +1593,7 @@ private final class MediaToggleButton: NSView {
     let stack = NSStackView(views: [icon, label])
     stack.spacing = 6
     stack.edgeInsets = NSEdgeInsets(top: 3, left: 2, bottom: 3, right: 4)
-    if let font = label.font {
-      icon.shift = (font.ascender + font.descender) / 2 - font.xHeight / 2
-    }
+    updateIconShift()
     addSubview(stack)
     stack.pinEdges(to: self)
     update()
@@ -1395,9 +1613,10 @@ private final class MediaToggleButton: NSView {
   required init?(coder: NSCoder) { fatalError() }
 
   private func update() {
-    icon.image = Theme.symbol(collapsed ? "arrow.up.left.and.arrow.down.right" : "arrow.down.right.and.arrow.up.left", size: 10, weight: .semibold)
-    label.stringValue = collapsed ? "expand" : "collapse"
-    toolTip = showsLabel ? nil : (collapsed ? "Expand" : "Collapse")
+    let look = collapsed ? looks.collapsed : looks.expanded
+    icon.image = Theme.symbol(look.symbol, size: 10, weight: .semibold)
+    label.stringValue = look.label
+    toolTip = showsLabel ? nil : look.tooltip
     let color = hovering ? Theme.text : Theme.tertiaryText
     label.textColor = color
     icon.contentTintColor = color

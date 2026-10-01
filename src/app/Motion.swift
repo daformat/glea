@@ -9,6 +9,10 @@ enum Motion {
   static let standard = CAMediaTimingFunction(controlPoints: 0.25, 0.1, 0.25, 1)
   static let easeOut = CAMediaTimingFunction(controlPoints: 0.16, 1, 0.3, 1)
 
+  /// How long a note's section takes to fold or unfold (a variable so
+  /// automated checks can slow it down).
+  static var foldDuration: CFTimeInterval = 0.28
+
   static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
 
   static func spring(_ keyPath: String, stiffness: CGFloat = 400, damping: CGFloat = 28) -> CASpringAnimation {

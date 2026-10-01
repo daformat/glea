@@ -49,6 +49,14 @@ final class GleaMainWindow: NSWindow {
   @objc func _hasActiveAppearanceIgnoringKeyFocus() -> Bool { NSApp.isActive }
   @objc func _hasKeyAppearance() -> Bool { NSApp.isActive }
 
+  /// An embed in a note doesn't take the focus on its own as it loads
+  /// (the note's selection would flicker, ⌘A would go to the embed): only
+  /// when it's clicked.
+  override func makeFirstResponder(_ responder: NSResponder?) -> Bool {
+    if let view = responder as? NSView, MediaBlockView.takesFocusUnasked(view) { return false }
+    return super.makeFirstResponder(responder)
+  }
+
   /// AppKit resets the window buttons to their default place whenever the
   /// title changes (the title follows the active tab) or the window comes
   /// forward (Beam hit this too): put them back right away.

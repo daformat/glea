@@ -5,7 +5,11 @@ import AppKit
 /// drawn by the app, not written into the journal's Markdown.
 final class DailySummaryView: NSView {
   weak var navigator: NoteNavigator?
+  /// Called once it's closed (folded away): the journal removes it.
   var onHide: (() -> Void)?
+  /// How open it is while closing, from 1 to 0 (the journal closes the gap
+  /// below it along).
+  var onFold: ((CGFloat) -> Void)?
 
   /// The day it was hidden for: it comes back the next day.
   static var hiddenOn: String? {
@@ -14,6 +18,7 @@ final class DailySummaryView: NSView {
   }
 
   private let stack = NSStackView()
+  private var foldTimer: Timer?
 
   init(summary: ActivityLog.Summary) {
     super.init(frame: .zero)
@@ -26,8 +31,19 @@ final class DailySummaryView: NSView {
     stack.spacing = 4
     stack.translatesAutoresizingMaskIntoConstraints = false
     addSubview(stack)
-    stack.pinEdges(to: self, insets: NSEdgeInsets(top: 14, left: 16, bottom: 16, right: 16))
+    // Its bottom gives way while it folds (a height then rules).
+    let bottom = bottomAnchor.constraint(equalTo: stack.bottomAnchor, constant: 16)
+    bottom.priority = .init(999)
+    NSLayoutConstraint.activate([
+      stack.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+      stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      trailingAnchor.constraint(equalTo: stack.trailingAnchor, constant: 16),
+      bottom,
+    ])
 
+    hover.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(hover, positioned: .below, relativeTo: stack)
+    hover.pinEdges(to: self)
     addHeader(for: summary.day)
 
     var pickUp: [NSView] = []
@@ -60,6 +76,9 @@ final class DailySummaryView: NSView {
 
   required init?(coder: NSCoder) { fatalError() }
 
+  /// The pointer over the card (shows the close button).
+  private let hover = HoverView()
+
   /// Whether there's anything to show under the header.
   var hasContent: Bool { stack.arrangedSubviews.count > 1 }
 
@@ -75,7 +94,7 @@ final class DailySummaryView: NSView {
   // MARK: Building
 
   /// "YESTERDAY", or the weekday when the last active day was earlier, and
-  /// a Hide button that shows while the pointer is over the header.
+  /// a close button (like a tab's) that shows while the pointer is over the card.
   private func addHeader(for dayKey: String) {
     let date = NoteStore.dayFormatter.date(from: dayKey) ?? Date()
     let title: String
@@ -87,21 +106,24 @@ final class DailySummaryView: NSView {
       title = formatter.string(from: date)
     }
     let label = NSTextField.label(title.uppercased(), size: 11, weight: .semibold, color: Theme.tertiaryText)
-    let hide = QuietButton(title: "Hide")
-    hide.onClick = { [weak self] in self?.hide() }
-    hide.alphaValue = 0
-    hide.isHidden = true
-    let header = HoverView()
+    let close = IconButton(symbol: "xmark", size: 9, tooltip: "Close until tomorrow", target: self, action: #selector(closeClicked))
+    NSLayoutConstraint.activate([
+      close.widthAnchor.constraint(equalToConstant: 22),
+      close.heightAnchor.constraint(equalToConstant: 22),
+    ])
+    close.alphaValue = 0
+    close.isHidden = true
+    hover.onHover = { [weak close] hovering in close?.fade(in: hovering) }
+    let header = NSView()
     header.translatesAutoresizingMaskIntoConstraints = false
-    header.onHover = { [weak hide] hovering in hide?.fade(in: hovering) }
     header.addSubview(label)
-    header.addSubview(hide)
+    header.addSubview(close)
     NSLayoutConstraint.activate([
       label.leadingAnchor.constraint(equalTo: header.leadingAnchor),
       label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
       header.heightAnchor.constraint(equalToConstant: 20),
-      hide.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: 4),
-      hide.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
+      close.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: 5),
+      close.centerYAnchor.constraint(equalTo: label.centerYAnchor),
     ])
     stack.addArrangedSubview(header)
     header.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -170,10 +192,42 @@ final class DailySummaryView: NSView {
 
   // MARK: Hiding
 
-  private func hide() {
+  @objc private func closeClicked() {
     DailySummaryView.hiddenOn = NoteStore.dayFormatter.string(from: Date())
-    Motion.animate(0.2, timing: Motion.easeInOut, { animator().alphaValue = 0 }, completion: { [weak self] in
-      self?.onHide?()
-    })
+    fold()
+  }
+
+  /// Folds away like a note's section: the height eases to nothing (cubic
+  /// ease-out, the sections' timing), the content clipped and fading.
+  private func fold() {
+    guard foldTimer == nil else { return }
+    guard !Motion.reduceMotion else {
+      onFold?(0)
+      onHide?()
+      return
+    }
+    layer?.masksToBounds = true
+    let full = bounds.height
+    let height = heightAnchor.constraint(equalToConstant: full)
+    height.isActive = true
+    let began = CACurrentMediaTime()
+    let duration = Motion.foldDuration
+    let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard let self else { return timer.invalidate() }
+        let t = min(1, (CACurrentMediaTime() - began) / duration)
+        let shown = 1 - CGFloat(1 - pow(1 - t, 3))
+        height.constant = (full * shown).rounded()
+        self.stack.alphaValue = shown
+        self.onFold?(shown)
+        if t >= 1 {
+          timer.invalidate()
+          self.foldTimer = nil
+          self.onHide?()
+        }
+      }
+    }
+    foldTimer = timer
+    RunLoop.main.add(timer, forMode: .common)
   }
 }

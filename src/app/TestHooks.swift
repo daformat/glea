@@ -141,14 +141,24 @@ enum TestHooks {
       }
     case "undo", "redo":
       // Like ⌘Z / ⇧⌘Z, with the window's undo manager.
-      let undo = controller.window?.firstResponder?.undoManager ?? controller.window?.undoManager
-      if parts[0] == "undo" { undo?.undo() } else { undo?.redo() }
+      // Through the responder chain, like the menu (a table cell's editor
+      // routes it to its note).
+      if NSApp.sendAction(Selector(parts[0] + ":"), to: nil, from: nil) == false {
+        let undo = controller.window?.firstResponder?.undoManager ?? controller.window?.undoManager
+        if parts[0] == "undo" { undo?.undo() } else { undo?.redo() }
+      }
     case "focus-note":
       // Puts the cursor at the start of the visible note.
       let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
       editor?.focus(atEnd: false)
     case "fold-duration":
-      if let seconds = Double(argument) { FoldAnimation.fullDuration = seconds }
+      if let seconds = Double(argument) { Motion.foldDuration = seconds }
+    case "table-hover":
+      // table-hover:<n>: the pointer over the visible note's nth table (-1: away).
+      let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
+      if let n = Int(argument) { editor?.debugHoverTable(n) } else { editor?.debugClickTableToggle() }
+    case "media-duration":
+      if let seconds = Double(argument) { MediaBlockView.resizeDuration = seconds }
     case "fold":
       // fold:<n> collapses or expands the nth heading's section in the visible note.
       let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
@@ -166,6 +176,13 @@ enum TestHooks {
          let item = controller.tabMenu(for: tab).items.first(where: { $0.title == argument }), let action = item.action {
         NSApp.sendAction(action, to: item.target, from: item)
       }
+    case "media-collapse":
+      // media-collapse:<n>,<0|1>: collapses or expands the nth media block shown.
+      let v = argument.split(separator: ",").compactMap { Int($0) }
+      let blocks = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MediaBlockView }
+        .filter { !$0.isHiddenOrHasHiddenAncestor && $0.frame.minX > -50_000 }
+        .sorted { $0.convert($0.bounds, to: nil).maxY > $1.convert($1.bounds, to: nil).maxY }
+      if v.count == 2, blocks.indices.contains(v[0]) { blocks[v[0]].setCollapsed(v[1] == 1) }
     case "media-label":
       // media-label:<0/1>: the first media block's toggle, its label shrinking out or growing in.
       let blocks = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MediaBlockView }
@@ -430,6 +447,22 @@ enum TestHooks {
       // for it in the event queue while handling the down.
       if let up = mouse(.leftMouseUp) { NSApp.postEvent(up, atStart: false) }
       if let down = mouse(.leftMouseDown) { window.sendEvent(down) }
+    case "drag-select":
+      // drag-select:<x1>,<y1>,<x2>,<y2>: press, drag and release in the window
+      // (points, from the top left), through the event queue.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      guard v.count == 4, let window = controller.window, let content = window.contentView else { break }
+      func event(_ type: NSEvent.EventType, _ x: Double, _ y: Double) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: NSPoint(x: x, y: content.bounds.height - y), modifierFlags: [],
+                           timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
+                           context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+      }
+      for step in 1...6 {
+        let t = Double(step) / 6
+        if let drag = event(.leftMouseDragged, v[0] + (v[2] - v[0]) * t, v[1] + (v[3] - v[1]) * t) { NSApp.postEvent(drag, atStart: false) }
+      }
+      if let up = event(.leftMouseUp, v[2], v[3]) { NSApp.postEvent(up, atStart: false) }
+      if let down = event(.leftMouseDown, v[0], v[1]) { window.sendEvent(down) }
     case "real-click":
       // real-click:<x>,<y>: a click through the event queue, dispatched like
       // a real one (the window's hit testing, the table's checks).

@@ -544,6 +544,11 @@ final class JournalView: ColumnPageView {
     let view = DailySummaryView(summary: summary)
     guard view.hasContent else { return nil }
     view.navigator = navigator
+    // The gap below closes along with it.
+    view.onFold = { [weak self, weak view] shown in
+      guard let self, let view else { return }
+      self.column.setCustomSpacing(20 * shown, after: view)
+    }
     view.onHide = { [weak self, weak view] in
       guard let self, let view else { return }
       self.column.removeArrangedSubview(view)
@@ -792,9 +797,8 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
       backlinks.addArrangedSubview(source)
       backlinks.setCustomSpacing(4, after: source)
       for line in link.lines.prefix(4) {
-        let text = NSTextField(wrappingLabelWithString: line)
-        text.font = .systemFont(ofSize: 13)
-        text.textColor = Theme.secondaryText
+        let text = NSTextField(wrappingLabelWithString: "")
+        text.attributedStringValue = MarkdownPreview.render(line)
         text.translatesAutoresizingMaskIntoConstraints = false
         backlinks.addArrangedSubview(text)
         text.widthAnchor.constraint(equalTo: backlinks.widthAnchor).isActive = true
@@ -904,7 +908,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     unlinkedFold = nil
     let target: CGFloat = showsUnlinked ? 1 : 0
     guard !Motion.reduceMotion else { return applyUnlinkedShown(target) }
-    let duration = FoldAnimation.fullDuration * Double(abs(target - unlinkedShown))
+    let duration = Motion.foldDuration * Double(abs(target - unlinkedShown))
     let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.stepUnlinkedFold() }
     }
@@ -958,10 +962,9 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     line = line.substring(from: leading) as NSString
     match.location -= leading
 
-    let text = NSMutableAttributedString(string: line as String, attributes: [
-      .font: NSFont.systemFont(ofSize: 13), .foregroundColor: Theme.secondaryText,
+    let text = MarkdownPreview.render(line as String, highlight: match, highlightAttributes: [
+      .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: Theme.text,
     ])
-    text.addAttributes([.font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: Theme.text], range: match)
     let label = NSTextField(wrappingLabelWithString: "")
     label.attributedStringValue = text
     label.translatesAutoresizingMaskIntoConstraints = false
@@ -1048,7 +1051,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
 // MARK: - All notes
 
-final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuDelegate {
+final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
   weak var navigator: NoteNavigator?
   var onNewNote: (() -> Void)?
   /// A note's ⋮ menu (or right click): export it, move it to the Trash; the
@@ -1129,9 +1132,12 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     tableView.target = self
     tableView.action = #selector(rowClicked)
     // Right click: the same menu as a row's ⋮ button.
-    let rowMenu = NSMenu()
-    rowMenu.delegate = self
-    tableView.menu = rowMenu
+    tableView.menuForRow = { [weak self] row in
+      guard let self, self.refs.indices.contains(row) else { return nil }
+      let menu = NSMenu()
+      self.addNoteItems(for: self.refs[row], to: menu)
+      return menu
+    }
     let scroll = NSScrollView()
     scroll.documentView = tableView
     scroll.drawsBackground = false
@@ -1330,13 +1336,6 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     menu.addItem(ClosureMenuItem(title: "Move to Trash…") { [weak self] in self?.onDelete?([ref]) })
   }
 
-  func menuNeedsUpdate(_ menu: NSMenu) {
-    menu.removeAllItems()
-    let row = tableView.clickedRow
-    guard refs.indices.contains(row) else { return }
-    addNoteItems(for: refs[row], to: menu)
-  }
-
   func numberOfRows(in tableView: NSTableView) -> Int { refs.count }
 
   func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -1368,6 +1367,15 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 /// keeps clicks on custom controls, selecting the row and opening the note),
 /// and the pointer is an arrow over it.
 private final class NotesTableView: NSTableView {
+  /// The menu a right click (or ⌃-click) anywhere on a row opens.
+  var menuForRow: ((Int) -> NSMenu?)?
+
+  /// Without NSTableView's own handling, which outlines the clicked row.
+  override func menu(for event: NSEvent) -> NSMenu? {
+    let row = row(at: convert(event.locationInWindow, from: nil))
+    return row >= 0 ? menuForRow?(row) : nil
+  }
+
   override func validateProposedFirstResponder(_ responder: NSResponder, for event: NSEvent?) -> Bool {
     responder is IconButton || responder is SelectionCheckbox || super.validateProposedFirstResponder(responder, for: event)
   }
