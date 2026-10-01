@@ -258,11 +258,16 @@ enum TestHooks {
       // (to the overlay window while an overlay is up).
       let overlayWindow = NSApp.windows.first { w in w.contentView?.subviews.contains { $0 is OverlayView } == true }
       guard let window = overlayWindow ?? controller.window else { break }
-      let parts = argument.split(separator: ",", maxSplits: 1).map(String.init)
+      // (keydown:<keyCode>,<characters>,<cmd|opt|shift|ctrl joined by +> for modifiers.)
+      let parts = argument.split(separator: ",", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
       let code = UInt16(parts[0]) ?? 0
-      let chars = parts.count > 1 ? parts[1].replacingOccurrences(of: "\\t", with: "\t") : ""
+      let chars = parts.count > 1 ? parts[1].replacingOccurrences(of: "\\t", with: "\t").replacingOccurrences(of: "\\r", with: "\r") : ""
+      var flags: NSEvent.ModifierFlags = []
+      for name in (parts.count > 2 ? parts[2] : "").split(separator: "+") {
+        flags.insert(["cmd": .command, "opt": .option, "shift": .shift, "ctrl": .control][String(name)] ?? [])
+      }
       for type in [NSEvent.EventType.keyDown, .keyUp] {
-        if let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+        if let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
                                         windowNumber: window.windowNumber, context: nil, characters: chars,
                                         charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
           window.sendEvent(event)

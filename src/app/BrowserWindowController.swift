@@ -900,8 +900,19 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
   }
 
+  /// What had the keyboard focus in the notes when the web took over (a
+  /// note's text, with its cursor), and where: coming back gives it back.
+  private weak var notesFocusView: NSView?
+  private var notesFocusMode: Mode?
+  /// Whether the last mode change gave the notes' focus back.
+  private var restoredNotesFocus = false
+
   func setMode(_ newMode: Mode) {
     let previousPlace = currentNotePlace
+    if newMode == .web, mode != .web, let view = window?.firstResponder as? NSView, view.isDescendant(of: container(for: mode)) {
+      notesFocusView = view
+      notesFocusMode = mode
+    }
     if case .note = mode, newMode != mode {
       MarkdownEditorView.flushAll()
       discardIfUntouched()
@@ -918,6 +929,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     case .note: break
     }
     crossfade(from: outgoing, to: incoming)
+    restoredNotesFocus = false
+    if newMode != .web, newMode == notesFocusMode, let view = notesFocusView, view.window === window, view.isDescendant(of: incoming) {
+      restoredNotesFocus = window?.makeFirstResponder(view) == true
+    }
     if newMode != .web {
       // A new place in the notes is a step back from the last one (the
       // window's first place isn't).
@@ -1863,6 +1878,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     setMode(.note(ref))
   }
 
+  func openSearch(_ url: URL) {
+    openTab(url.absoluteString)
+  }
+
   func openLink(_ url: URL) {
     if url.scheme == "glea-note" {
       let raw = url.absoluteString.dropFirst("glea-note:".count)
@@ -2062,7 +2081,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   @objc func showJournal(_ sender: Any?) {
     setMode(.journal)
-    journalView.focusToday()
+    if !restoredNotesFocus { journalView.focusToday() }
   }
 
   @objc func showAllNotes(_ sender: Any?) {

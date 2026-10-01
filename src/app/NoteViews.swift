@@ -5,6 +5,8 @@ import AppKit
 protocol NoteNavigator: AnyObject {
   func openNote(_ ref: NoteRef)
   func openLink(_ url: URL)
+  /// A web search from a note (⌘↩), shown in a new tab.
+  func openSearch(_ url: URL)
 }
 
 /// A heading the table of contents can jump to.
@@ -513,6 +515,7 @@ final class JournalView: ColumnPageView {
       }
       let editor = MarkdownEditorView(ref: day, placeholder: day == today ? "What's on your mind today?" : "")
       editor.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
+      editor.onSearch = { [weak self] url in self?.navigator?.openSearch(url) }
       editors[day] = editor
       addToColumn(editor, spacingAfter: index == shownDays.count - 1 ? 32 : 48)
     }
@@ -724,6 +727,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
     let editor = MarkdownEditorView(ref: ref)
     editor.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
+    editor.onSearch = { [weak self] url in self?.navigator?.openSearch(url) }
     editor.onTextChange = { [weak self] in self?.refreshToc() }
     self.editor = editor
     addToColumn(editor, spacingAfter: 56)

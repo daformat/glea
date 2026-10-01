@@ -1589,6 +1589,7 @@ final class MarkdownTextView: NSTextView {
   /// A click in a wrapped table's cell (its row's location, its column):
   /// the cell's own field takes it.
   var onEditCell: ((_ row: Int, _ column: Int, _ event: NSEvent) -> Void)?
+  var onSearch: ((URL) -> Void)?
 
   /// Kept between the cursor and the page's top or bottom edge as it moves.
   private static let caretMargin: CGFloat = 40
@@ -1856,6 +1857,90 @@ final class MarkdownTextView: NSTextView {
 
   private static let headingPrefix = try! NSRegularExpression(pattern: "^#{1,6} ")
 
+  // MARK: Searching the web
+
+  /// ⌘↩ searches the web for the word at the cursor (or the selection),
+  /// ⌥⌘↩ for the sentence; the searched text becomes a link to the search.
+  override func keyDown(with event: NSEvent) {
+    if event.keyCode == 36 || event.keyCode == 76, !hasMarkedText() {
+      let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
+      if flags == .command || flags == [.command, .option], searchWeb(sentence: flags.contains(.option)) { return }
+    }
+    super.keyDown(with: event)
+  }
+
+  private func searchWeb(sentence: Bool) -> Bool {
+    let selection = selectedRange()
+    guard let range = selection.length > 0 ? selection : (sentence ? sentenceAtCursor() : wordAtCursor()), range.length > 0 else {
+      return false
+    }
+    let raw = (string as NSString).substring(with: range)
+    // What reads on screen, not its Markdown.
+    let query = MarkdownPreview.render(raw).string.trimmingCharacters(in: .whitespacesAndNewlines)
+    // (Parentheses would end the Markdown link early.)
+    let address = SearchEngine.current.searchURL(query).replacingOccurrences(of: "(", with: "%28").replacingOccurrences(of: ")", with: "%29")
+    guard !query.isEmpty, let url = URL(string: address) else { return false }
+    // Already a link (or in one): just searched.
+    let linked = (range.location..<NSMaxRange(range)).contains { textStorage?.attribute(.link, at: $0, effectiveRange: nil) != nil }
+      || raw.contains("](") || raw.contains("[[")
+    if !linked, !raw.contains("\n") {
+      let label = raw.replacingOccurrences(of: "[", with: "\\[").replacingOccurrences(of: "]", with: "\\]")
+      replace(range, with: "[\(label)](\(url.absoluteString))")
+    }
+    onSearch?(url)
+    return true
+  }
+
+  /// The line's text after its Markdown marker ("- ", "> ", "## "...).
+  private var currentLineContent: NSRange {
+    let line = currentLine
+    let local = NSRange(location: 0, length: (line.text as NSString).length)
+    var markerEnd = 0
+    for pattern in [MarkdownTextView.listPrefix, MarkdownTextView.quotePrefix, MarkdownTextView.headingPrefix] {
+      if let m = pattern.firstMatch(in: line.text, range: local) { markerEnd = max(markerEnd, m.range.length) }
+    }
+    return NSRange(location: line.range.location + markerEnd, length: local.length - markerEnd)
+  }
+
+  /// The word the cursor is in or just after (skipping spaces back to it).
+  private func wordAtCursor() -> NSRange? {
+    let s = string as NSString
+    let content = currentLineContent
+    let isWord: (Int) -> Bool = { index in
+      guard let scalar = Unicode.Scalar(s.character(at: index)) else { return true }
+      return CharacterSet.alphanumerics.contains(scalar) || "'’-_".unicodeScalars.contains(scalar)
+    }
+    var end = min(max(selectedRange().location, content.location), NSMaxRange(content))
+    while end < NSMaxRange(content), isWord(end) { end += 1 }
+    while end > content.location, !isWord(end - 1) { end -= 1 }
+    var start = end
+    while start > content.location, isWord(start - 1) { start -= 1 }
+    return end > start ? NSRange(location: start, length: end - start) : nil
+  }
+
+  /// The sentence the cursor is in, on its line.
+  private func sentenceAtCursor() -> NSRange? {
+    let s = string as NSString
+    let content = currentLineContent
+    let caret = min(max(selectedRange().location, content.location), NSMaxRange(content))
+    var found: NSRange?
+    s.enumerateSubstrings(in: content, options: .bySentences) { _, range, _, stop in
+      if caret >= range.location && caret <= NSMaxRange(range) {
+        found = range
+        stop.pointee = true
+      }
+    }
+    guard var range = found else { return nil }
+    // Without the space and closing punctuation around it.
+    let trim = CharacterSet.whitespaces.union(CharacterSet(charactersIn: ".!?;:"))
+    while range.length > 0, let c = Unicode.Scalar(s.character(at: NSMaxRange(range) - 1)), trim.contains(c) { range.length -= 1 }
+    while range.length > 0, let c = Unicode.Scalar(s.character(at: range.location)), CharacterSet.whitespaces.contains(c) {
+      range.location += 1
+      range.length -= 1
+    }
+    return range
+  }
+
   private func replace(_ range: NSRange, with text: String) {
     guard shouldChangeText(in: range, replacementString: text) else { return }
     textStorage?.replaceCharacters(in: range, with: text)
@@ -2122,6 +2207,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   private(set) var ref: NoteRef
   let textView: MarkdownTextView
   var onOpenLink: ((URL) -> Void)?
+  /// A web search started from the text (⌘↩).
+  var onSearch: ((URL) -> Void)?
   /// Called after the text changes (typing or an external edit).
   var onTextChange: (() -> Void)?
 
@@ -2188,6 +2275,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     textView.typingAttributes = MarkdownStyler.baseAttributes
     textView.delegate = self
     textView.onEditCell = { [weak self] row, column, event in self?.editCell(row: row, column: column, clicked: event) }
+    textView.onSearch = { [weak self] url in self?.onSearch?(url) }
     // (Not this note: a link to itself goes nowhere.)
     textView.noteNames = { [weak self] in NoteStore.shared.noteNames.filter { $0 != self?.ref.name } }
     textView.onFocusChange = { [weak self] focused in
@@ -3368,12 +3456,44 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     return view
   }
 
+  /// The text's change under way: where its new text is, and the headings
+  /// and code fences its lines had (they style what follows them).
+  private var pendingEdit: (range: NSRange, structure: [String]?)?
+  private static let structuralLine = try! NSRegularExpression(pattern: "^(#{1,6})(\\s|$)|^\\s*(```|~~~)")
+
+  /// The heading levels and code fences of `text`'s lines, in order.
+  private static func structure(of text: String) -> [String] {
+    text.components(separatedBy: "\n").compactMap { line in
+      guard let m = structuralLine.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else { return nil }
+      return m.range(at: 1).location != NSNotFound ? "h\(m.range(at: 1).length)" : "fence"
+    }
+  }
+
+  func textView(_ textView: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
+    guard textView === self.textView else { return true }
+    let s = storage.string as NSString
+    let replaced = s.substring(with: s.paragraphRange(for: range))
+    // (Several changes before the text says it changed: restyle it all.)
+    pendingEdit = (NSRange(location: range.location, length: ((replacementString ?? "") as NSString).length),
+                   pendingEdit == nil ? MarkdownEditorView.structure(of: replaced) : nil)
+    return true
+  }
+
   func textDidChange(_ notification: Notification) {
     isDirty = true
     if let slide { endSlide(slide) }
     hoveredTable = nil
     if let window { updateTableHover(window.mouseLocationOutsideOfEventStream) }
-    restyle()
+    // Typing restyles just its lines; a heading or fence coming, going or
+    // changing level changes the sections or code below it: everything.
+    let s = storage.string as NSString
+    if let edit = pendingEdit, let before = edit.structure, NSMaxRange(edit.range) <= s.length,
+       MarkdownEditorView.structure(of: s.substring(with: s.paragraphRange(for: edit.range))) == before {
+      restyle(limit: edit.range)
+    } else {
+      restyle()
+    }
+    pendingEdit = nil
     onTextChange?()
     saveWork?.cancel()
     let work = DispatchWorkItem { [weak self] in self?.flush() }
@@ -3420,7 +3540,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     // Out of the table shown as Markdown: back to tables.
     if tableAsMarkdown, textView.tableRowAtCursor() == nil { tableAsMarkdown = false }
     defer { beginCellEditingIfNeeded() }
-    guard selection != styledSelection else { return }
+    // Typing: the change restyles its lines (the cursor's) right after.
+    guard selection != styledSelection, pendingEdit == nil else { return }
     if selection.length == 0 { unfold(around: selection) }
     let previous = styledSelection
     restyle(limit: selection)
