@@ -5,21 +5,26 @@ import SwiftMath
 /// in a line of text, `$$…$$` as a block of its own.
 final class MathRender: NSObject {
   let image: NSImage
-  /// How far the formula goes below its baseline.
+  /// How far the formula goes below its baseline (its last line's).
   let descent: CGFloat
   let latex: String
   let fontSize: CGFloat
   let display: Bool
+  /// A formula too long for the column is broken into lines (a block):
+  /// each line's part of the LaTeX, and where it's drawn (from the top left).
+  let lines: [(range: NSRange, frame: NSRect)]
 
   var size: NSSize { image.size }
   var ascent: CGFloat { image.size.height - descent }
 
-  private init(image: NSImage, descent: CGFloat, latex: String, fontSize: CGFloat, display: Bool) {
+  private init(image: NSImage, descent: CGFloat, latex: String, fontSize: CGFloat, display: Bool,
+               lines: [(range: NSRange, frame: NSRect)]) {
     self.image = image
     self.descent = descent
     self.latex = latex
     self.fontSize = fontSize
     self.display = display
+    self.lines = lines
   }
 
   private static var cache: [String: MathRender] = [:]
@@ -28,27 +33,171 @@ final class MathRender: NSObject {
   /// The formula, or nil when it isn't valid LaTeX (its source shows), in
   /// the text's color for the app's appearance (SwiftMath sets its color
   /// once: notes with formulas restyle when the appearance changes).
+  ///
+  /// Within `maxWidth` (the column, when given): a formula too long breaks
+  /// into lines before its relations and operators (`=`, `+`…), the next
+  /// ones indented, and what still doesn't fit (a term too long to break)
+  /// is typeset smaller, down to 70%. An inline formula that fits at 70%
+  /// or more is just made smaller.
   @MainActor
-  static func render(_ latex: String, display: Bool) -> MathRender? {
+  static func render(_ latex: String, display: Bool, maxWidth: CGFloat = 0, lead: Bool = false) -> MathRender? {
+    // (A piece of an inline formula starting with an operator: an empty
+    // symbol before it gives it its spacing as an operator.)
+    if lead { return render(MathRender.lead + latex, display: display, maxWidth: maxWidth) }
     let appearance = NSApp.effectiveAppearance
     let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-    let key = (display ? "d" : "t") + (dark ? "D:" : "L:") + latex
+    let width = maxWidth > 0 ? floor(maxWidth) : 0
+    let key = (display ? "d" : "t") + (dark ? "D" : "L") + "\(Int(width)):" + latex
     if let cached = cache[key] { return cached }
     if failures.contains(key) { return nil }
     var color = Theme.text
     appearance.performAsCurrentDrawingAppearance { color = Theme.text.usingColorSpace(.sRGB) ?? Theme.text }
-    let fontSize = Theme.bodySize * (display ? 1.25 : 1.1)
-    var math = MathImage(latex: latex, fontSize: fontSize, textColor: color,
-                         labelMode: display ? .display : .text, textAlignment: .left)
-    let (error, image, layout) = math.asImage()
-    guard error == nil, let image, let layout, image.size.width > 0 else {
+    let base = Theme.bodySize * (display ? 1.25 : 1.1)
+    // (A line after the first starts with an operator: an empty symbol
+    // before it, "{}^{}", gives it its spacing as an operator, not a sign.)
+    func typeset(_ range: NSRange, _ size: CGFloat) -> (image: NSImage, descent: CGFloat)? {
+      let part = (latex as NSString).substring(with: range)
+      return MathTypeset.image(latex: range.location > 0 ? MathRender.lead + part : part, fontSize: size, color: color, display: display, maxWidth: 0)
+    }
+    let whole = NSRange(location: 0, length: (latex as NSString).length)
+    guard let full = typeset(whole, base) else {
       failures.insert(key)
       return nil
     }
+    var fontSize = base
+    var lines = [(range: whole, image: full.image, descent: full.descent)]
+    if width > 0, full.image.size.width > width {
+      // A block breaks into lines; an inline formula only gets smaller (it
+      // wraps with the text, see `inlinePieces`).
+      let shrinks = !display
+      if !shrinks, let broken = breakLines(latex, width: width, size: base, typeset: typeset) {
+        lines = broken
+      }
+      // Still too wide: smaller, the lines broken again.
+      let indent = base * 1.5
+      let widest = lines.enumerated().map { $1.image.size.width + ($0 > 0 ? indent : 0) }.max() ?? 0
+      if widest > width {
+        fontSize = base * max(0.7, width / widest)
+        if !shrinks, let broken = breakLines(latex, width: width, size: fontSize, typeset: typeset) {
+          lines = broken
+        } else if let small = typeset(whole, fontSize) {
+          lines = [(whole, small.image, small.descent)]
+        }
+      }
+    }
     if cache.count > 500 { cache.removeAll() }
-    let render = MathRender(image: image, descent: layout.descent, latex: latex, fontSize: fontSize, display: display)
+    let render: MathRender
+    if lines.count == 1 {
+      let line = lines[0]
+      render = MathRender(image: line.image, descent: line.descent, latex: latex, fontSize: fontSize, display: display,
+                          lines: [(line.range, NSRect(origin: .zero, size: line.image.size))])
+    } else {
+      // Stacked, a little apart, the lines after the first indented.
+      let indent = fontSize * 1.5, gap = fontSize * 0.35
+      var frames: [NSRect] = []
+      var y: CGFloat = 0
+      for (index, line) in lines.enumerated() {
+        frames.append(NSRect(x: index > 0 ? indent : 0, y: y, width: line.image.size.width, height: line.image.size.height))
+        y += line.image.size.height + gap
+      }
+      let size = NSSize(width: ceil(frames.map(\.maxX).max() ?? 0), height: ceil(y - gap))
+      let images = lines.map(\.image)
+      let image = NSImage(size: size, flipped: true) { _ in
+        for (picture, frame) in zip(images, frames) {
+          picture.draw(in: frame, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+        }
+        return true
+      }
+      render = MathRender(image: image, descent: lines.last?.descent ?? 0, latex: latex, fontSize: fontSize, display: display,
+                          lines: zip(lines, frames).map { ($0.range, $1) })
+    }
     cache[key] = render
     return render
+  }
+
+  /// Before a line starting with an operator: an empty symbol.
+  static let lead = "{}^{}"
+
+  /// An inline formula's pieces, each drawn on its own so the text can wrap
+  /// between them like between words: split before its top-level
+  /// relations and operators, where a space comes before them (the text
+  /// only wraps at spaces).
+  static func inlinePieces(of latex: String) -> [NSRange] {
+    let s = latex as NSString
+    let pieces = pieces(of: latex)
+    var starts: [Int] = []
+    for (index, piece) in pieces.enumerated() where index > 0 && piece.location > 0 {
+      let text = s.substring(with: piece).trimmingCharacters(in: .whitespaces)
+      let previous = s.substring(with: pieces[index - 1]).trimmingCharacters(in: .whitespaces)
+      let spaced = [0x20, 0x09].contains(s.character(at: piece.location - 1))
+      if spaced, breaks.contains(text), !breaks.contains(previous) { starts.append(piece.location) }
+    }
+    let bounds = [0] + starts + [s.length]
+    return zip(bounds, bounds.dropFirst()).map { NSRange(location: $0, length: $1 - $0) }
+  }
+
+  /// Relations and operators a long formula breaks before.
+  private static let breaks: Set<String> = [
+    "=", "+", "-", "<", ">", "\\leq", "\\geq", "\\le", "\\ge", "\\neq", "\\approx", "\\equiv", "\\sim", "\\simeq",
+    "\\cdot", "\\times", "\\pm", "\\mp", "\\to", "\\rightarrow", "\\Rightarrow", "\\Leftrightarrow", "\\iff", "\\implies",
+  ]
+
+  /// `latex` in lines no wider than `width` (the first one; the others are
+  /// indented), broken before top-level relations and operators, each with
+  /// as much as fits. Nil when it can't be broken.
+  @MainActor private static func breakLines(_ latex: String, width: CGFloat, size: CGFloat,
+                                            typeset: (NSRange, CGFloat) -> (image: NSImage, descent: CGFloat)?)
+    -> [(range: NSRange, image: NSImage, descent: CGFloat)]? {
+    let s = latex as NSString
+    let pieces = pieces(of: latex)
+    // Where lines may start: an operator, not right after another one
+    // ("= -x") nor first.
+    var starts: [Int] = []
+    for (index, piece) in pieces.enumerated() where index > 0 {
+      let text = s.substring(with: piece).trimmingCharacters(in: .whitespaces)
+      let previous = s.substring(with: pieces[index - 1]).trimmingCharacters(in: .whitespaces)
+      if breaks.contains(text), !breaks.contains(previous) { starts.append(piece.location) }
+    }
+    guard !starts.isEmpty else { return nil }
+    let bounds = [0] + starts + [s.length]
+    let indent = size * 1.5
+    var lines: [(range: NSRange, image: NSImage, descent: CGFloat)] = []
+    var lineStart = 0
+    var best: (end: Int, image: NSImage, descent: CGFloat)?
+    var index = 1
+    while index < bounds.count {
+      let range = NSRange(location: lineStart, length: bounds[index] - lineStart)
+      let room = width - (lines.isEmpty ? 0 : indent)
+      if let line = typeset(range, size), line.image.size.width <= room || best == nil {
+        best = (bounds[index], line.image, line.descent)
+        index += 1
+        continue
+      }
+      // Full: the line ends at the last break that fit.
+      guard let fitted = best else { return nil }
+      lines.append((NSRange(location: lineStart, length: fitted.end - lineStart), fitted.image, fitted.descent))
+      lineStart = fitted.end
+      best = nil
+    }
+    if let last = best { lines.append((NSRange(location: lineStart, length: last.end - lineStart), last.image, last.descent)) }
+    return lines.count > 1 ? lines : nil
+  }
+}
+
+/// A piece of an inline formula, drawn where its source starts: its part of
+/// the formula's LaTeX, and where that is in the note.
+final class MathPiece: NSObject {
+  let render: MathRender
+  let latex: String
+  /// The length of what was typeset before its LaTeX (`MathRender.lead`).
+  let lead: Int
+  let sourceStart: Int
+
+  init(render: MathRender, latex: String, lead: Int, sourceStart: Int) {
+    self.render = render
+    self.latex = latex
+    self.lead = lead
+    self.sourceStart = sourceStart
   }
 }
 
@@ -162,8 +311,21 @@ extension MathRender {
   /// LaTeX: before or after the symbol under it, inside fractions, roots and
   /// scripts too.
   @MainActor func sourceOffset(at point: CGPoint) -> Int {
-    MathHitTest.sourceOffset(latex: latex, fontSize: fontSize, display: display, x: point.x, y: point.y)
-      ?? MathRender.sourceOffset(in: latex, display: display, x: point.x)
+    // The line clicked (the nearest one, between them).
+    guard let line = lines.min(by: { distance(point, $0.frame) < distance(point, $1.frame) }) else { return 0 }
+    let part = (latex as NSString).substring(with: line.range)
+    let local = CGPoint(x: point.x - line.frame.minX, y: point.y - line.frame.minY)
+    if line.range.location > 0, let offset = MathHitTest.sourceOffset(latex: MathRender.lead + part, fontSize: fontSize, display: display,
+                                                                     x: local.x, y: local.y) {
+      return line.range.location + max(0, offset - (MathRender.lead as NSString).length)
+    }
+    let offset = MathHitTest.sourceOffset(latex: part, fontSize: fontSize, display: display, x: local.x, y: local.y)
+      ?? MathRender.sourceOffset(in: part, display: display, x: local.x)
+    return line.range.location + offset
+  }
+
+  private func distance(_ point: CGPoint, _ rect: NSRect) -> CGFloat {
+    max(0, rect.minY - point.y, point.y - rect.maxY) * 4 + max(0, rect.minX - point.x, point.x - rect.maxX)
   }
 
   /// The same along the formula's top-level pieces only: before or after the

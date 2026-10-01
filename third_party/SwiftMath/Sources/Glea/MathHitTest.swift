@@ -8,17 +8,16 @@ public enum MathHitTest {
   /// The UTF-16 offset in `latex` for a point of the formula as MathImage
   /// draws it (left aligned, no insets): `x` from its left edge, `y` from
   /// its top. Nil when it can't tell.
-  public static func sourceOffset(latex: String, fontSize: CGFloat, display: Bool, x: CGFloat, y: CGFloat) -> Int? {
+  public static func sourceOffset(latex: String, fontSize: CGFloat, display: Bool, maxWidth: CGFloat = 0,
+                                  x: CGFloat, y: CGFloat) -> Int? {
     var error: NSError?
     guard let list = MTMathListBuilder.build(fromString: latex, error: &error), error == nil else { return nil }
     let finalized = list.finalized
     guard let line = MTTypesetter.createLineForMathList(finalized, font: MathFont.latinModernFont.mtfont(size: fontSize),
-                                                        style: display ? .display : .text, cramped: false) else { return nil }
-    // Where MathImage puts the baseline (y up from the bottom).
+                                                        style: display ? .display : .text, cramped: false, maxWidth: maxWidth)
+    else { return nil }
     let imageHeight = ceil(line.ascent + line.descent)
-    let height = max(line.ascent + line.descent, fontSize / 2)
-    let baseline = (imageHeight - height) / 2 + line.descent
-    return hit(list: line, atoms: finalized, at: CGPoint(x: x, y: imageHeight - y - baseline))
+    return hit(list: line, atoms: finalized, at: CGPoint(x: x, y: imageHeight - y - MathTypeset.baseline(of: line, fontSize: fontSize)))
   }
 
   /// `point` in the coordinates `display` is positioned in.
@@ -35,7 +34,7 @@ public enum MathHitTest {
     // overlaps), or the nearest across.
     let under = subs.filter { contains($0, x: true, y: true) }
     let sub = under.first(where: isScript) ?? under.first ?? subs.first { contains($0, x: true, y: false) }
-      ?? subs.min { distance(local.x, $0) < distance(local.x, $1) }!
+      ?? subs.min { distance(local, $0) < distance(local, $1) }!
     let atom = list?.atoms.first { $0.indexRange.location == sub.range.location }
 
     switch sub {
@@ -83,8 +82,13 @@ public enum MathHitTest {
     return local.x < sub.position.x + sub.width / 2 ? range.location : NSMaxRange(range)
   }
 
-  private static func distance(_ x: CGFloat, _ d: MTDisplay) -> CGFloat {
-    x < d.position.x ? d.position.x - x : max(0, x - d.position.x - d.width)
+  /// How far `p` is from `d`'s box (a formula broken over lines has
+  /// pieces side by side on each).
+  private static func distance(_ p: CGPoint, _ d: MTDisplay) -> CGFloat {
+    let dx = p.x < d.position.x ? d.position.x - p.x : max(0, p.x - d.position.x - d.width)
+    let top = d.position.y + d.ascent, bottom = d.position.y - d.descent
+    let dy = p.y > top ? p.y - top : max(0, bottom - p.y)
+    return dx + dy * 4
   }
 
   /// A run of symbols: the one under `point`, before or after it.

@@ -418,7 +418,7 @@ struct MarkdownStyler {
     let string = storage.string as NSString
     let shows = (selection.map { $0.length > 0 ? NSIntersectionRange($0, block).length > 0
                                                : $0.location >= block.location && $0.location <= NSMaxRange(block) } ?? false)
-    let render = MathRender.render(latex, display: true)
+    let render = MathRender.render(latex, display: true, maxWidth: width - indent - 4)
     guard !shows, let render else {
       if let render {
         let below = paragraph.mutableCopy() as! NSMutableParagraphStyle
@@ -1089,27 +1089,52 @@ struct MarkdownStyler {
       construct = m.range
       taken.append(m.range)
       let span = abs(m.range)
-      guard !reveals(span), let math = MathRender.render(ns.substring(with: m.range(at: 1)), display: false) else {
+      let content = m.range(at: 1)
+      let latex = ns.substring(with: content)
+      let room = width - imageIndent - 4
+      // In pieces the text wraps between (see MathRender.inlinePieces), or
+      // whole when a piece isn't valid LaTeX on its own.
+      var pieces: [(range: NSRange, piece: MathPiece)] = []
+      if !reveals(span) {
+        let parts = MathRender.inlinePieces(of: latex)
+        for (index, part) in parts.enumerated() {
+          let text = (latex as NSString).substring(with: part)
+          guard let render = MathRender.render(text, display: false, maxWidth: room, lead: index > 0) else {
+            pieces = []
+            break
+          }
+          // Its source: the first one from the opening dollar, the last one
+          // to the closing one.
+          let start = index == 0 ? m.range.location : content.location + part.location
+          let end = index == parts.count - 1 ? m.range.upperBound : content.location + NSMaxRange(part)
+          pieces.append((abs(NSRange(location: start, length: end - start)),
+                         MathPiece(render: render, latex: text, lead: index > 0 ? (MathRender.lead as NSString).length : 0,
+                                   sourceStart: abs(content).location + part.location)))
+        }
+        if pieces.isEmpty, parts.count > 1, let render = MathRender.render(latex, display: false, maxWidth: room) {
+          pieces = [(span, MathPiece(render: render, latex: latex, lead: 0, sourceStart: abs(content).location))]
+        }
+      }
+      guard !pieces.isEmpty else {
         syntax(NSRange(location: m.range.location, length: 1))
         syntax(NSRange(location: m.range.upperBound - 1, length: 1))
         continue
       }
-      // The source gives way to the formula. Its opening dollar takes the
-      // formula's width (a click on the formula lands inside it) and, if
-      // taller, its height; the closing one its depth below the baseline.
-      let open = NSRange(location: span.location, length: 1)
-      let close = NSRange(location: NSMaxRange(span) - 1, length: 1)
+      // The source gives way to the formula. Each piece's first character
+      // takes its width (a click on it lands inside its source) and, if
+      // taller, its height (its depth: see FoldingLayoutDelegate).
       let body = Theme.bodyFont
-      if math.ascent > body.ascender {
-        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: ceil(Theme.bodySize * math.ascent / body.ascender)), range: open)
-      }
-      if math.descent > -body.descender {
-        storage.addAttribute(.baselineOffset, value: -(math.descent + body.descender), range: close)
+      for (range, piece) in pieces where piece.render.ascent > body.ascender {
+        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: ceil(Theme.bodySize * piece.render.ascent / body.ascender)),
+                             range: NSRange(location: range.location, length: 1))
       }
       hide(storage, span)
-      let kern = (storage.attribute(.kern, at: open.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0
-      storage.addAttribute(.kern, value: kern + Double(math.size.width), range: open)
-      storage.addAttribute(.gleaMath, value: math, range: span)
+      for (range, piece) in pieces {
+        let carrier = NSRange(location: range.location, length: 1)
+        let kern = (storage.attribute(.kern, at: carrier.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0
+        storage.addAttribute(.kern, value: kern + Double(piece.render.size.width), range: carrier)
+        storage.addAttribute(.gleaMath, value: piece, range: range)
+      }
     }
 
     var imageHeight: CGFloat = 0
@@ -1364,7 +1389,7 @@ final class MarkdownLayoutManager: NSLayoutManager {
     // Formulas, over their hidden source: inline ones on the line's baseline
     // where their source starts, blocks at the start of their line.
     storage.enumerateAttribute(.gleaMath, in: chars) { value, range, _ in
-      guard let math = value as? MathRender else { return }
+      guard let math = (value as? MathPiece)?.render else { return }
       var span = range
       _ = storage.attribute(.gleaMath, at: range.location, longestEffectiveRange: &span, in: NSRange(location: 0, length: storage.length))
       let glyph = glyphIndexForCharacter(at: span.location)
@@ -1452,7 +1477,18 @@ final class FoldingLayoutDelegate: NSObject, NSLayoutManagerDelegate {
               storage.attribute(.gleaFoldEnd, at: start, effectiveRange: nil) != nil {
       height = 0
     } else {
-      return false
+      // A formula going lower than the text: the line makes room below.
+      guard let storage = layoutManager.textStorage else { return false }
+      let chars = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+      var depth: CGFloat = 0
+      storage.enumerateAttribute(.gleaMath, in: NSIntersectionRange(chars, NSRange(location: 0, length: storage.length))) { value, _, _ in
+        if let piece = value as? MathPiece { depth = max(depth, piece.render.descent) }
+      }
+      let extra = ceil(baselineOffset.pointee + depth + 2 - lineFragmentUsedRect.pointee.height)
+      guard depth > 0, extra > 0 else { return false }
+      lineFragmentRect.pointee.size.height += extra
+      lineFragmentUsedRect.pointee.size.height += extra
+      return true
     }
     lineFragmentRect.pointee.size.height = height
     lineFragmentUsedRect.pointee.size.height = height
@@ -1802,16 +1838,17 @@ final class MarkdownTextView: NSTextView {
     let all = NSRange(location: 0, length: storage.length)
     for candidate in [index, index - 1] where candidate >= 0 && candidate < storage.length {
       var span = NSRange()
-      if let math = storage.attribute(.gleaMath, at: candidate, longestEffectiveRange: &span, in: all) as? MathRender {
+      if let piece = storage.attribute(.gleaMath, at: candidate, longestEffectiveRange: &span, in: all) as? MathPiece {
+        let math = piece.render
         let g = layoutManager.glyphIndexForCharacter(at: span.location)
         let line = layoutManager.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
         let at = layoutManager.location(forGlyphAt: g)
         let baseline = origin.y + line.minY + at.y
         let rect = NSRect(x: origin.x + line.minX + at.x, y: baseline - math.ascent, width: math.size.width, height: math.size.height)
         guard rect.insetBy(dx: -2, dy: -2).contains(point) else { continue }
-        let latex = s.substring(with: NSRange(location: span.location + 1, length: span.length - 2))
-        let offset = math.sourceOffset(at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY))
-        return placeCursorInMath(MathRender.sourceLocation(of: offset, in: latex, source: s, contentStart: span.location + 1))
+        let offset = max(0, math.sourceOffset(at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY)) - piece.lead)
+        return placeCursorInMath(MathRender.sourceLocation(of: min(offset, (piece.latex as NSString).length), in: piece.latex,
+                                                           source: s, contentStart: piece.sourceStart))
       }
       if let block = storage.attribute(.gleaMathBlock, at: candidate, longestEffectiveRange: &span, in: all) as? MathBlock {
         let used = layoutManager.lineFragmentUsedRect(forGlyphAt: layoutManager.glyphIndexForCharacter(at: span.location), effectiveRange: nil)
