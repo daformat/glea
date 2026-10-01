@@ -5,7 +5,8 @@ import AppKit
 // Return or Tab (or a click) turns what was typed into the chosen block, and
 // Esc closes it, leaving the text as it is.
 //
-// The same menu, opened by "[[", offers the notes to link to.
+// The same menu, opened by "[[", offers the notes to link to, and by "\"
+// in math (`$…$`, `$$…$$`), LaTeX commands, each shown typeset.
 
 struct SlashItem {
   let title: String
@@ -15,6 +16,8 @@ struct SlashItem {
   /// Its Markdown, shown faded.
   let hint: String
   let apply: @MainActor (MarkdownTextView) -> Void
+  /// What it looks like (LaTeX commands), shown instead of the hint.
+  var preview: NSImage? = nil
 
   @MainActor static let all: [SlashItem] = [
     lineItem("Heading 1", ["h1", "title"], "textformat.size.larger", "# "),
@@ -67,6 +70,55 @@ struct SlashItem {
       items.append(SlashItem(title: wanted, keywords: [], symbol: "plus", hint: "new note", apply: { $0.completeNoteLink(wanted) }))
     }
     return items
+  }
+
+  /// LaTeX commands: the command, what it inserts ("|" is where the cursor
+  /// goes), and an example to show typeset.
+  private static let latex: [(command: String, insert: String, example: String)] = {
+    let structures: [(String, String, String)] = [
+      ("frac", "\\frac{|}{}", "\\frac{a}{b}"), ("sqrt", "\\sqrt{|}", "\\sqrt{x}"), ("sum", "\\sum_{|}^{}", "\\sum_{i=1}^{n}"),
+      ("int", "\\int_{|}^{}", "\\int_{a}^{b}"), ("prod", "\\prod_{|}^{}", "\\prod_{i=1}^{n}"), ("lim", "\\lim_{|}", "\\lim_{x \\to 0}"),
+      ("infty", "\\infty|", "\\infty"), ("partial", "\\partial|", "\\partial"), ("nabla", "\\nabla|", "\\nabla"),
+      ("binom", "\\binom{|}{}", "\\binom{n}{k}"), ("vec", "\\vec{|}", "\\vec{v}"), ("hat", "\\hat{|}", "\\hat{x}"),
+      ("bar", "\\bar{|}", "\\bar{x}"), ("dot", "\\dot{|}", "\\dot{x}"), ("overline", "\\overline{|}", "\\overline{AB}"),
+      ("mathbb", "\\mathbb{|}", "\\mathbb{R}"), ("mathbf", "\\mathbf{|}", "\\mathbf{x}"), ("mathrm", "\\mathrm{|}", "\\mathrm{d}"),
+      ("text", "\\text{|}", "\\text{text}"), ("left(", "\\left( | \\right)", "\\left(\\frac{a}{b}\\right)"),
+      ("begin{pmatrix}", "\\begin{pmatrix} | \\end{pmatrix}", "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}"),
+      ("cdot", "\\cdot |", "a \\cdot b"), ("times", "\\times |", "a \\times b"), ("div", "\\div |", "a \\div b"),
+      ("pm", "\\pm |", "\\pm"), ("leq", "\\leq |", "\\leq"), ("geq", "\\geq |", "\\geq"), ("neq", "\\neq |", "\\neq"),
+      ("approx", "\\approx |", "\\approx"), ("equiv", "\\equiv |", "\\equiv"), ("propto", "\\propto |", "\\propto"),
+      ("to", "\\to |", "\\to"), ("rightarrow", "\\rightarrow |", "\\rightarrow"), ("Rightarrow", "\\Rightarrow |", "\\Rightarrow"),
+      ("Leftrightarrow", "\\Leftrightarrow |", "\\Leftrightarrow"), ("mapsto", "\\mapsto |", "\\mapsto"),
+      ("in", "\\in |", "\\in"), ("notin", "\\notin |", "\\notin"), ("subset", "\\subset |", "\\subset"),
+      ("subseteq", "\\subseteq |", "\\subseteq"), ("cup", "\\cup |", "\\cup"), ("cap", "\\cap |", "\\cap"),
+      ("emptyset", "\\emptyset|", "\\emptyset"), ("forall", "\\forall |", "\\forall"), ("exists", "\\exists |", "\\exists"),
+      ("neg", "\\neg |", "\\neg"), ("ldots", "\\ldots|", "1, \\ldots, n"), ("cdots", "\\cdots|", "\\cdots"),
+      ("log", "\\log|", "\\log"), ("ln", "\\ln|", "\\ln"), ("exp", "\\exp|", "\\exp"), ("sin", "\\sin|", "\\sin"),
+      ("cos", "\\cos|", "\\cos"), ("tan", "\\tan|", "\\tan"), ("max", "\\max|", "\\max"), ("min", "\\min|", "\\min"),
+      ("hbar", "\\hbar|", "\\hbar"), ("quad", "\\quad |", "a \\quad b"),
+    ]
+    let greek = ["alpha", "beta", "gamma", "delta", "epsilon", "varepsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu",
+                 "nu", "xi", "pi", "rho", "sigma", "tau", "upsilon", "phi", "varphi", "chi", "psi", "omega",
+                 "Gamma", "Delta", "Theta", "Lambda", "Xi", "Pi", "Sigma", "Phi", "Psi", "Omega"]
+      .map { ($0, "\\\($0)|", "\\\($0)") }
+    return (structures + greek).map { (command: $0.0, insert: $0.1, example: $0.2) }
+  }()
+
+  /// The LaTeX commands starting with `query` (exact case first), then
+  /// those containing it; the first few.
+  @MainActor static func math(_ query: String) -> [SlashItem] {
+    let lower = query.lowercased()
+    let exact = latex.filter { $0.command.hasPrefix(query) }
+    let starting = latex.filter { !$0.command.hasPrefix(query) && $0.command.lowercased().hasPrefix(lower) }
+    let containing = lower.isEmpty ? [] : latex.filter { !$0.command.lowercased().hasPrefix(lower) && $0.command.lowercased().contains(lower) }
+    return (exact + starting + containing).prefix(8).map { entry in
+      SlashItem(title: "\\" + entry.command, keywords: [], symbol: "function", hint: "", apply: { textView in
+        let caret = (entry.insert as NSString).range(of: "|").location
+        let text = entry.insert.replacingOccurrences(of: "|", with: "")
+        let location = textView.selectedRange().location
+        textView.replace(NSRange(location: location, length: 0), with: text, select: NSRange(location: location + caret, length: 0))
+      }, preview: MathRender.render(entry.example, display: false)?.image)
+    }
   }
 
   /// The items `query` finds: those whose title or a keyword starts with it
@@ -135,12 +187,20 @@ final class SlashMenu {
     case blocks
     /// "[[": the notes to link to.
     case noteLink
+    /// "\" in math: LaTeX commands.
+    case math
   }
 
   private unowned let textView: MarkdownTextView
   private let kind: Kind
   /// What opens it.
-  private var trigger: String { kind == .blocks ? "/" : "[[" }
+  private var trigger: String {
+    switch kind {
+    case .blocks: return "/"
+    case .noteLink: return "[["
+    case .math: return "\\"
+    }
+  }
   /// Where the trigger is, while the menu is open (it may have no matches,
   /// and then shows nothing until typing finds some again).
   private var start: Int?
@@ -173,6 +233,10 @@ final class SlashMenu {
       guard before == 0x20 || before == 0x09 || before == 0x0A else { return }
     }
     guard !isInCodeBlock(caret.location - length) else { return }
+    // "\" in math (not a "\\" line break).
+    if kind == .math {
+      guard textView.isInMath(caret.location - 1), caret.location < 2 || s.character(at: caret.location - 2) != 0x5C else { return }
+    }
     start = caret.location - length
     update()
   }
@@ -235,6 +299,11 @@ final class SlashMenu {
       let matches = SlashItem.matching(query)
       if matches.isEmpty && query.hasSuffix(" ") { return close() }
       items = matches
+    case .math:
+      // Letters only: past a space, a brace… the command is typed.
+      guard !query.isEmpty || caret.location == start + length,
+            query.allSatisfy({ $0.isASCII && ($0.isLetter || $0 == "(") }), (query as NSString).length <= 20 else { return close() }
+      items = SlashItem.math(query)
     case .noteLink:
       // Past the line or the link's end: done.
       guard !query.contains("\n"), !query.contains("]"), (query as NSString).length <= 120 else { return close() }
@@ -254,8 +323,8 @@ final class SlashMenu {
   private func choose(_ index: Int) {
     guard let start, items.indices.contains(index) else { return }
     let item = items[index]
-    // "/" goes with the query; "[[" stays.
-    let from = kind == .blocks ? start : start + (trigger as NSString).length
+    // "/" and "\\" go with the query; "[[" stays.
+    let from = kind == .noteLink ? start + (trigger as NSString).length : start
     let range = NSRange(location: from, length: textView.selectedRange().location - from)
     close()
     textView.breakUndoCoalescing()
@@ -264,7 +333,7 @@ final class SlashMenu {
     textView.replace(range, with: "", select: NSRange(location: from, length: 0))
     item.apply(textView)
     undo?.endUndoGrouping()
-    undo?.setActionName(kind == .blocks ? item.title : "Link to Note")
+    undo?.setActionName(kind == .blocks ? item.title : kind == .math ? "Insert \(item.title)" : "Link to Note")
   }
 
   private func isInCodeBlock(_ location: Int) -> Bool {
@@ -498,6 +567,13 @@ final class SlashMenuView: NSView {
         let size = tinted.size
         tinted.draw(in: NSRect(x: rect.minX + 8 + (18 - size.width) / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height),
                     from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+      }
+      if let preview = item.preview {
+        let size = preview.size
+        let scale = min(1, 20 / max(size.height, 1))
+        let width = size.width * scale, height = size.height * scale
+        preview.draw(in: NSRect(x: rect.maxX - 10 - width, y: rect.midY - height / 2, width: width, height: height),
+                     from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
       }
       let hint = NSAttributedString(string: item.hint, attributes: [
         .font: NSFont.monospacedSystemFont(ofSize: 11.5, weight: .regular),

@@ -467,10 +467,12 @@ final class FormatBar: NSView {
     guard let textView else { return }
     let selection = textView.selectedRange()
     showWork?.cancel()
-    if selection.length == 0 || textView.hasMarkedText() {
+    // (In a formula: LaTeX, not text to format.)
+    if selection.length == 0 || textView.hasMarkedText() || textView.isInMath(selection) {
       hideWork?.cancel()
       let work = DispatchWorkItem { [weak self] in
-        guard let self, let textView = self.textView, textView.selectedRange().length == 0 else { return }
+        guard let self, let textView = self.textView,
+              textView.selectedRange().length == 0 || textView.isInMath(textView.selectedRange()) else { return }
         self.hide()
       }
       hideWork = work
@@ -492,7 +494,7 @@ final class FormatBar: NSView {
   }
 
   private func showIfSelected() {
-    guard let textView, textView.selectedRange().length > 0 else { return }
+    guard let textView, textView.selectedRange().length > 0, !textView.isInMath(textView.selectedRange()) else { return }
     if NSEvent.pressedMouseButtons != 0 {
       selectionChanged()
       return

@@ -29,6 +29,14 @@ extension NSAttributedString.Key {
   static let gleaTableWrapped = NSAttributedString.Key("gleaTableWrapped")
   /// A link inside a wrapped table cell (drawn by the layout manager).
   static let gleaCellLink = NSAttributedString.Key("gleaCellLink")
+  /// MathRender: an inline formula (`$…$`), drawn over its hidden source.
+  static let gleaMath = NSAttributedString.Key("gleaMath")
+  /// MathBlock: a `$$…$$` block shown as its formula, on its first line (the
+  /// others are folded away).
+  static let gleaMathBlock = NSAttributedString.Key("gleaMathBlock")
+  /// MathBlock: the formula of a `$$…$$` block being edited, drawn under its
+  /// source (set on its last line).
+  static let gleaMathPreview = NSAttributedString.Key("gleaMathPreview")
   /// Set on the content of a collapsed section: it takes no space.
   static let gleaFolded = NSAttributedString.Key("gleaFolded")
   /// The line break after a collapsed section's content. It still breaks the
@@ -145,6 +153,9 @@ struct MarkdownStyler {
   private static let quote = regex("^(\\s*>\\s?)+")
   private static let list = regex("^(\\s*)([-*+]|\\d+[.)])\\s+(\\[[ xX]\\]\\s+)?")
   private static let inlineCode = regex("`[^`\\n]+`")
+  /// `$…$`: no space just inside the dollars, none right before or after
+  /// them a word or another dollar (so prices like "$5 and $10" stay text).
+  private static let inlineMath = regex("(?<![\\\\$\\w])\\$(?=[^\\s$])([^$\\n]*?[^\\s\\\\$])\\$(?![\\w$])")
   private static let image = regex("!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)")
   private static let link = regex("(?<!!)\\[([^\\]\\n]+)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)")
   private static let wikiLink = regex("\\[\\[([^\\]\\n|]+)(?:\\|([^\\]\\n]+))?\\]\\]")
@@ -219,6 +230,9 @@ struct MarkdownStyler {
       MarkdownStyler.fence.firstMatch(in: string as String, range: $0.line) != nil
     }
     let codeBlocks = fencedBlocks(lines: lines, string: string, fenceLines: fenceLines)
+    let mathBlocks = MarkdownStyler.mathBlocks(lines: lines, string: string, fenceLines: fenceLines)
+    var mathAt: [Int: (lines: Range<Int>, latex: String)] = [:]
+    for block in mathBlocks { mathAt[block.lines.lowerBound] = block }
     let depths = MarkdownStyler.sectionDepths(lines: lines, string: string, fenceLines: fenceLines)
     let foldRanges = MarkdownStyler.headingSections(lines: lines, string: string, fenceLines: fenceLines)
       .filter { folded.contains($0.key) && $0.body.length > 0 }.map(\.body)
@@ -235,6 +249,8 @@ struct MarkdownStyler {
                 length: NSMaxRange(lines[$0.upperBound - 1].enclosing) - lines[$0.lowerBound].enclosing.location)
       }
       blockRanges += codeBlocks.map(\.block)
+      blockRanges += mathBlocks.map { NSRange(location: lines[$0.lines.lowerBound].enclosing.location,
+                                              length: NSMaxRange(lines[$0.lines.upperBound - 1].enclosing) - lines[$0.lines.lowerBound].enclosing.location) }
       for blockRange in blockRanges {
         if NSIntersectionRange(blockRange, target).length > 0 || NSLocationInRange(target.location, blockRange) {
           target = NSUnionRange(target, blockRange)
@@ -283,6 +299,14 @@ struct MarkdownStyler {
         }
         if isFence { inFence.toggle() }
         index += 1
+        continue
+      }
+      if !inFence, let block = mathAt[index] {
+        let blockLines = Array(lines[block.lines])
+        if blockLines.contains(where: { inTarget($0.enclosing) }) {
+          styleMathBlock(storage, lines: blockLines, latex: block.latex, indent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent)
+        }
+        index = block.lines.upperBound
         continue
       }
       if !inFence, let block = tableAt[index] {
@@ -337,6 +361,97 @@ struct MarkdownStyler {
       add(from: start.index, language: start.language, contentEnd: string.length, blockEnd: string.length)
     }
     return blocks
+  }
+
+  /// `$$…$$` blocks outside code: on one line, or from a line starting with
+  /// `$$` to the next one ending with it.
+  private static func mathBlocks(lines: [(line: NSRange, enclosing: NSRange)], string: NSString,
+                                 fenceLines: [Bool]) -> [(lines: Range<Int>, latex: String)] {
+    var blocks: [(lines: Range<Int>, latex: String)] = []
+    var inFence = false
+    var index = 0
+    while index < lines.count {
+      defer { index += 1 }
+      if fenceLines[index] {
+        inFence.toggle()
+        continue
+      }
+      let text = string.substring(with: lines[index].line).trimmingCharacters(in: .whitespaces)
+      guard !inFence, text.hasPrefix("$$") else { continue }
+      if text.count > 4, text.hasSuffix("$$") {
+        blocks.append((index..<index + 1, String(text.dropFirst(2).dropLast(2))))
+        continue
+      }
+      // Up to its closing line (none: not a block).
+      var parts = [String(text.dropFirst(2))]
+      for end in (index + 1)..<max(index + 1, lines.count) {
+        if fenceLines[end] { break }
+        let line = string.substring(with: lines[end].line).trimmingCharacters(in: .whitespaces)
+        if line.hasSuffix("$$") {
+          parts.append(String(line.dropLast(2)))
+          blocks.append((index..<end + 1, parts.joined(separator: "\n")))
+          index = end
+          break
+        }
+        parts.append(line)
+      }
+    }
+    return blocks.filter { !$0.latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+  }
+
+  /// A `$$…$$` block: its formula on its first line (the source hidden, the
+  /// line as tall as the formula) and its other lines folded away. While the
+  /// cursor is in it, its source with the formula under it, following the
+  /// typing (just the source while the LaTeX isn't valid).
+  private func styleMathBlock(_ storage: NSTextStorage, lines: [(line: NSRange, enclosing: NSRange)], latex: String, indent: CGFloat) {
+    guard let first = lines.first, let last = lines.last else { return }
+    let block = NSRange(location: first.line.location, length: NSMaxRange(last.line) - first.line.location)
+    let opening = (storage.string as NSString).range(of: "$$", range: first.line)
+    let sourceStart = opening.location == NSNotFound ? first.line.location : NSMaxRange(opening)
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineSpacing = MarkdownStyler.lineSpacing
+    paragraph.paragraphSpacing = MarkdownStyler.paragraphSpacing
+    paragraph.firstLineHeadIndent = indent
+    paragraph.headIndent = indent
+    storage.addAttributes([.paragraphStyle: paragraph, .gleaSectionIndent: NSNumber(value: Double(indent))],
+                          range: NSRange(location: first.enclosing.location, length: NSMaxRange(last.enclosing) - first.enclosing.location))
+    let string = storage.string as NSString
+    let shows = (selection.map { $0.length > 0 ? NSIntersectionRange($0, block).length > 0
+                                               : $0.location >= block.location && $0.location <= NSMaxRange(block) } ?? false)
+    let render = MathRender.render(latex, display: true)
+    guard !shows, let render else {
+      if let render {
+        let below = paragraph.mutableCopy() as! NSMutableParagraphStyle
+        below.paragraphSpacing = MarkdownStyler.paragraphSpacing + ceil(render.size.height) + 20
+        storage.addAttribute(.paragraphStyle, value: below, range: last.enclosing)
+        storage.addAttribute(.gleaMathPreview, value: MathBlock(render: render, indent: indent, latex: latex, sourceStart: sourceStart), range: last.line)
+      }
+      // The source, its dollars faded.
+      for line in [first.line, last.line] {
+        let text = string.substring(with: line) as NSString
+        let open = text.range(of: "$$")
+        if open.location != NSNotFound, line == first.line {
+          storage.addAttributes(faded, range: NSRange(location: line.location + open.location, length: 2))
+        }
+        let close = text.range(of: "$$", options: .backwards)
+        if close.location != NSNotFound, close.location != open.location || line != first.line {
+          storage.addAttributes(faded, range: NSRange(location: line.location + close.location, length: 2))
+        }
+      }
+      return
+    }
+    hide(storage, first.line)
+    let tall = paragraph.mutableCopy() as! NSMutableParagraphStyle
+    tall.minimumLineHeight = ceil(render.size.height) + 16
+    storage.addAttribute(.paragraphStyle, value: tall, range: first.enclosing)
+    storage.addAttribute(.gleaMathBlock, value: MathBlock(render: render, indent: indent, latex: latex, sourceStart: sourceStart), range: first.line)
+    if lines.count > 1 {
+      let fold = NSRange(location: lines[1].enclosing.location, length: NSMaxRange(last.line) - lines[1].enclosing.location)
+      storage.addAttribute(.gleaFolded, value: true, range: fold)
+      if NSMaxRange(last.enclosing) > NSMaxRange(last.line) {
+        storage.addAttribute(.gleaFoldEnd, value: true, range: NSRange(location: NSMaxRange(last.line), length: 1))
+      }
+    }
   }
 
   static func headingSections(in string: NSString) -> [HeadingSection] {
@@ -970,6 +1085,33 @@ struct MarkdownStyler {
       taken.append(m.range)
     }
 
+    for m in MarkdownStyler.inlineMath.matches(in: line, range: local) where free(m.range) {
+      construct = m.range
+      taken.append(m.range)
+      let span = abs(m.range)
+      guard !reveals(span), let math = MathRender.render(ns.substring(with: m.range(at: 1)), display: false) else {
+        syntax(NSRange(location: m.range.location, length: 1))
+        syntax(NSRange(location: m.range.upperBound - 1, length: 1))
+        continue
+      }
+      // The source gives way to the formula. Its opening dollar takes the
+      // formula's width (a click on the formula lands inside it) and, if
+      // taller, its height; the closing one its depth below the baseline.
+      let open = NSRange(location: span.location, length: 1)
+      let close = NSRange(location: NSMaxRange(span) - 1, length: 1)
+      let body = Theme.bodyFont
+      if math.ascent > body.ascender {
+        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: ceil(Theme.bodySize * math.ascent / body.ascender)), range: open)
+      }
+      if math.descent > -body.descender {
+        storage.addAttribute(.baselineOffset, value: -(math.descent + body.descender), range: close)
+      }
+      hide(storage, span)
+      let kern = (storage.attribute(.kern, at: open.location, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0
+      storage.addAttribute(.kern, value: kern + Double(math.size.width), range: open)
+      storage.addAttribute(.gleaMath, value: math, range: span)
+    }
+
     var imageHeight: CGFloat = 0
     for m in MarkdownStyler.image.matches(in: line, range: local) where free(m.range) {
       taken.append(m.range)
@@ -1217,6 +1359,42 @@ final class MarkdownLayoutManager: NSLayoutManager {
         text.draw(with: row.cellRect(column, in: cells), options: [.usesLineFragmentOrigin, .usesFontLeading])
       }
       NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // Formulas, over their hidden source: inline ones on the line's baseline
+    // where their source starts, blocks at the start of their line.
+    storage.enumerateAttribute(.gleaMath, in: chars) { value, range, _ in
+      guard let math = value as? MathRender else { return }
+      var span = range
+      _ = storage.attribute(.gleaMath, at: range.location, longestEffectiveRange: &span, in: NSRange(location: 0, length: storage.length))
+      let glyph = glyphIndexForCharacter(at: span.location)
+      let line = lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+      let point = location(forGlyphAt: glyph)
+      let baseline = origin.y + line.minY + point.y
+      let rect = NSRect(x: origin.x + line.minX + point.x, y: baseline - math.ascent, width: math.size.width, height: math.size.height)
+      math.image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+    storage.enumerateAttribute(.gleaMathBlock, in: chars) { value, range, _ in
+      guard let block = value as? MathBlock else { return }
+      var line = range
+      _ = storage.attribute(.gleaMathBlock, at: range.location, longestEffectiveRange: &line, in: NSRange(location: 0, length: storage.length))
+      let used = lineFragmentUsedRect(forGlyphAt: glyphIndexForCharacter(at: line.location), effectiveRange: nil)
+      let size = block.render.size
+      let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.minY + (used.height - size.height) / 2,
+                        width: size.width, height: size.height)
+      block.render.image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+
+    storage.enumerateAttribute(.gleaMathPreview, in: chars) { value, range, _ in
+      guard let block = value as? MathBlock else { return }
+      var line = range
+      _ = storage.attribute(.gleaMathPreview, at: range.location, longestEffectiveRange: &line, in: NSRange(location: 0, length: storage.length))
+      let glyphs = glyphRange(forCharacterRange: line, actualCharacterRange: nil)
+      let used = lineFragmentUsedRect(forGlyphAt: max(glyphs.location, NSMaxRange(glyphs) - 1), effectiveRange: nil)
+      let size = block.render.size
+      let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.maxY + 10,
+                        width: size.width, height: size.height)
+      block.render.image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
     }
 
     storage.enumerateAttribute(.gleaImage, in: chars) { value, range, _ in
@@ -1586,6 +1764,92 @@ final class NoteGutterView: NSView {
 // MARK: - Text view
 
 final class MarkdownTextView: NSTextView {
+  /// The cursor stays as tall as the text it's in, on lines a tall formula
+  /// makes taller.
+  override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
+    super.drawInsertionPoint(in: caretRect(rect), color: color, turnedOn: flag)
+  }
+
+  private func caretRect(_ rect: NSRect) -> NSRect {
+    guard let layoutManager, let storage = textStorage, storage.length > 0 else { return rect }
+    let s = string as NSString
+    let caret = selectedRange().location
+    // The text next to the cursor: before it on its line, or after it.
+    var index = min(caret, storage.length - 1)
+    if caret > 0, caret == storage.length || s.character(at: caret) == 0x0A || storage.attribute(.gleaMath, at: caret, effectiveRange: nil) != nil {
+      index = caret - 1
+    }
+    guard s.character(at: index) != 0x0A, storage.attribute(.gleaMath, at: index, effectiveRange: nil) == nil,
+          let font = storage.attribute(.font, at: index, effectiveRange: nil) as? NSFont, font.pointSize > 1 else { return rect }
+    let height = ceil(font.ascender - font.descender)
+    guard rect.height > height + 4 else { return rect }
+    let glyph = layoutManager.glyphIndexForCharacter(at: index)
+    let line = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+    let baseline = textContainerOrigin.y + line.minY + layoutManager.location(forGlyphAt: glyph).y
+    return NSRect(x: rect.minX, y: round(baseline - font.ascender), width: rect.width, height: height)
+  }
+
+  /// A click on a typeset formula: the cursor goes where it was clicked in
+  /// its source (which then shows).
+  private func handleMathClick(_ event: NSEvent) -> Bool {
+    guard event.clickCount == 1, event.modifierFlags.intersection([.shift, .command, .option]).isEmpty,
+          let layoutManager, let textContainer, let storage = textStorage, storage.length > 0 else { return false }
+    let point = convert(event.locationInWindow, from: nil)
+    let origin = textContainerOrigin
+    let glyph = layoutManager.glyphIndex(for: NSPoint(x: point.x - origin.x, y: point.y - origin.y), in: textContainer)
+    let index = layoutManager.characterIndexForGlyph(at: glyph)
+    let s = string as NSString
+    let all = NSRange(location: 0, length: storage.length)
+    for candidate in [index, index - 1] where candidate >= 0 && candidate < storage.length {
+      var span = NSRange()
+      if let math = storage.attribute(.gleaMath, at: candidate, longestEffectiveRange: &span, in: all) as? MathRender {
+        let g = layoutManager.glyphIndexForCharacter(at: span.location)
+        let line = layoutManager.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
+        let at = layoutManager.location(forGlyphAt: g)
+        let baseline = origin.y + line.minY + at.y
+        let rect = NSRect(x: origin.x + line.minX + at.x, y: baseline - math.ascent, width: math.size.width, height: math.size.height)
+        guard rect.insetBy(dx: -2, dy: -2).contains(point) else { continue }
+        let latex = s.substring(with: NSRange(location: span.location + 1, length: span.length - 2))
+        let offset = math.sourceOffset(at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY))
+        return placeCursorInMath(MathRender.sourceLocation(of: offset, in: latex, source: s, contentStart: span.location + 1))
+      }
+      if let block = storage.attribute(.gleaMathBlock, at: candidate, longestEffectiveRange: &span, in: all) as? MathBlock {
+        let used = layoutManager.lineFragmentUsedRect(forGlyphAt: layoutManager.glyphIndexForCharacter(at: span.location), effectiveRange: nil)
+        let size = block.render.size
+        let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.minY + (used.height - size.height) / 2, width: size.width, height: size.height)
+        if rect.insetBy(dx: -2, dy: -4).contains(point) {
+          return placeCursor(in: block, at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY))
+        }
+      }
+    }
+    // The formula under a block's source, while it's edited (the click is
+    // below the source's last line).
+    var found: Bool?
+    storage.enumerateAttribute(.gleaMathPreview, in: all) { value, range, stop in
+      guard let block = value as? MathBlock else { return }
+      let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+      let used = layoutManager.lineFragmentUsedRect(forGlyphAt: max(glyphs.location, NSMaxRange(glyphs) - 1), effectiveRange: nil)
+      let size = block.render.size
+      let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.maxY + 10, width: size.width, height: size.height)
+      if rect.insetBy(dx: -2, dy: -4).contains(point) {
+        found = placeCursor(in: block, at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY))
+        stop.pointee = true
+      }
+    }
+    return found ?? false
+  }
+
+  private func placeCursor(in block: MathBlock, at point: NSPoint) -> Bool {
+    let offset = block.render.sourceOffset(at: point)
+    return placeCursorInMath(MathRender.sourceLocation(of: offset, in: block.latex, source: string as NSString, contentStart: block.sourceStart))
+  }
+
+  private func placeCursorInMath(_ location: Int) -> Bool {
+    window?.makeFirstResponder(self)
+    setSelectedRange(NSRange(location: min(location, (string as NSString).length), length: 0))
+    return true
+  }
+
   /// A click in a wrapped table's cell (its row's location, its column):
   /// the cell's own field takes it.
   var onEditCell: ((_ row: Int, _ column: Int, _ event: NSEvent) -> Void)?
@@ -1641,6 +1905,7 @@ final class MarkdownTextView: NSTextView {
     defer {
       slashMenu.selectionDidChange()
       linkMenu.selectionDidChange()
+      mathMenu.selectionDidChange()
     }
     guard keepsSelectionThroughUndo, let first = ranges.first?.rangeValue else {
       super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
@@ -1653,10 +1918,12 @@ final class MarkdownTextView: NSTextView {
   private(set) lazy var slashMenu = SlashMenu(textView: self, kind: .blocks)
   /// The notes menu "[[" opens.
   private(set) lazy var linkMenu = SlashMenu(textView: self, kind: .noteLink)
+  /// The LaTeX menu "\\" opens in math.
+  private(set) lazy var mathMenu = SlashMenu(textView: self, kind: .math)
 
   /// While a menu shows, it takes ↑/↓, Return, Tab and Esc.
   override func doCommand(by selector: Selector) {
-    if slashMenu.handle(selector) || linkMenu.handle(selector) { return }
+    if slashMenu.handle(selector) || linkMenu.handle(selector) || mathMenu.handle(selector) { return }
     super.doCommand(by: selector)
   }
 
@@ -1694,6 +1961,7 @@ final class MarkdownTextView: NSTextView {
     if result {
       slashMenu.close()
       linkMenu.close()
+      mathMenu.close()
       onFocusChange?(false)
     }
     return result
@@ -1779,7 +2047,7 @@ final class MarkdownTextView: NSTextView {
   }
 
   override func mouseDown(with event: NSEvent) {
-    if handleTableClick(event) { return }
+    if handleTableClick(event) || handleMathClick(event) { return }
     if let layoutManager, let textContainer, let storage = textStorage, storage.length > 0 {
       let point = convert(event.locationInWindow, from: nil)
       let p = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
@@ -1999,7 +2267,7 @@ final class MarkdownTextView: NSTextView {
   }
 
   override func insertTab(_ sender: Any?) {
-    if moveTableCell(forward: true) { return }
+    if moveTableCell(forward: true) || moveMathSlot(forward: true) { return }
     let (range, text) = currentLine
     if MarkdownTextView.listPrefix.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil {
       let selection = selectedRange()
@@ -2011,7 +2279,7 @@ final class MarkdownTextView: NSTextView {
   }
 
   override func insertBacktab(_ sender: Any?) {
-    if moveTableCell(forward: false) { return }
+    if moveTableCell(forward: false) || moveMathSlot(forward: false) { return }
     let (range, text) = currentLine
     let start = quotePrefixLength(text)
     let spaces = min(2, (text as NSString).substring(from: start).prefix { $0 == " " }.count)
@@ -2168,6 +2436,7 @@ final class MarkdownTextView: NSTextView {
     super.didChangeText()
     slashMenu.textDidChange()
     linkMenu.textDidChange()
+    mathMenu.textDidChange()
   }
 }
 
@@ -2371,6 +2640,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       clip.postsBoundsChangedNotifications = true
       NotificationCenter.default.addObserver(self, selector: #selector(pageScrolled), name: NSView.boundsDidChangeNotification, object: clip)
     }
+  }
+
+  // Formulas are drawn in the appearance's text color: they're typeset again.
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    if window != nil, storage.string.contains("$") { restyle() }
   }
 
   @objc private func pageScrolled() {
@@ -3456,16 +3731,17 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     return view
   }
 
-  /// The text's change under way: where its new text is, and the headings
-  /// and code fences its lines had (they style what follows them).
+  /// The text's change under way: where its new text is, and the headings,
+  /// code fences and math block delimiters its lines had (they style what
+  /// follows them).
   private var pendingEdit: (range: NSRange, structure: [String]?)?
-  private static let structuralLine = try! NSRegularExpression(pattern: "^(#{1,6})(\\s|$)|^\\s*(```|~~~)")
+  private static let structuralLine = try! NSRegularExpression(pattern: "^(#{1,6})(\\s|$)|^\\s*(```|~~~|\\$\\$)|\\$\\$\\s*$")
 
   /// The heading levels and code fences of `text`'s lines, in order.
   private static func structure(of text: String) -> [String] {
     text.components(separatedBy: "\n").compactMap { line in
       guard let m = structuralLine.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else { return nil }
-      return m.range(at: 1).location != NSNotFound ? "h\(m.range(at: 1).length)" : "fence"
+      return m.range(at: 1).location != NSNotFound ? "h\(m.range(at: 1).length)" : (line as NSString).substring(with: m.range)
     }
   }
 

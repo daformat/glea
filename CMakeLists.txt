@@ -61,6 +61,16 @@ foreach(_suffix_list ${CEF_HELPER_APP_SUFFIXES})
   list(APPEND GLEA_HELPER_NAMES "${HELPER_NAME}")
 endforeach()
 
+# --- SwiftMath (LaTeX math in notes; vendored, see third_party/SwiftMath) -----
+
+file(GLOB_RECURSE SWIFTMATH_SOURCES CONFIGURE_DEPENDS third_party/SwiftMath/Sources/*.swift)
+add_library(SwiftMath STATIC ${SWIFTMATH_SOURCES})
+set_target_properties(SwiftMath PROPERTIES
+  Swift_MODULE_NAME SwiftMath
+  Swift_LANGUAGE_VERSION 5
+)
+target_compile_options(SwiftMath PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:-O>" "$<$<COMPILE_LANGUAGE:Swift>:-suppress-warnings>")
+
 # --- The Swift application ---------------------------------------------------
 
 file(GLOB GLEA_SWIFT_SOURCES CONFIGURE_DEPENDS src/app/*.swift)
@@ -80,7 +90,7 @@ target_compile_options(Glea PRIVATE
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-I ${BRIDGE_INCLUDE}>"
   "$<$<COMPILE_LANGUAGE:Swift>:-O>"
 )
-target_link_libraries(Glea PRIVATE glea_bridge libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CEF_STANDARD_LIBS})
 add_dependencies(Glea ${GLEA_HELPERS})
 
 # Copy the CEF framework fresh each build. (CEF's COPY_MAC_FRAMEWORK macro uses
@@ -113,6 +123,15 @@ foreach(_resource ${GLEA_RESOURCES})
             "${GLEA_APP}/Contents/Resources/${_name}"
     VERBATIM)
 endforeach()
+add_custom_command(TARGET Glea POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${GLEA_APP}/Contents/Resources/mathFonts.bundle"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SwiftMath/mathFonts.bundle"
+          "${GLEA_APP}/Contents/Resources/mathFonts.bundle"
+  COMMAND ${CMAKE_COMMAND} -E copy
+          "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SwiftMath/LICENSE"
+          "${GLEA_APP}/Contents/Resources/SwiftMath-LICENSE.txt"
+  VERBATIM)
 # Bundles are assembled after linking, so re-sign them ad hoc, innermost first.
 # swiftc leaves a dependency file next to the executable; codesign rejects it.
 add_custom_command(TARGET Glea POST_BUILD
