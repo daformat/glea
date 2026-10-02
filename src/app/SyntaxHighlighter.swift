@@ -121,6 +121,7 @@ enum SyntaxHighlighter {
     case "diff", "patch": "diff"
     case "php": "php"
     case "lua": "lua"
+    case "latex", "tex", "math", "katex": "latex"
     default: nil
     }
   }
@@ -287,6 +288,10 @@ enum SyntaxHighlighter {
         keywords: ["and", "break", "do", "else", "elseif", "end", "for", "function", "goto", "if", "in", "local", "not",
                    "or", "repeat", "return", "then", "until", "while"],
         literals: ["true", "false", "nil"])
+    case "latex":
+      return Grammar(
+        branches: [(#"(?<!\\)%.*"#, .comment), (#"(?<=\\begin\{|\\end\{)[A-Za-z*]+"#, .type),
+                   (#"\\(?:[A-Za-z]+|.)"#, .keyword), (#"[_^&]"#, .meta), (#"\d+(?:\.\d+)?"#, .number)])
     default:
       return nil
     }

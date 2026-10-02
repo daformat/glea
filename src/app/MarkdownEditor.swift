@@ -444,7 +444,10 @@ struct MarkdownStyler {
         storage.addAttribute(.paragraphStyle, value: below, range: last.enclosing)
         storage.addAttribute(.gleaMathPreview, value: MathBlock(render: render, indent: indent, latex: latex, sourceStart: sourceStart), range: last.line)
       }
-      // The source, its dollars faded.
+      // The source, colored, its dollars faded.
+      let closing = string.range(of: "$$", options: .backwards, range: last.line)
+      let sourceEnd = closing.location != NSNotFound && closing.location >= sourceStart ? closing.location : NSMaxRange(last.line)
+      SyntaxHighlighter.highlight(storage, range: NSRange(location: sourceStart, length: sourceEnd - sourceStart), language: "latex")
       for line in [first.line, last.line] {
         let text = string.substring(with: line) as NSString
         let open = text.range(of: "$$")
@@ -1270,6 +1273,7 @@ struct MarkdownStyler {
       guard !pieces.isEmpty else {
         syntax(NSRange(location: m.range.location, length: 1))
         syntax(NSRange(location: m.range.upperBound - 1, length: 1))
+        SyntaxHighlighter.highlight(storage, range: abs(content), language: "latex")
         continue
       }
       // The source gives way to the formula. Each piece's first character

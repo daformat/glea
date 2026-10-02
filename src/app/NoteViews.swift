@@ -1183,6 +1183,11 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     scroll.hasVerticalScroller = true
     scroll.autohidesScrollers = true
     scroll.scrollerStyle = .overlay
+    // Room under the last note when scrolled to the end; the scroller still
+    // runs to the window's edge.
+    scroll.automaticallyAdjustsContentInsets = false
+    scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 48, right: 0)
+    scroll.scrollerInsets = NSEdgeInsets(top: 0, left: 0, bottom: -48, right: 0)
     scroll.translatesAutoresizingMaskIntoConstraints = false
 
     addSubview(header)
@@ -1627,6 +1632,28 @@ private final class NoteRowView: RoundedRowView {
 
   override func mouseEntered(with event: NSEvent) { hovering = true }
   override func mouseExited(with event: NSEvent) { hovering = false }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
+    if let clip = enclosingScrollView?.contentView {
+      NotificationCenter.default.addObserver(self, selector: #selector(listScrolled), name: NSView.boundsDidChangeNotification, object: clip)
+    }
+  }
+
+  /// Scrolling sends no enter or exit events: rows moving away from a still
+  /// pointer lose their hover (and those moving under it gain it).
+  private var syncPending = false
+  @objc private func listScrolled() {
+    guard !syncPending else { return }
+    syncPending = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.syncPending = false
+      guard let window = self.window, !self.isHiddenOrHasHiddenAncestor else { return self.hovering = false }
+      self.hovering = window.isKeyWindow && self.bounds.contains(self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+  }
 
   private func updateCheckbox(animated: Bool) {
     checkbox.setShown(hovering || checkbox.isChecked, animated: animated)
