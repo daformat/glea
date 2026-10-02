@@ -69,6 +69,10 @@ final class NoteStore {
 
   private(set) var root: URL
   private var entries: [NoteRef: Entry] = [:]
+  /// Notes by their frontmatter aliases (lowercased), built when needed.
+  private var aliasIndex: [String: NoteRef]?
+  /// Files other than notes, by their lowercased name (see `attachment`).
+  private var attachments: [String: URL]?
   private var eventStream: FSEventStreamRef?
 
   var notesDirectory: URL { root.appendingPathComponent("notes", isDirectory: true) }
@@ -103,6 +107,8 @@ final class NoteStore {
   private func load() {
     stopWatching()
     entries = [:]
+    aliasIndex = nil
+    attachments = nil
     let fm = FileManager.default
     for dir in [notesDirectory, journalDirectory, assetsDirectory] {
       try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -157,19 +163,74 @@ final class NoteStore {
 
   var today: NoteRef { .journal(Date()) }
 
-  /// Finds the note a `[[name]]` link points to (case-insensitive).
+  /// Finds the note a `[[name]]` link points to (case-insensitive): by its
+  /// name (a path or ".md" is fine, as Obsidian writes them), or one of the
+  /// `aliases` in its frontmatter.
   func resolve(linkName: String) -> NoteRef? {
-    let wanted = linkName.trimmingCharacters(in: .whitespaces).lowercased()
+    let written = linkName.trimmingCharacters(in: .whitespaces)
+    if let ref = note(named: written) { return ref }
+    let name = WikiTarget.noteName(written)
+    if let date = NoteStore.dayFormatter.date(from: name) { return .journal(date) }
+    if name != written, let ref = note(named: name) { return ref }
+    return aliases()[name.lowercased()]
+  }
+
+  /// The note with exactly this name (case-insensitive), or the journal day.
+  private func note(named name: String) -> NoteRef? {
+    let wanted = name.lowercased()
     if let date = NoteStore.dayFormatter.date(from: wanted) { return .journal(date) }
     return entries.keys.first { $0.kind == .note && $0.name.lowercased() == wanted }
   }
 
+  private func aliases() -> [String: NoteRef] {
+    if let aliasIndex { return aliasIndex }
+    var index: [String: NoteRef] = [:]
+    for (ref, entry) in entries where ref.kind == .note && entry.content.hasPrefix("---") {
+      for alias in Frontmatter.parse(entry.content)?.aliases ?? [] { index[alias.lowercased()] = index[alias.lowercased()] ?? ref }
+    }
+    aliasIndex = index
+    return index
+  }
+
+  /// The aliases `ref`'s frontmatter gives it.
+  func aliases(of ref: NoteRef) -> [String] {
+    let content = content(of: ref)
+    return content.hasPrefix("---") ? Frontmatter.parse(content)?.aliases ?? [] : []
+  }
+
+  /// Files in the notes folder that aren't notes, by lowercased name.
+  func attachmentIndex() -> [String: URL] {
+    if let attachments { return attachments }
+    var index: [String: URL] = [:]
+    let skipped: Set<String> = [".obsidian", ".git", ".trash", "node_modules"]
+    if let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsPackageDescendants]) {
+      for case let url as URL in files {
+        if skipped.contains(url.lastPathComponent) {
+          files.skipDescendants()
+          continue
+        }
+        let name = url.lastPathComponent.lowercased()
+        guard url.pathExtension.lowercased() != "md", !name.hasPrefix("."), index[name] == nil,
+              (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory != true else { continue }
+        index[name] = url
+      }
+    }
+    attachments = index
+    return index
+  }
+
   /// Markdown reduced to readable text, for snippets and excerpts.
   nonisolated static func plainText(_ markdown: String) -> String {
-    var text = markdown
+    var text = Frontmatter.body(of: markdown)
     let replacements: [(String, String)] = [
+      ("%%.*?%%", ""),
+      ("(?m)\\s\\^[\\w-]+$", ""),
+      ("(?m)^(\\s*>\\s?)+\\[![\\w-]+\\][+-]?[ \\t]*", ""),
+      ("==(?=\\S)(.+?)(?<=\\S)==", "$1"),
       ("!\\[([^\\]]*)\\]\\([^)]*\\)", "$1"),
-      ("\\[\\[([^\\]|]+)(\\|([^\\]]+))?\\]\\]", "$1"),
+      ("!?\\[\\[[^\\]|]*\\|([^\\]]+)\\]\\]", "$1"),
+      ("!?\\[\\[([^\\]#|]+)(#[^\\]|]*)?\\]\\]", "$1"),
+      ("!?\\[\\[#\\^?([^\\]|]*)\\]\\]", "$1"),
       ("\\[([^\\]]+)\\]\\([^)]*\\)", "$1"),
       ("(?m)^\\s*(#{1,6}|>|[-*+]( \\[[ xX]\\])?|\\d+[.)])\\s+", ""),
       ("(\\*\\*|__|~~|`)", ""),
@@ -205,7 +266,19 @@ final class NoteStore {
       let body = entry.content.lowercased()
       var score = 0
       var matchedAll = true
+      var tags: Set<String>?
       for term in terms {
+        // "#tag" finds the notes tagged with it (or a tag nested in it).
+        if term.count > 1, term.hasPrefix("#") {
+          if tags == nil { tags = ObsidianSyntax.tags(in: entry.content) }
+          let tag = String(term.dropFirst())
+          if tags!.contains(where: { $0 == tag || $0.hasPrefix(tag + "/") }) {
+            score += 10
+            continue
+          }
+          matchedAll = false
+          break
+        }
         if title.hasPrefix(term) { score += 30 } else if title.contains(term) { score += 20 } else if body.contains(term) {
           score += 5
         } else {
@@ -232,15 +305,17 @@ final class NoteStore {
     return (start > content.startIndex ? "…" : "") + text + (end < content.endIndex ? "…" : "")
   }
 
-  /// Notes that link to `ref` with `[[name]]`, with the lines containing the link.
+  /// Notes that link to `ref` with `[[name]]` (or `[[name#heading]]`, or
+  /// one of its aliases), with the lines containing the link.
   func backlinks(to ref: NoteRef) -> [(ref: NoteRef, lines: [String])] {
-    let needle = "[[\(ref.name.lowercased())"
+    let needles = ([ref.name] + aliases(of: ref)).map { "[[\($0.lowercased())" }
     var result: [(NoteRef, [String])] = []
     for (other, entry) in entries where other != ref {
-      guard entry.content.lowercased().contains(needle) else { continue }
+      let content = entry.content.lowercased()
+      guard needles.contains(where: content.contains) else { continue }
       let lines = entry.content.split(separator: "\n").filter { line in
         let lower = line.lowercased()
-        return lower.contains(needle + "]]") || lower.contains(needle + "|")
+        return needles.contains { lower.contains($0 + "]]") || lower.contains($0 + "|") || lower.contains($0 + "#") }
       }.map { $0.trimmingCharacters(in: .whitespaces) }
       if !lines.isEmpty { result.append((other, lines)) }
     }
@@ -283,7 +358,8 @@ final class NoteStore {
   nonisolated static func mentions(of name: String, in content: String) -> [Mention] {
     guard content.range(of: name, options: .caseInsensitive) != nil else { return [] }
     let text = content as NSString
-    let excluded = unlinkableText.matches(in: content, range: NSRange(location: 0, length: text.length)).map(\.range)
+    var excluded = unlinkableText.matches(in: content, range: NSRange(location: 0, length: text.length)).map(\.range)
+    if let frontmatter = Frontmatter.parse(content) { excluded.append(frontmatter.range) }
     let wordEdges = (first: name.unicodeScalars.first.map(isWordCharacter) ?? false,
                      last: name.unicodeScalars.last.map(isWordCharacter) ?? false)
     var mentions: [Mention] = []
@@ -341,6 +417,7 @@ final class NoteStore {
       try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
       try content.write(to: url, atomically: true, encoding: .utf8)
       entries[ref] = Entry(content: content, modified: Date())
+      if ref.kind == .note { aliasIndex = nil }
       postChange([ref.id])
     } catch {
       NSLog("Glea: failed to save \(url.path): \(error)")
@@ -367,7 +444,7 @@ final class NoteStore {
 
   func createNote(named title: String) -> NoteRef {
     let name = NoteStore.sanitize(title).isEmpty ? "Untitled" : NoteStore.sanitize(title)
-    if let existing = resolve(linkName: name) { return existing }
+    if let existing = note(named: name) { return existing }
     let ref = NoteRef(kind: .note, name: name)
     let url = fileURL(for: ref)
     try? "".write(to: url, atomically: true, encoding: .utf8)
@@ -379,7 +456,7 @@ final class NoteStore {
   func uniqueUntitledName() -> String {
     var name = "Untitled"
     var i = 2
-    while resolve(linkName: name) != nil {
+    while note(named: name) != nil {
       name = "Untitled \(i)"
       i += 1
     }
@@ -395,7 +472,7 @@ final class NoteStore {
     let name = NoteStore.sanitize(newTitle)
     guard ref.kind == .note, !name.isEmpty else { return .failure(.invalidName) }
     if name == ref.name { return .success(ref) }
-    if let existing = resolve(linkName: name), existing != ref { return .failure(.alreadyExists) }
+    if let existing = note(named: name), existing != ref { return .failure(.alreadyExists) }
 
     let newRef = NoteRef(kind: .note, name: name)
     do {
@@ -414,8 +491,10 @@ final class NoteStore {
       return .failure(.invalidName)
     }
     entries[newRef] = entries.removeValue(forKey: ref)
+    aliasIndex = nil
 
-    let pattern = "\\[\\[" + NSRegularExpression.escapedPattern(for: ref.name) + "(\\||\\]\\])"
+    // Links to a heading or block in it too ("[[Old#Heading]]").
+    let pattern = "\\[\\[" + NSRegularExpression.escapedPattern(for: ref.name) + "(\\||\\]\\]|#)"
     if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
       let template = "[[" + NSRegularExpression.escapedTemplate(for: name) + "$1"
       for (other, entry) in entries {
@@ -454,6 +533,7 @@ final class NoteStore {
       try? FileManager.default.trashItem(at: url, resultingItemURL: &trashed)
     }
     entries[ref] = nil
+    aliasIndex = nil
     postChange([ref.id])
     return trashed as URL?
   }
@@ -548,6 +628,7 @@ final class NoteStore {
     let name = UUID().uuidString.prefix(12).lowercased() + "." + ext
     try? FileManager.default.createDirectory(at: assetsDirectory, withIntermediateDirectories: true)
     guard (try? data.write(to: assetsDirectory.appendingPathComponent(name))) != nil else { return nil }
+    attachments = nil
     return "../assets/" + name
   }
 
@@ -653,6 +734,7 @@ final class NoteStore {
 
   private func filesChanged(_ paths: [String]) {
     var changed = Set<String>()
+    if paths.contains(where: { !$0.hasSuffix(".md") }) { attachments = nil }
     for path in paths where path.hasSuffix(".md") {
       let url = URL(fileURLWithPath: path)
       let parent = url.deletingLastPathComponent().lastPathComponent
@@ -666,6 +748,7 @@ final class NoteStore {
         guard entries[ref] != nil else { continue }
         entries[ref] = nil
       }
+      if kind == .note { aliasIndex = nil }
       changed.insert(ref.id)
     }
     if !changed.isEmpty { postChange(changed) }

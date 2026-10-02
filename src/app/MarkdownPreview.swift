@@ -19,6 +19,8 @@ enum MarkdownPreview {
       raw = raw.replacingCharacters(in: NSRange(location: highlight.location, length: 0), with: highlightStart) as NSString
     }
     var text = (raw as String).trimmingCharacters(in: .whitespaces)
+      .replacingOccurrences(of: "\\s\\^[\\w-]+$", with: "", options: .regularExpression)
+      .replacingOccurrences(of: "%%.*?%%", with: "", options: .regularExpression)
     let base: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: size), .foregroundColor: color]
     var attributes = base
     let result = NSMutableAttributedString()
@@ -56,7 +58,7 @@ enum MarkdownPreview {
   private static let inlinePattern = try! NSRegularExpression(pattern: [
     "`([^`]+)`",                                               // 1 code
     "!\\[([^\\]]*)\\]\\([^)]*\\)",                             // 2 image
-    "\\[\\[([^\\]|]+)(?:\\|([^\\]]+))?\\]\\]",                 // 3, 4 wiki link (alias)
+    "!?\\[\\[([^\\]|]+)(?:\\|([^\\]]+))?\\]\\]",               // 3, 4 wiki link or embed (alias)
     "\\[([^\\]]+)\\]\\(([^)\\s]+)[^)]*\\)",                    // 5, 6 link
     "(\\*\\*|__)(?=\\S)(.+?)(?<=\\S)\\7",                      // 7, 8 bold
     "~~(?=\\S)(.+?)(?<=\\S)~~",                                // 9 strikethrough
@@ -86,7 +88,11 @@ enum MarkdownPreview {
         let alt = group(2) ?? ""
         result.append(NSAttributedString(string: alt.isEmpty ? "Image" : alt, attributes: link))
       } else if let name = group(3) {
-        result.append(NSAttributedString(string: group(4) ?? name, attributes: link))
+        // "Note#Heading" reads "Note › Heading"; "#Heading", "Heading".
+        let target = WikiTarget(name)
+        let anchor = target.anchor.map { $0.hasPrefix("^") ? String($0.dropFirst()) : $0 }
+        let shown = anchor.map { target.name.isEmpty ? $0 : "\(target.name) › \($0)" } ?? name
+        result.append(NSAttributedString(string: group(4) ?? shown, attributes: link))
       } else if let label = group(5) {
         result.append(inline(label, link))
       } else if let bold = group(8) {

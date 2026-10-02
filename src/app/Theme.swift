@@ -57,6 +57,10 @@ enum Theme {
   static let accentWash = dynamic(
     light: NSColor(srgbRed: 0.33, green: 0.35, blue: 0.95, alpha: 0.10),
     dark: NSColor(srgbRed: 0.55, green: 0.58, blue: 1.0, alpha: 0.18))
+  /// `==highlighted==` text.
+  static let highlight = dynamic(
+    light: NSColor(srgbRed: 1.0, green: 0.85, blue: 0.2, alpha: 0.4),
+    dark: NSColor(srgbRed: 1.0, green: 0.8, blue: 0.2, alpha: 0.3))
 
   /// Code block syntax colors (GitHub's palettes).
   enum Syntax {

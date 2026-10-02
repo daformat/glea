@@ -47,6 +47,17 @@ That stock build can't play H.264 or AAC. Release builds use CEF built from sour
 - **Formatting bar** on text selection: bold, italic, strikethrough, code, link, headings, quote, lists and tasks. The same commands are in the *Format* menu (⌘B, ⌘I, ⇧⌘X, ⌘E, ⇧⌘K, ⌥⌘1–3…).
 - Enter continues lists, tasks and quotes. Tab and ⇧Tab indent list items. Typing `[] ` (or `[ ] `, `[x] `) at the start of a line makes a task.
 
+### Obsidian compatibility
+Notes use Obsidian's flavor of Markdown, so the same files work in both apps:
+- **Links** to a heading or block: `[[Note#Heading]]`, `[[Note#^block-id]]`, `[[#Heading in this note]]`. Clicking one scrolls there. After `[[Note#` the link menu lists the note's headings, and after `#^` its blocks (choosing one without an id gives it one). Links written as paths (`[[Folder/Note]]`, `[[Note.md]]`) resolve by name.
+- **Embeds:** `![[image.png]]` (`|300` sets its width), `![[clip.mp4]]` and `![[paper.pdf]]` show the file, found by name anywhere in the notes folder. `![[Note]]` and `![[Note#Heading]]` show the note or section in place, rendered like the note itself (tables, math, media, embeds) and following its edits. Its name above it opens it.
+- **Frontmatter** shows as a box of properties at the top. Its `aliases` work as link names, and its `tags` count as tags.
+- **Tags:** `#tag` and `#nested/tag` are links. Typing `#` and a letter offers the tags already used. Clicking a tag lists the notes that have it, and searching `#tag` in All Notes does the same.
+- `==highlights==`, `%%comments%%` (faded) and **callouts** (`> [!warning] Title`) in their type's color.
+- `![](https://youtube.com/…)` embeds like a bare link does.
+
+The folder layout stays Glea's: `notes/`, `journal/` and `assets/`.
+
 ### Storage
 Everything lives in `~/Documents/Glea` (change it with *Glea ▸ Change Notes Folder…*):
 

@@ -200,6 +200,15 @@ class ColumnPageView: NSView {
     guard tocTargets.indices.contains(index) else { return }
     tocTargets[index].reveal?()
     guard let rect = tocTargets[index].locate() else { return }
+    scroll(to: rect) { [weak self] in
+      guard let self else { return }
+      self.pinnedEntry = (index, self.scrollView.contentView.bounds.minY)
+      self.toc.setActiveIndex(index)
+    }
+  }
+
+  /// Scrolls a place in the page (a heading jumped to) near the top.
+  func scroll(to rect: NSRect, completion: (() -> Void)? = nil) {
     let clip = scrollView.contentView
     let maxY = max(0, document.bounds.height - clip.bounds.height)
     let y = min(max(0, rect.minY - 40), maxY)
@@ -211,8 +220,7 @@ class ColumnPageView: NSView {
     }, completion: { [weak self] in
       guard let self else { return }
       self.scrollView.reflectScrolledClipView(clip)
-      self.pinnedEntry = (index, clip.bounds.minY)
-      self.toc.setActiveIndex(index)
+      completion?()
     })
   }
 
@@ -743,6 +751,33 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
   func focusEditor() { editor?.focus() }
 
+  /// Scrolls to a heading (`[[Note#Heading]]`) or a block (`[[Note#^id]]`)
+  /// of the note shown. False if it has none by that name.
+  @discardableResult
+  func jump(to anchor: String) -> Bool {
+    guard let editor else { return false }
+    let target = WikiTarget("#" + anchor)
+    let content = editor.content
+    var offset: Int?
+    if let heading = target.heading {
+      offset = markdownHeadings(in: content).first { $0.title.caseInsensitiveCompare(heading) == .orderedSame }?.offset
+    } else if anchor.hasPrefix("^") {
+      let ns = content as NSString
+      ns.enumerateSubstrings(in: NSRange(location: 0, length: ns.length), options: .byLines) { line, range, _, stop in
+        if line?.trimmingCharacters(in: .whitespaces).hasSuffix(" " + anchor) == true {
+          offset = range.location
+          stop.pointee = true
+        }
+      }
+    }
+    guard let offset else { return false }
+    editor.reveal(offset)
+    layoutSubtreeIfNeeded()
+    guard let rect = editor.lineRect(forCharacterAt: offset) else { return false }
+    scroll(to: editor.convert(rect, to: document))
+    return true
+  }
+
   /// The note's title, then its headings.
   private func refreshToc() {
     guard let ref, let editor else { return }
@@ -1228,6 +1263,12 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       if ref == wanted { wanted = next.next() } else { removed.insert(index) }
     }
     return wanted == nil ? removed : nil
+  }
+
+  /// Shows the notes matching `query` (a "#tag" from a note).
+  func search(_ query: String) {
+    searchField.stringValue = query
+    reload()
   }
 
   func focusSearch() {

@@ -1885,8 +1885,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   func openLink(_ url: URL) {
     if url.scheme == "glea-note" {
       let raw = url.absoluteString.dropFirst("glea-note:".count)
-      let name = String(raw).removingPercentEncoding ?? String(raw)
-      openNote(NoteStore.shared.resolve(linkName: name) ?? NoteStore.shared.createNote(named: name))
+      let written = String(raw).removingPercentEncoding ?? String(raw)
+      // A note whose name has a "#" in it, or "Note#Heading".
+      if let ref = NoteStore.shared.resolve(linkName: written) {
+        openNote(ref)
+        return
+      }
+      let target = WikiTarget(written)
+      let current: NoteRef? = { if case .note(let ref) = mode { return ref } else { return nil } }()
+      guard let ref = target.name.isEmpty ? current
+              : NoteStore.shared.resolve(linkName: target.name) ?? NoteStore.shared.createNote(named: WikiTarget.noteName(target.name)) else { return }
+      let wasOpen = ref == current
+      openNote(ref)
+      if let anchor = target.anchor {
+        // Once the note is laid out (at once if it was already open).
+        DispatchQueue.main.asyncAfter(deadline: .now() + (wasOpen ? 0 : 0.1)) { [weak self] in self?.noteView.jump(to: anchor) }
+      }
+    } else if url.scheme == "glea-tag" {
+      let raw = url.absoluteString.dropFirst("glea-tag:".count)
+      let tag = String(raw).removingPercentEncoding ?? String(raw)
+      setMode(.notes)
+      notesView.search("#" + tag)
     } else if url.scheme == "http" || url.scheme == "https" {
       openTab(url.absoluteString, background: NSApp.currentEvent?.modifierFlags.contains(.command) == true)
     } else {

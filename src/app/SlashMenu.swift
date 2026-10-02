@@ -72,6 +72,79 @@ struct SlashItem {
     return items
   }
 
+  /// The headings of a note to link to (`[[Note#…`): those starting with
+  /// `query` first, then those containing it.
+  @MainActor static func headings(_ query: String, note name: String, content: String) -> [SlashItem] {
+    let lower = query.trimmingCharacters(in: .whitespaces).lowercased()
+    let headings = markdownHeadings(in: content)
+    let starting = headings.filter { lower.isEmpty || $0.title.lowercased().hasPrefix(lower) }
+    let containing = lower.isEmpty ? [] : headings.filter { !$0.title.lowercased().hasPrefix(lower) && $0.title.lowercased().contains(lower) }
+    return (starting + containing).prefix(8).map { heading in
+      SlashItem(title: heading.title, keywords: [], symbol: "number", hint: "H\(heading.level)",
+                apply: { $0.completeNoteLink(name + "#" + heading.title) })
+    }
+  }
+
+  private static let blockID = try! NSRegularExpression(pattern: "\\s\\^([\\w-]+)$")
+
+  /// The blocks of a note to link to (`[[Note#^…`): its paragraphs, list
+  /// items and quotes, found by their text. Choosing one without an id gives
+  /// it one (" ^id" at the end of its line), like Obsidian.
+  @MainActor static func blocks(_ query: String, note name: String, ref: NoteRef?, content: String) -> [SlashItem] {
+    let lower = query.trimmingCharacters(in: .whitespaces).lowercased()
+    var items: [SlashItem] = []
+    var inFence = false
+    let body = Frontmatter.body(of: content)
+    for line in body.components(separatedBy: "\n") {
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") {
+        inFence.toggle()
+        continue
+      }
+      guard !inFence, !trimmed.isEmpty, !MarkdownStyler.isHeading(trimmed), !trimmed.hasPrefix("|"), trimmed != "---" else { continue }
+      let ns = line as NSString
+      let idMatch = blockID.firstMatch(in: line, range: NSRange(location: 0, length: ns.length))
+      let existing = idMatch.map { ns.substring(with: $0.range(at: 1)) }
+      let text = NoteStore.plainText(idMatch.map { ns.substring(to: $0.range.location) } ?? line)
+        .trimmingCharacters(in: .whitespaces)
+      guard !text.isEmpty, lower.isEmpty || text.lowercased().contains(lower) || existing?.lowercased().hasPrefix(lower) == true else { continue }
+      items.append(SlashItem(title: text, keywords: [], symbol: "text.alignleft", hint: existing.map { "^" + $0 } ?? "",
+                             apply: { textView in
+        let id = existing ?? blockIDs()
+        if existing == nil { textView.addBlockID(id, toLine: line, of: ref) }
+        textView.completeNoteLink(name + "#^" + id)
+      }))
+      if items.count == 8 { break }
+    }
+    return items
+  }
+
+  /// A new block id, like Obsidian's: six lowercase letters and digits.
+  private static func blockIDs() -> String {
+    String((0..<6).map { _ in "abcdefghijklmnopqrstuvwxyz0123456789".randomElement()! })
+  }
+
+  /// Tags the notes use, starting with `query` first, then containing it,
+  /// the most used first. Nothing until a letter is typed (a "#" alone may
+  /// start a heading).
+  @MainActor static func tags(_ query: String) -> [SlashItem] {
+    let lower = query.lowercased()
+    guard !lower.isEmpty else { return [] }
+    let all = NoteStore.shared.tagCounts().sorted { $0.count != $1.count ? $0.count > $1.count : $0.tag < $1.tag }
+    let starting = all.filter { $0.tag.lowercased().hasPrefix(lower) && $0.tag.lowercased() != lower }
+    let containing = all.filter { !$0.tag.lowercased().hasPrefix(lower) && $0.tag.lowercased().contains(lower) }
+    return (starting + containing).prefix(8).map { entry in
+      SlashItem(title: "#" + entry.tag, keywords: [], symbol: "number", hint: "\(entry.count)", apply: { textView in
+        let location = textView.selectedRange().location
+        let s = textView.string as NSString
+        let spaced = location < s.length && [0x20, 0x0A, 0x09].contains(s.character(at: location))
+        let text = entry.tag + (spaced ? "" : " ")
+        textView.replace(NSRange(location: location, length: 0), with: text,
+                         select: NSRange(location: location + (entry.tag as NSString).length + 1, length: 0))
+      })
+    }
+  }
+
   /// LaTeX commands: the command, what it inserts ("|" is where the cursor
   /// goes), and an example to show typeset.
   private static let latex: [(command: String, insert: String, example: String)] = {
@@ -138,13 +211,44 @@ struct SlashItem {
 extension MarkdownTextView {
   /// Writes `name` at the cursor (just after "[["), and closes the link:
   /// the cursor goes after "]]", which is added unless it's already there.
+  /// Before an alias ("|alias]]"), the link keeps it, and the cursor goes
+  /// after the name.
   func completeNoteLink(_ name: String) {
     let location = selectedRange().location
     let s = string as NSString
     let closed = location + 2 <= s.length && s.substring(with: NSRange(location: location, length: 2)) == "]]"
-    let text = closed ? name : name + "]]"
+    let aliased = location < s.length && s.character(at: location) == 0x7C
+    let text = closed || aliased ? name : name + "]]"
     replace(NSRange(location: location, length: 0), with: text,
-            select: NSRange(location: location + (name as NSString).length + 2, length: 0))
+            select: NSRange(location: location + (name as NSString).length + (aliased ? 0 : 2), length: 0))
+  }
+
+  /// Ends `line` with " ^id": in this text when `ref` is nil (a link within
+  /// the note), otherwise in that note's file. The first line written that
+  /// way, other than the one the cursor is on.
+  func addBlockID(_ id: String, toLine line: String, of ref: NoteRef?) {
+    let suffix = " ^" + id
+    if let ref {
+      var lines = NoteStore.shared.content(of: ref).components(separatedBy: "\n")
+      guard let index = lines.firstIndex(of: line) else { return }
+      lines[index] = line.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression) + suffix
+      NoteStore.shared.save(ref, content: lines.joined(separator: "\n"))
+      return
+    }
+    let s = string as NSString
+    let caret = selectedRange().location
+    var target: NSRange?
+    s.enumerateSubstrings(in: NSRange(location: 0, length: s.length), options: .byLines) { text, range, _, stop in
+      if text == line, !(caret >= range.location && caret <= NSMaxRange(range)) {
+        target = range
+        stop.pointee = true
+      }
+    }
+    guard let target else { return }
+    let trailing = (line as NSString).length - (line.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression) as NSString).length
+    let end = NSRange(location: NSMaxRange(target) - trailing, length: trailing)
+    let shift = NSMaxRange(target) <= caret ? (suffix as NSString).length - trailing : 0
+    replace(end, with: suffix, select: NSRange(location: caret + shift, length: 0))
   }
 
   /// A fenced code block at the cursor, with the cursor inside it.
@@ -189,6 +293,8 @@ final class SlashMenu {
     case noteLink
     /// "\" in math: LaTeX commands.
     case math
+    /// "#": the tags the notes use.
+    case tag
   }
 
   private unowned let textView: MarkdownTextView
@@ -199,6 +305,7 @@ final class SlashMenu {
     case .blocks: return "/"
     case .noteLink: return "[["
     case .math: return "\\"
+    case .tag: return "#"
     }
   }
   /// Where the trigger is, while the menu is open (it may have no matches,
@@ -217,6 +324,7 @@ final class SlashMenu {
   var isOpen: Bool { start != nil }
 
   func textDidChange() {
+    guard !choosing else { return }
     if isOpen {
       update()
       return
@@ -224,11 +332,18 @@ final class SlashMenu {
     let caret = textView.selectedRange()
     let s = textView.string as NSString
     let length = (trigger as NSString).length
+    // Typing (or deleting) in a link or tag written earlier: the menu comes
+    // back for it.
+    if let earlier = earlierTrigger(before: caret), !isInCodeBlock(earlier) {
+      start = earlier
+      update()
+      return
+    }
     guard caret.length == 0, caret.location >= length, caret.location <= s.length,
           s.substring(with: NSRange(location: caret.location - length, length: length)) == trigger else { return }
     // A "/" at the start of a line or after a space (not in a URL); "[["
     // anywhere. Neither in a code block.
-    if kind == .blocks, caret.location >= 2 {
+    if kind == .blocks || kind == .tag, caret.location >= 2 {
       let before = s.character(at: caret.location - 2)
       guard before == 0x20 || before == 0x09 || before == 0x0A else { return }
     }
@@ -240,6 +355,33 @@ final class SlashMenu {
     start = caret.location - length
     update()
   }
+
+  /// The "[[" (or "#") of the link (or tag) the cursor is in, typed before
+  /// what was just changed: "[[" with no "]" between it and the cursor, on
+  /// its line; "#" followed by tag characters only, at a word's start.
+  private func earlierTrigger(before caret: NSRange) -> Int? {
+    guard caret.length == 0 else { return nil }
+    switch kind {
+    case .noteLink:
+      return textView.wikiLinkContext.map { $0.location - 2 }
+    case .tag:
+      let s = textView.string as NSString
+      var index = caret.location
+      while index > 0, let scalar = Unicode.Scalar(s.character(at: index - 1)),
+            CharacterSet.alphanumerics.contains(scalar) || "_-/".unicodeScalars.contains(scalar) {
+        index -= 1
+      }
+      guard index > 0, index < caret.location, s.character(at: index - 1) == 0x23 else { return nil }
+      let hash = index - 1
+      guard hash == 0 || [0x20, 0x09, 0x0A].contains(s.character(at: hash - 1)) else { return nil }
+      return hash
+    case .blocks, .math:
+      return nil
+    }
+  }
+
+  /// Set while a choice is written: those changes don't open it again.
+  private var choosing = false
 
   /// Opens it on a trigger typed earlier (Esc inside "[[…").
   func open(at location: Int) {
@@ -307,7 +449,31 @@ final class SlashMenu {
     case .noteLink:
       // Past the line or the link's end: done.
       guard !query.contains("\n"), !query.contains("]"), (query as NSString).length <= 120 else { return close() }
-      items = SlashItem.notes(query, names: textView.noteNames())
+      // "Note#": its headings; "Note#^": its blocks. "#" alone: this note's.
+      if let hash = query.firstIndex(of: "#"), !NoteStore.shared.hasNote(named: query) {
+        let name = String(query[..<hash])
+        let anchor = String(query[query.index(after: hash)...])
+        // A name being typed ("Rec#"): the note the menu would offer first.
+        let ref = name.isEmpty ? nil : NoteStore.shared.resolve(linkName: name)
+          ?? SlashItem.notes(name, names: textView.noteNames()).first { $0.symbol == "doc.text" }
+            .flatMap { NoteStore.shared.resolve(linkName: $0.title) }
+        if !name.isEmpty && ref == nil {
+          items = []
+        } else {
+          let content = ref.map { NoteStore.shared.content(of: $0) } ?? textView.string
+          let note = ref.map { NoteStore.shared.resolve(linkName: name) == $0 ? name : $0.name } ?? name
+          items = anchor.hasPrefix("^")
+            ? SlashItem.blocks(String(anchor.dropFirst()), note: note, ref: ref, content: content)
+            : SlashItem.headings(anchor, note: note, content: content)
+        }
+      } else {
+        items = SlashItem.notes(query, names: textView.noteNames())
+      }
+    case .tag:
+      // Tag characters only: past a space or punctuation, the tag is typed.
+      guard query.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.contains($0) || "_-/".unicodeScalars.contains($0) }),
+            (query as NSString).length <= 60 else { return close() }
+      items = SlashItem.tags(query)
     }
     selected = 0
     if items.isEmpty { hidePanel() } else { showPanel() }
@@ -323,17 +489,34 @@ final class SlashMenu {
   private func choose(_ index: Int) {
     guard let start, items.indices.contains(index) else { return }
     let item = items[index]
-    // "/" and "\\" go with the query; "[[" stays.
-    let from = kind == .noteLink ? start + (trigger as NSString).length : start
-    let range = NSRange(location: from, length: textView.selectedRange().location - from)
+    // "/" and "\\" go with the query; "[[" and "#" stay.
+    let from = kind == .noteLink || kind == .tag ? start + (trigger as NSString).length : start
+    var end = textView.selectedRange().location
+    // In the middle of a link or tag: what's after the cursor goes too (a
+    // link up to its "]]" or alias, keeping them).
+    let s = textView.string as NSString
+    let lineEnd = NSMaxRange(s.lineRange(for: NSRange(location: end, length: 0)))
+    if kind == .noteLink {
+      let rest = s.substring(with: NSRange(location: end, length: lineEnd - end)) as NSString
+      let close = rest.range(of: "]]").location, open = rest.range(of: "[["), bar = rest.range(of: "|").location
+      if close != NSNotFound, open.location == NSNotFound || open.location > close { end += min(close, bar) }
+    } else if kind == .tag {
+      while end < lineEnd, let scalar = Unicode.Scalar(s.character(at: end)),
+            CharacterSet.alphanumerics.contains(scalar) || "_-/".unicodeScalars.contains(scalar) {
+        end += 1
+      }
+    }
+    let range = NSRange(location: from, length: end - from)
     close()
     textView.breakUndoCoalescing()
     let undo = textView.undoManager
     undo?.beginUndoGrouping()
+    choosing = true
     textView.replace(range, with: "", select: NSRange(location: from, length: 0))
     item.apply(textView)
+    choosing = false
     undo?.endUndoGrouping()
-    undo?.setActionName(kind == .blocks ? item.title : kind == .math ? "Insert \(item.title)" : "Link to Note")
+    undo?.setActionName(kind == .blocks ? item.title : kind == .math ? "Insert \(item.title)" : kind == .tag ? "Insert Tag" : "Link to Note")
   }
 
   private func isInCodeBlock(_ location: Int) -> Bool {

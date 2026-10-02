@@ -159,30 +159,42 @@ final class MediaDescriptor: NSObject {
     case image(URL)
     case video(URL)
     case embed(URL, EmbedProvider, [String])
+    /// A PDF from the notes folder (`![[paper.pdf]]`), in Chromium's viewer.
+    case document(URL)
+    /// Another note, or a section of it, shown in place (`![[Note#Heading]]`).
+    case note(WikiTarget)
   }
 
   let key: String
   let kind: Kind
   let title: String?
   let indent: CGFloat
+  /// The width it's asked to show at (`![[image.png|300]]`).
+  let preferredWidth: CGFloat?
 
-  init(key: String, kind: Kind, title: String?, indent: CGFloat) {
+  init(key: String, kind: Kind, title: String?, indent: CGFloat, preferredWidth: CGFloat? = nil) {
     self.key = key
     self.kind = kind
     self.title = title
     self.indent = indent
+    self.preferredWidth = preferredWidth
   }
 
   var isLocal: Bool {
     switch kind {
-    case .image(let url), .video(let url): return url.isFileURL
+    case .image(let url), .video(let url), .document(let url): return url.isFileURL
     case .embed: return false
+    case .note: return true
     }
   }
 
   var sourceURL: URL {
     switch kind {
-    case .image(let url), .video(let url), .embed(let url, _, _): return url
+    case .image(let url), .video(let url), .embed(let url, _, _), .document(let url): return url
+    case .note(let target):
+      let written = target.name + (target.anchor.map { "#" + $0 } ?? "")
+      return URL(string: "glea-note:" + (written.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? written))
+        ?? URL(string: "glea-note:")!
     }
   }
 
@@ -213,12 +225,20 @@ final class MediaDescriptor: NSObject {
   private static let imageLine = try! NSRegularExpression(pattern: "^!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)(?:\\s+\"([^\"]*)\")?\\)$")
   private static let videoLinkLine = try! NSRegularExpression(pattern: "^\\[([^\\]\\n]*)\\]\\((https?://[^)\\s]+)\\)$")
   private static let urlLine = try! NSRegularExpression(pattern: "^https?://\\S+$")
+  /// `![[file or note]]`, with what follows "|": a size or a caption.
+  private static let wikiEmbedLine = try! NSRegularExpression(pattern: "^!\\[\\[([^\\]\\n|]+)(?:\\|([^\\]\\n]*))?\\]\\]$")
 
   /// The media a line's content stands for, if it is a media line.
+  @MainActor
   static func parse(_ content: String, baseDirectory: URL, indent: CGFloat, occurrence: Int) -> MediaDescriptor? {
     let text = content.trimmingCharacters(in: .whitespaces)
     let ns = text as NSString
     let full = NSRange(location: 0, length: ns.length)
+    if let m = wikiEmbedLine.firstMatch(in: text, range: full) {
+      return wikiEmbed(ns.substring(with: m.range(at: 1)),
+                       option: m.range(at: 2).location != NSNotFound ? ns.substring(with: m.range(at: 2)) : nil,
+                       indent: indent, occurrence: occurrence)
+    }
     func resolve(_ source: String) -> URL? {
       if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("file://") { return URL(string: source) }
       let path = source.removingPercentEncoding ?? source
@@ -257,6 +277,36 @@ final class MediaDescriptor: NSObject {
       if imageExtensions.contains(ext) { return MediaDescriptor(key: key, kind: .image(url), title: nil, indent: indent) }
     }
     return nil
+  }
+
+  /// `![[target|option]]`: a file from the notes folder (an image, a video
+  /// or sound, a PDF), or a note. The option is a width ("300", "300x200")
+  /// or, for a file, a caption.
+  @MainActor
+  private static func wikiEmbed(_ written: String, option: String?, indent: CGFloat, occurrence: Int) -> MediaDescriptor? {
+    let target = WikiTarget(written)
+    // The whole line: the same file at another size is another block.
+    let key = "![[\(written)\(option.map { "|" + $0 } ?? "")]]#\(occurrence)"
+    let ext = (target.name as NSString).pathExtension.lowercased()
+    guard !ext.isEmpty, ext != "md" else {
+      guard !target.name.isEmpty || target.anchor != nil else { return nil }
+      return MediaDescriptor(key: key, kind: .note(target), title: nil, indent: indent)
+    }
+    let option = option?.trimmingCharacters(in: .whitespaces)
+    let width = option.flatMap { $0.range(of: "^\\d+(x\\d+)?$", options: .regularExpression) != nil
+      ? Double($0.split(separator: "x")[0]).map { CGFloat($0) } : nil }
+    let caption = width == nil && option?.isEmpty == false ? option : nil
+    // Not in the folder: an image still shows where it would be, missing.
+    let url = NoteStore.shared.attachment(named: target.name)
+      ?? NoteStore.shared.assetsDirectory.appendingPathComponent(target.name)
+    if isPlayable(url) {
+      return MediaDescriptor(key: key, kind: .video(url), title: caption, indent: indent, preferredWidth: width)
+    }
+    if ext == "pdf" {
+      return MediaDescriptor(key: key, kind: .document(url), title: caption, indent: indent, preferredWidth: width)
+    }
+    guard imageExtensions.contains(ext) else { return nil }
+    return MediaDescriptor(key: key, kind: .image(url), title: caption, indent: indent, preferredWidth: width)
   }
 }
 
@@ -561,6 +611,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   let descriptor: MediaDescriptor
   let noteID: String
+  /// The notes it's in, outermost first (see MarkdownEditorView.embedChain).
+  let embedChain: [String]
   /// The reserved height changed: animating from the old one (given), or
   /// at once.
   var onHeightChange: ((_ animatedFrom: CGFloat?) -> Void)?
@@ -615,9 +667,10 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     didSet { if abs(availableWidth - oldValue) > 0.5 { relayout(animated: false) } }
   }
 
-  init(descriptor: MediaDescriptor, noteID: String) {
+  init(descriptor: MediaDescriptor, noteID: String, embedChain: [String] = []) {
     self.descriptor = descriptor
     self.noteID = noteID
+    self.embedChain = embedChain
     collapsed = MediaState.isCollapsed(note: noteID, key: descriptor.key)
     titleText = descriptor.title
     super.init(frame: .zero)
@@ -884,9 +937,13 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       // No title from the service (e.g. Instagram): name the service.
       let kind = url.path.contains("/reel/") ? "reel" : url.path.contains("/status") || url.path.contains("/post/") ? "post" : ""
       return kind.isEmpty ? provider.name : "\(provider.name) \(kind)"
-    case .image(let url), .video(let url):
+    case .image(let url), .video(let url), .document(let url):
       if !url.isFileURL && !loaded { return "Loading \(url.host ?? "media")…" }
       return url.lastPathComponent
+    case .note(let target):
+      let name = target.name.isEmpty ? "" : WikiTarget.noteName(target.name)
+      guard let anchor = target.heading ?? target.anchor else { return name }
+      return name.isEmpty ? anchor : "\(name) › \(anchor)"
     }
   }
 
@@ -914,6 +971,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       placeholder.image = Theme.symbol("photo", size: 22, weight: .regular)
     case .video:
       let symbol = descriptor.isAudio ? "waveform" : "film"
+      rowIcon.image = Theme.symbol(symbol, size: 12)
+      rowIcon.contentTintColor = Theme.secondaryText
+      placeholder.image = Theme.symbol(symbol, size: 22, weight: .regular)
+    case .document, .note:
+      let symbol = { if case .document = descriptor.kind { return "doc.richtext" } else { return "doc.text" } }()
       rowIcon.image = Theme.symbol(symbol, size: 12)
       rowIcon.contentTintColor = Theme.secondaryText
       placeholder.image = Theme.symbol(symbol, size: 22, weight: .regular)
@@ -946,6 +1008,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     case .image(let url) where url.isFileURL || ImageCache.shared.image(for: url) != nil:
       performLoad()
     case .video(let url) where url.isFileURL:
+      performLoad()
+    case .note:
       performLoad()
     default:
       if !waitingToLoad { startLoading() }
@@ -1048,6 +1112,18 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
           if let self { MediaLoadQueue.shared.finished(self) }
         }
       }
+    case .document(let url):
+      startLoading()
+      showBrowser(url.absoluteString, script: nil)
+    case .note(let target):
+      let view = NoteEmbedView(target: target, host: NoteRef(id: noteID), chain: embedChain)
+      view.onOpenLink = { [weak self] url in self?.onOpenURL?(url) }
+      view.onContentChange = { [weak self] in
+        guard let self, self.loaded else { return }
+        self.relayout(animated: true, followingContent: true)
+      }
+      install(view)
+      finishLoading(immediately: true)
     case .embed(let url, let provider, let groups):
       startLoading()
       EmbedService.resolve(url, provider: provider, groups: groups, dark: isDark) { [weak self] resolution in
@@ -1250,8 +1326,12 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   // MARK: Layout
 
   private func targetMediaSize() -> NSSize {
-    let maxWidth = availableWidth
+    let maxWidth = min(availableWidth, descriptor.preferredWidth ?? availableWidth)
     switch descriptor.kind {
+    case .document:
+      return NSSize(width: maxWidth, height: round(min(760, maxWidth * 1.3)))
+    case .note:
+      return NSSize(width: maxWidth, height: (content as? NoteEmbedView)?.height(forWidth: maxWidth) ?? 44)
     case .video where descriptor.isAudio:
       // A player bar.
       return NSSize(width: min(maxWidth, 480), height: 54)

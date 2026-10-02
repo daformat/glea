@@ -158,7 +158,15 @@ struct MarkdownStyler {
   private static let inlineMath = regex("(?<![\\\\$\\w])\\$(?=[^\\s$])([^$\\n]*?[^\\s\\\\$])\\$(?![\\w$])")
   private static let image = regex("!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)")
   private static let link = regex("(?<!!)\\[([^\\]\\n]+)\\]\\(([^)\\s]+)(?:\\s+\"[^\"]*\")?\\)")
-  private static let wikiLink = regex("\\[\\[([^\\]\\n|]+)(?:\\|([^\\]\\n]+))?\\]\\]")
+  /// `[[Note]]`, `[[Note|alias]]`, `[[Note#Heading]]`, `[[#Heading]]`.
+  private static let wikiLink = regex("(?<!!)\\[\\[([^\\]\\n|]+)(?:\\|([^\\]\\n]+))?\\]\\]")
+  /// `![[file or note]]` within a line (alone on its line, it's a media block).
+  private static let wikiEmbed = regex("!\\[\\[([^\\]\\n|]+)(?:\\|([^\\]\\n]*))?\\]\\]")
+  private static let highlight = regex("==(?=\\S)(.+?)(?<=\\S)==")
+  /// `%%comment%%` (Obsidian's), kept in the text but shown faded.
+  private static let comment = regex("%%.+?%%")
+  /// A block id at the end of a line (`… ^id`), what `[[Note#^id]]` links to.
+  private static let blockID = regex("\\s\\^[\\w-]+$")
   private static let bareURL = regex("\\bhttps?://[^\\s<>()\\[\\]]*[^\\s<>()\\[\\].,;:!?'\"]")
   private static let bold = regex("(\\*\\*|__)(?=\\S)(.+?)(?<=\\S)\\1")
   private static let italic = regex("(?<![*\\w])\\*(?=\\S)([^*\\n]+?)(?<=\\S)\\*(?![*\\w])|(?<![_\\w])_(?=\\S)([^_\\n]+?)(?<=\\S)_(?![_\\w])")
@@ -234,6 +242,8 @@ struct MarkdownStyler {
     var mathAt: [Int: (lines: Range<Int>, latex: String)] = [:]
     for block in mathBlocks { mathAt[block.lines.lowerBound] = block }
     let depths = MarkdownStyler.sectionDepths(lines: lines, string: string, fenceLines: fenceLines)
+    let frontmatter = string.hasPrefix("---") ? Frontmatter.parse(string as String) : nil
+    let callouts = MarkdownStyler.callouts(lines: lines, string: string, fenceLines: fenceLines)
     let foldRanges = MarkdownStyler.headingSections(lines: lines, string: string, fenceLines: fenceLines)
       .filter { folded.contains($0.key) && $0.body.length > 0 }.map(\.body)
     func foldRange(of line: NSRange) -> NSRange? {
@@ -249,6 +259,7 @@ struct MarkdownStyler {
                 length: NSMaxRange(lines[$0.upperBound - 1].enclosing) - lines[$0.lowerBound].enclosing.location)
       }
       blockRanges += codeBlocks.map(\.block)
+      if let frontmatter { blockRanges.append(frontmatter.range) }
       blockRanges += mathBlocks.map { NSRange(location: lines[$0.lines.lowerBound].enclosing.location,
                                               length: NSMaxRange(lines[$0.lines.upperBound - 1].enclosing) - lines[$0.lines.lowerBound].enclosing.location) }
       for blockRange in blockRanges {
@@ -301,6 +312,12 @@ struct MarkdownStyler {
         index += 1
         continue
       }
+      if index == 0, let frontmatter, frontmatter.lineCount <= lines.count {
+        let blockLines = Array(lines[0..<frontmatter.lineCount])
+        if blockLines.contains(where: { inTarget($0.enclosing) }) { styleFrontmatter(storage, lines: blockLines, string: string) }
+        index = frontmatter.lineCount
+        continue
+      }
       if !inFence, let block = mathAt[index] {
         let blockLines = Array(lines[block.lines])
         if blockLines.contains(where: { inTarget($0.enclosing) }) {
@@ -319,7 +336,8 @@ struct MarkdownStyler {
       }
       if inTarget(enclosing) {
         styleLine(storage, line: line, lineRange: lineRange, enclosing: enclosing, inFence: inFence, isFence: isFence,
-                  sectionIndent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent, mediaOccurrence: mediaOccurrence)
+                  sectionIndent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent, mediaOccurrence: mediaOccurrence,
+                  callout: inFence ? nil : callouts[index])
       }
       if isFence { inFence.toggle() }
       index += 1
@@ -606,6 +624,95 @@ struct MarkdownStyler {
     return (lines.joined(separator: "\n"), at)
   }
 
+  /// Callouts (`> [!type] Title` and the quote lines after it), by line:
+  /// their color, and whether the line is the one with the title.
+  private static func callouts(lines: [(line: NSRange, enclosing: NSRange)], string: NSString,
+                               fenceLines: [Bool]) -> [Int: (color: NSColor, isHead: Bool)] {
+    var result: [Int: (NSColor, Bool)] = [:]
+    var current: NSColor?
+    var inFence = false
+    for (index, (line, _)) in lines.enumerated() {
+      if fenceLines[index] { inFence.toggle() }
+      let text = string.substring(with: line)
+      guard !inFence, !fenceLines[index], let m = quote.firstMatch(in: text, range: NSRange(location: 0, length: line.length)) else {
+        current = nil
+        continue
+      }
+      let rest = NSRange(location: m.range.length, length: line.length - m.range.length)
+      if let c = ObsidianSyntax.callout.firstMatch(in: text, range: rest) {
+        current = ObsidianSyntax.calloutColor((text as NSString).substring(with: c.range(at: 1)))
+        result[index] = (current!, true)
+      } else if let current {
+        result[index] = (current, false)
+      }
+    }
+    return result
+  }
+
+  /// The frontmatter, as a box of properties: its "---" lines disappear
+  /// unless the cursor is in it, keys are faded and tags look like tags.
+  private func styleFrontmatter(_ storage: NSTextStorage, lines: [(line: NSRange, enclosing: NSRange)], string: NSString) {
+    let block = NSRange(location: lines[0].enclosing.location,
+                        length: NSMaxRange(lines[lines.count - 1].enclosing) - lines[0].enclosing.location)
+    let editing = revealsMarker(block)
+    let font = NSFont.systemFont(ofSize: Theme.bodySize - 2)
+    for (index, (line, enclosing)) in lines.enumerated() {
+      let isFence = index == 0 || index == lines.count - 1
+      let paragraph = NSMutableParagraphStyle()
+      paragraph.lineSpacing = 2
+      paragraph.headIndent = 12
+      paragraph.firstLineHeadIndent = 12
+      paragraph.paragraphSpacingBefore = index == 1 ? 4 : 0
+      paragraph.paragraphSpacing = index == lines.count - 1 ? 18 : index == lines.count - 2 ? 4 : 0
+      storage.addAttributes([.font: font, .foregroundColor: Theme.secondaryText, .paragraphStyle: paragraph], range: enclosing)
+      if isFence {
+        if editing {
+          storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.tertiaryText], range: enclosing)
+        } else {
+          storage.addAttributes(hidden, range: enclosing)
+        }
+        continue
+      }
+      storage.addAttribute(.gleaCode, value: true, range: enclosing)
+      let text = string.substring(with: line)
+      let trimmed = text.trimmingCharacters(in: .whitespaces)
+      let colon = (text as NSString).range(of: ":")
+      if !trimmed.hasPrefix("-"), colon.location != NSNotFound {
+        storage.addAttribute(.foregroundColor, value: Theme.tertiaryText,
+                             range: NSRange(location: line.location, length: colon.upperBound))
+      }
+      for m in ObsidianSyntax.tag.matches(in: text, range: NSRange(location: 0, length: line.length)) {
+        styleTag(storage, NSRange(location: line.location + m.range.location, length: m.range.length), name: (text as NSString).substring(with: m.range(at: 1)))
+      }
+      // Tags listed without "#" (tags: [a, b]).
+      if trimmed.lowercased().hasPrefix("tags:") || (trimmed.hasPrefix("- ") && isUnderTags(lines: lines, index: index, string: string)) {
+        let start = trimmed.hasPrefix("- ") ? (text as NSString).range(of: "- ").upperBound : (text as NSString).range(of: ":").upperBound
+        let value = NSRange(location: start, length: line.length - start)
+        let words = try! NSRegularExpression(pattern: "[^\\s,\\[\\]\"'#]+")
+        for m in words.matches(in: text, range: value) {
+          styleTag(storage, NSRange(location: line.location + m.range.location, length: m.range.length), name: (text as NSString).substring(with: m.range))
+        }
+      }
+    }
+  }
+
+  private func isUnderTags(lines: [(line: NSRange, enclosing: NSRange)], index: Int, string: NSString) -> Bool {
+    for i in stride(from: index - 1, through: 1, by: -1) {
+      let text = string.substring(with: lines[i].line).trimmingCharacters(in: .whitespaces)
+      if text.hasPrefix("- ") { continue }
+      return text.lowercased().hasPrefix("tags:")
+    }
+    return false
+  }
+
+  /// A tag: in the accent color, and a link to the notes that have it.
+  private func styleTag(_ storage: NSTextStorage, _ range: NSRange, name: String) {
+    storage.addAttribute(.foregroundColor, value: Theme.accent, range: range)
+    if let url = MarkdownStyler.linkValue("glea-tag:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)) {
+      storage.addAttribute(.link, value: url, range: range)
+    }
+  }
+
   /// Cheap pre-check: the source of a would-be media line.
   static func mediaSourceHint(_ line: String) -> String? {
     var text = line.trimmingCharacters(in: .whitespaces)
@@ -614,11 +721,13 @@ struct MarkdownStyler {
       return String(text[open.upperBound...].dropLast()).components(separatedBy: " ").first
     }
     if text.hasPrefix("http"), !text.contains(" ") { return text }
+    if text.hasPrefix("![["), text.hasSuffix("]]") { return text }
     return nil
   }
 
   private func styleLine(_ storage: NSTextStorage, line: String, lineRange: NSRange, enclosing: NSRange,
-                         inFence: Bool, isFence: Bool, sectionIndent: CGFloat, mediaOccurrence: Int = 0) {
+                         inFence: Bool, isFence: Bool, sectionIndent: CGFloat, mediaOccurrence: Int = 0,
+                         callout: (color: NSColor, isHead: Bool)? = nil) {
     let local = NSRange(location: 0, length: (line as NSString).length)
     func abs(_ r: NSRange) -> NSRange { NSRange(location: r.location + lineRange.location, length: r.length) }
     storage.addAttribute(.gleaSectionIndent, value: sectionIndent, range: enclosing)
@@ -684,11 +793,18 @@ struct MarkdownStyler {
     // Block quotes.
     if let m = MarkdownStyler.quote.firstMatch(in: line, range: local) {
       if revealsMarker(abs(m.range)) { storage.addAttributes(faded, range: abs(m.range)) } else { hide(storage, abs(m.range)) }
-      storage.addAttribute(.foregroundColor, value: Theme.secondaryText, range: abs(NSRange(location: m.range.length, length: local.length - m.range.length)))
-      storage.addAttribute(.gleaQuote, value: true, range: enclosing)
-      indent += 16
+      let rest = NSRange(location: m.range.length, length: local.length - m.range.length)
+      storage.addAttribute(.foregroundColor, value: callout == nil ? Theme.secondaryText : Theme.text, range: abs(rest))
+      // A callout's bar (and tint) takes its color.
+      storage.addAttribute(.gleaQuote, value: callout?.color ?? true, range: enclosing)
+      indent += callout == nil ? 16 : 20
       spacingAfter = 2
       contentStart = m.range.length
+      if let callout, callout.isHead, let c = ObsidianSyntax.callout.firstMatch(in: line, range: rest) {
+        styleCalloutHead(storage, line: line as NSString, marker: c, lineRange: lineRange, color: callout.color)
+        spacingBefore = 4
+        contentStart = c.range.upperBound
+      }
     }
 
     // Media blocks: the line is hidden (unless being edited) and the block
@@ -759,6 +875,31 @@ struct MarkdownStyler {
     let imageHeight = styleInline(storage, line: line, lineRange: lineRange, imageIndent: indent)
     if imageHeight > 0 { spacingAfter += imageHeight + 12 }
     finishParagraph()
+  }
+
+  /// A callout's first line: its "[!type]" goes, its title shows in the
+  /// callout's color. With no title, the type stands for it, in small caps.
+  private func styleCalloutHead(_ storage: NSTextStorage, line: NSString, marker: NSTextCheckingResult, lineRange: NSRange, color: NSColor) {
+    func abs(_ r: NSRange) -> NSRange { NSRange(location: r.location + lineRange.location, length: r.length) }
+    let title = NSRange(location: marker.range.upperBound, length: line.length - marker.range.upperBound)
+    let weight = NSFont.systemFont(ofSize: Theme.bodySize, weight: .semibold)
+    storage.addAttributes([.font: weight, .foregroundColor: color], range: abs(title))
+    if revealsMarker(NSRange(location: lineRange.location, length: marker.range.upperBound + 1)) {
+      storage.addAttributes(faded, range: abs(marker.range))
+      return
+    }
+    if title.length > 0 && !line.substring(with: title).trimmingCharacters(in: .whitespaces).isEmpty {
+      hide(storage, abs(marker.range))
+      return
+    }
+    let type = marker.range(at: 1)
+    let smallCaps = weight.fontDescriptor.addingAttributes([.featureSettings: [
+      [NSFontDescriptor.FeatureKey.typeIdentifier: kLowerCaseType, .selectorIdentifier: kLowerCaseSmallCapsSelector],
+      [NSFontDescriptor.FeatureKey.typeIdentifier: kUpperCaseType, .selectorIdentifier: kUpperCaseSmallCapsSelector],
+    ]])
+    storage.addAttributes([.font: NSFont(descriptor: smallCaps, size: Theme.bodySize) ?? weight, .foregroundColor: color, .kern: 0.4], range: abs(type))
+    hide(storage, abs(NSRange(location: marker.range.location, length: type.location - marker.range.location)))
+    hide(storage, abs(NSRange(location: type.upperBound, length: marker.range.upperBound - type.upperBound)))
   }
 
   // MARK: Tables
@@ -1085,6 +1226,17 @@ struct MarkdownStyler {
       taken.append(m.range)
     }
 
+    for m in MarkdownStyler.blockID.matches(in: line, range: local) where free(m.range) {
+      construct = m.range
+      syntax(m.range)
+      taken.append(m.range)
+    }
+
+    for m in MarkdownStyler.comment.matches(in: line, range: local) where free(m.range) {
+      storage.addAttribute(.foregroundColor, value: Theme.tertiaryText, range: abs(m.range))
+      taken.append(m.range)
+    }
+
     for m in MarkdownStyler.inlineMath.matches(in: line, range: local) where free(m.range) {
       construct = m.range
       taken.append(m.range)
@@ -1154,12 +1306,33 @@ struct MarkdownStyler {
       imageHeight = size.height
     }
 
+    // An embed within text links to what it embeds: a note, or a file.
+    for m in MarkdownStyler.wikiEmbed.matches(in: line, range: local) where free(m.range) {
+      construct = m.range
+      taken.append(m.range)
+      let written = ns.substring(with: m.range(at: 1))
+      let target = WikiTarget(written)
+      let isFile = !(target.name as NSString).pathExtension.isEmpty && !target.name.lowercased().hasSuffix(".md")
+      let link = isFile ? NoteStore.shared.attachment(named: target.name).map { $0.absoluteString }
+        : "glea-note:" + (written.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? written)
+      let visible = m.range(at: 1)
+      if let link, let url = MarkdownStyler.linkValue(link) { storage.addAttribute(.link, value: url, range: abs(visible)) }
+      storage.addAttribute(.font, value: NSFont.systemFont(ofSize: Theme.bodySize, weight: .medium), range: abs(visible))
+      syntax(NSRange(location: m.range.location, length: visible.location - m.range.location))
+      syntax(NSRange(location: visible.upperBound, length: m.range.upperBound - visible.upperBound))
+    }
+
     for m in MarkdownStyler.wikiLink.matches(in: line, range: local) where free(m.range) {
       construct = m.range
       taken.append(m.range)
       let name = ns.substring(with: m.range(at: 1))
       let hasAlias = m.range(at: 2).location != NSNotFound
-      let visible = hasAlias ? m.range(at: 2) : m.range(at: 1)
+      var visible = hasAlias ? m.range(at: 2) : m.range(at: 1)
+      // "[[#Heading]]": the heading, without its "#".
+      if !hasAlias, name.hasPrefix("#") {
+        let marker = name.hasPrefix("#^") ? 2 : 1
+        visible = NSRange(location: visible.location + marker, length: max(0, visible.length - marker))
+      }
       if let url = MarkdownStyler.linkValue("glea-note:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)) {
         storage.addAttribute(.link, value: url, range: abs(visible))
       }
@@ -1186,6 +1359,11 @@ struct MarkdownStyler {
       }
     }
 
+    for m in ObsidianSyntax.tag.matches(in: line, range: local) where free(m.range) {
+      taken.append(m.range)
+      styleTag(storage, abs(m.range), name: ns.substring(with: m.range(at: 1)))
+    }
+
     // Emphasis may wrap links and code (**[[Note]]**), as long as they sit
     // wholly inside it, clear of its markers.
     func wraps(_ outer: NSRange, inner: NSRange) -> Bool {
@@ -1208,6 +1386,12 @@ struct MarkdownStyler {
     for m in MarkdownStyler.strike.matches(in: line, range: local) where wraps(m.range, inner: m.range(at: 1)) {
       construct = m.range
       storage.addAttribute(.strikethroughStyle, value: NSUnderlineStyle.single.rawValue, range: abs(m.range(at: 1)))
+      syntax(NSRange(location: m.range.location, length: 2))
+      syntax(NSRange(location: m.range.upperBound - 2, length: 2))
+    }
+    for m in MarkdownStyler.highlight.matches(in: line, range: local) where wraps(m.range, inner: m.range(at: 1)) {
+      construct = m.range
+      storage.addAttribute(.backgroundColor, value: Theme.highlight, range: abs(m.range(at: 1)))
       syntax(NSRange(location: m.range.location, length: 2))
       syntax(NSRange(location: m.range.upperBound - 2, length: 2))
     }
@@ -1272,7 +1456,14 @@ final class MarkdownLayoutManager: NSLayoutManager {
               Theme.codeBackground.setFill()
               NSBezierPath(roundedRect: rect.insetBy(dx: 0, dy: -2), xRadius: 6, yRadius: 6).fill()
             } else {
-              Theme.tertiaryText.withAlphaComponent(0.35).setFill()
+              let calloutColor = value as? NSColor
+              if let calloutColor {
+                // A callout: tinted, its bar in its color.
+                calloutColor.withAlphaComponent(0.08).setFill()
+                let tint = NSRect(x: origin.x + indent, y: rect.minY - 2, width: container.size.width - indent, height: rect.height + 4)
+                NSBezierPath(roundedRect: tint, xRadius: 6, yRadius: 6).fill()
+              }
+              (calloutColor?.withAlphaComponent(0.8) ?? Theme.tertiaryText.withAlphaComponent(0.35)).setFill()
               // Down to the last line's descender, not its fragment: the
               // note's last line gets no paragraph spacing, which would make
               // its bar shorter.
@@ -1943,6 +2134,7 @@ final class MarkdownTextView: NSTextView {
       slashMenu.selectionDidChange()
       linkMenu.selectionDidChange()
       mathMenu.selectionDidChange()
+      tagMenu.selectionDidChange()
     }
     guard keepsSelectionThroughUndo, let first = ranges.first?.rangeValue else {
       super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
@@ -1957,10 +2149,12 @@ final class MarkdownTextView: NSTextView {
   private(set) lazy var linkMenu = SlashMenu(textView: self, kind: .noteLink)
   /// The LaTeX menu "\\" opens in math.
   private(set) lazy var mathMenu = SlashMenu(textView: self, kind: .math)
+  /// The tags menu "#" opens.
+  private(set) lazy var tagMenu = SlashMenu(textView: self, kind: .tag)
 
   /// While a menu shows, it takes ↑/↓, Return, Tab and Esc.
   override func doCommand(by selector: Selector) {
-    if slashMenu.handle(selector) || linkMenu.handle(selector) || mathMenu.handle(selector) { return }
+    if slashMenu.handle(selector) || linkMenu.handle(selector) || mathMenu.handle(selector) || tagMenu.handle(selector) { return }
     super.doCommand(by: selector)
   }
 
@@ -1999,6 +2193,7 @@ final class MarkdownTextView: NSTextView {
       slashMenu.close()
       linkMenu.close()
       mathMenu.close()
+      tagMenu.close()
       onFocusChange?(false)
     }
     return result
@@ -2474,6 +2669,7 @@ final class MarkdownTextView: NSTextView {
     slashMenu.textDidChange()
     linkMenu.textDidChange()
     mathMenu.textDidChange()
+    tagMenu.textDidChange()
   }
 }
 
@@ -2511,8 +2707,16 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   }
 
   private(set) var ref: NoteRef
+  /// What of the note it shows when it's embedded in another note
+  /// (`![[Note#Heading]]`): read-only, without its gutter.
+  let embedded: WikiTarget?
+  /// The notes embedding this one, outermost first (an embed of one of them
+  /// would never end).
+  let embedChain: [String]
   let textView: MarkdownTextView
   var onOpenLink: ((URL) -> Void)?
+  /// Its height changed (an embedded note's block follows it).
+  var onHeightChange: (() -> Void)?
   /// A web search started from the text (⌘↩).
   var onSearch: ((URL) -> Void)?
   /// Called after the text changes (typing or an external edit).
@@ -2525,8 +2729,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// Collapsed sections by note, kept while the app runs.
   private static var foldedByNote: [String: Set<String>] = [:]
   private var folded: Set<String> {
-    get { MarkdownEditorView.foldedByNote[ref.id] ?? [] }
-    set { MarkdownEditorView.foldedByNote[ref.id] = newValue }
+    get { embedded == nil ? MarkdownEditorView.foldedByNote[ref.id] ?? [] : [] }
+    set { if embedded == nil { MarkdownEditorView.foldedByNote[ref.id] = newValue } }
   }
   /// What follows a change of height sliding into place (see `slidePage`).
   private var slide: Slide?
@@ -2547,8 +2751,10 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   private let observedAncestors = NSHashTable<NSView>.weakObjects()
   private var isDirty = false
 
-  init(ref: NoteRef, placeholder: String = "Start writing…") {
+  init(ref: NoteRef, placeholder: String = "Start writing…", embedded: WikiTarget? = nil, embedChain: [String] = []) {
     self.ref = ref
+    self.embedded = embedded
+    self.embedChain = embedChain
     let container = NSTextContainer(size: NSSize(width: 600, height: CGFloat.greatestFiniteMagnitude))
     container.widthTracksTextView = true
     container.lineFragmentPadding = 0
@@ -2602,7 +2808,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     gutter.onDragBegin = { [weak self] block, y in self?.beginBlockDrag(block, at: y) ?? false }
     gutter.onDragMove = { [weak self] y in self?.moveBlockDrag(to: y) }
     gutter.onDragEnd = { [weak self] drop in self?.endBlockDrag(drop: drop) }
-    if textView.responds(to: NSSelectorFromString("setPlaceholderAttributedString:")) {
+    if embedded == nil, textView.responds(to: NSSelectorFromString("setPlaceholderAttributedString:")) {
       textView.setValue(NSAttributedString(string: placeholder, attributes: [
         .font: Theme.bodyFont, .foregroundColor: Theme.tertiaryText,
       ]), forKey: "placeholderAttributedString")
@@ -2615,8 +2821,18 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     NotificationCenter.default.addObserver(self, selector: #selector(imageLoaded), name: ImageCache.didLoad, object: nil)
     MarkdownEditorView.live.add(self)
 
-    textView.string = NoteStore.shared.content(of: ref)
+    if embedded != nil {
+      textView.isEditable = false
+    }
+    textView.string = shownContent()
     restyle()
+  }
+
+  /// The note's text, or the part of it it's embedded for.
+  private func shownContent() -> String {
+    let content = NoteStore.shared.content(of: ref)
+    guard let embedded else { return content }
+    return NoteEmbedView.section(of: embedded, in: content).joined(separator: "\n")
   }
 
   required init?(coder: NSCoder) { fatalError() }
@@ -2633,7 +2849,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       hoverAreaHost?.removeTrackingArea(hoverArea)
       self.hoverArea = nil
     }
-    if window != nil, let host = mediaHost {
+    if window != nil, embedded == nil, let host = mediaHost {
       let area = NSTrackingArea(rect: .zero, options: [.mouseMoved, .mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
                                 owner: self)
       host.addTrackingArea(area)
@@ -2660,7 +2876,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       }
       DispatchQueue.main.async { [weak self] in self?.restyle() }
     }
-    if let host = window?.appRootView {
+    if embedded == nil, let host = window?.appRootView {
       if formatBar.superview !== host { host.addSubview(formatBar) }
     } else {
       formatBar.removeFromSuperview()
@@ -2742,6 +2958,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     if abs(contentHeight - height) > 0.5 {
       contentHeight = height
       invalidateIntrinsicContentSize()
+      onHeightChange?()
     }
   }
 
@@ -2941,7 +3158,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   }
 
   private func layoutFoldGutter() {
-    guard let host = mediaHost, let container = textView.textContainer else {
+    guard embedded == nil, let host = mediaHost, let container = textView.textContainer else {
       gutter.removeFromSuperview()
       return
     }
@@ -3069,7 +3286,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
       let baseline = fragment.minY + layoutManager.location(forGlyphAt: glyph).y
       let font = storage.attribute(.font, at: max(line.location, NSMaxRange(line) - 1), effectiveRange: nil) as? NSFont ?? Theme.bodyFont
-      let center = textView.textContainerOrigin.y + baseline - font.capHeight / 2
+      var center = textView.textContainerOrigin.y + baseline - font.capHeight / 2
+      // A typeset formula block: level with the middle of the formula.
+      if line.length > 0, storage.attribute(.gleaMathBlock, at: line.location, effectiveRange: nil) != nil { center = rect.midY }
       return NoteGutterView.Handle(block: index, band: rect.minY...rect.maxY, centerY: center)
     }
   }
@@ -3415,7 +3634,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       if let existing = mediaViews[media.key] {
         view = existing
       } else {
-        view = MediaBlockView(descriptor: media, noteID: ref.id)
+        view = MediaBlockView(descriptor: media, noteID: ref.id, embedChain: embedChain + [ref.id])
         let key = media.key
         view.onHeightChange = { [weak self] old in self?.mediaHeightChanged(key, from: old) }
         view.onOpenURL = { [weak self] url in
@@ -3478,13 +3697,17 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// Blocks live in the page (not the text view) so their gutter toggle isn't
   /// clipped; they follow the editor as it moves.
-  private var mediaHost: NSView? { enclosingScrollView?.documentView }
+  /// (An embedded note's blocks stay in it: they move, fade and are cut off
+  /// with the embed.)
+  private var mediaHost: NSView? { embedded != nil ? self : enclosingScrollView?.documentView }
 
   /// Where this editor was in the page when its blocks, gutter and table
   /// toggle were last placed.
   private var placedFrame: NSRect?
 
   @objc private func editorMoved() {
+    // Its blocks are its own subviews: they move with it.
+    guard embedded == nil else { return }
     guard let host = mediaHost else { return }
     let frame = convert(bounds, to: host)
     // Only moved (something above it changed height): its views move along,
@@ -3594,7 +3817,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       }
       endSlide(running)
     }
-    guard let host = mediaHost, window != nil, !Motion.reduceMotion, breaks.contains(where: { abs($0.offset) > 0.5 }) else {
+    guard embedded == nil, let host = mediaHost, window != nil, !Motion.reduceMotion, breaks.contains(where: { abs($0.offset) > 0.5 }) else {
       overlays.forEach { $0.removeFromSuperview() }
       completion?()
       return
@@ -3777,6 +4000,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// The heading levels and code fences of `text`'s lines, in order.
   private static func structure(of text: String) -> [String] {
     text.components(separatedBy: "\n").compactMap { line in
+      // A media line coming or going renumbers the same media after it
+      // (blocks are keyed by source and occurrence): everything restyles.
+      if let source = MarkdownStyler.mediaSourceHint(line) { return "m" + source }
       guard let m = structuralLine.firstMatch(in: line, range: NSRange(location: 0, length: (line as NSString).length)) else { return nil }
       return m.range(at: 1).location != NSNotFound ? "h\(m.range(at: 1).length)" : (line as NSString).substring(with: m.range)
     }
@@ -3784,6 +4010,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   func textView(_ textView: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
     guard textView === self.textView else { return true }
+    // An embedded note shows only part of it: nothing changes there.
+    guard embedded == nil else { return false }
     let s = storage.string as NSString
     let replaced = s.substring(with: s.paragraphRange(for: range))
     // (Several changes before the text says it changed: restyle it all.)
@@ -3793,6 +4021,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   }
 
   func textDidChange(_ notification: Notification) {
+    guard embedded == nil else { return }
     isDirty = true
     if let slide { endSlide(slide) }
     hoveredTable = nil
@@ -3802,7 +4031,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     let s = storage.string as NSString
     if let edit = pendingEdit, let before = edit.structure, NSMaxRange(edit.range) <= s.length,
        MarkdownEditorView.structure(of: s.substring(with: s.paragraphRange(for: edit.range))) == before {
-      restyle(limit: edit.range)
+      // With the line after it: a line break typed at a line's end starts
+      // one that took that line's style (a media line's height).
+      restyle(limit: NSRange(location: edit.range.location, length: min(edit.range.length + 1, s.length - edit.range.location)))
     } else {
       restyle()
     }
@@ -3886,7 +4117,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   func flush() {
     saveWork?.cancel()
     saveWork = nil
-    guard isDirty else { return }
+    // Never from an embed: its text is a part of the note, not the note.
+    guard isDirty, embedded == nil else { return }
     isDirty = false
     NoteStore.shared.save(ref, content: textView.string)
     ActivityLog.shared.edited(ref)
@@ -3900,7 +4132,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   @objc private func notesChanged(_ note: Notification) {
     guard let ids = note.userInfo?["ids"] as? Set<String>, ids.contains(ref.id), !isDirty else { return }
-    let fresh = NoteStore.shared.content(of: ref)
+    let fresh = shownContent()
     guard fresh != textView.string else { return }
     let selection = textView.selectedRange()
     textView.string = fresh
@@ -4053,6 +4285,7 @@ extension MarkdownEditorView {
   /// A click in a wrapped cell: its field opens over it and takes the
   /// click.
   private func editCell(row: Int, column: Int, clicked event: NSEvent) {
+    guard embedded == nil else { return }
     if cellEditing.map({ $0.row != row || $0.column != column }) ?? false { endCellEditing(focusText: false) }
     if cellEditing == nil {
       beginCellEditing(row: row, column: column, selection: NSRange(location: 0, length: 0))
