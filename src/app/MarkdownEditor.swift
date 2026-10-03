@@ -2123,6 +2123,20 @@ final class MarkdownTextView: NSTextView {
 
   /// Kept between the cursor and the page's top or bottom edge as it moves.
   private static let caretMargin: CGFloat = 40
+  /// An edit within one line is under way (until the end of this turn of
+  /// the run loop): no scrolling just to keep the margin.
+  private var editingInLine = false
+
+  override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+    let ok = super.shouldChangeText(in: affectedCharRange, replacementString: replacementString)
+    let s = string as NSString
+    let range = NSIntersectionRange(affectedCharRange, NSRange(location: 0, length: s.length))
+    if ok, !(replacementString ?? "").contains("\n"), s.substring(with: range).contains("\n") == false {
+      editingInLine = true
+      DispatchQueue.main.async { [weak self] in self?.editingInLine = false }
+    }
+    return ok
+  }
 
   /// The page (not this view) scrolls: just enough to keep the cursor in
   /// view with a margin, one line at a time as it moves (AppKit's own jumps
@@ -2145,6 +2159,9 @@ final class MarkdownTextView: NSTextView {
     rect.origin.y += textContainerOrigin.y
     let target = convert(rect, to: clip)
     let visible = clip.bounds
+    // Typing within a line that's in view (even one turning into a heading)
+    // leaves the page where it is: the margin is for moving through the text.
+    if editingInLine, range.length == 0, target.minY >= visible.minY, target.maxY <= visible.maxY { return }
     let margin = min(Self.caretMargin, visible.height / 4)
     // (Too tall to show whole, like a long selection: AppKit's way.)
     guard clip.isFlipped, target.height < visible.height - 2 * margin else { return super.scrollRangeToVisible(range) }

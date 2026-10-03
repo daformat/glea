@@ -474,17 +474,83 @@ final class TableOfContentsView: NSView {
     if entries.indices.contains(row) { onSelect?(row) }
   }
 
+  /// How far a trackpad scroll has gone past an end (the raw distance; the
+  /// list shows it with resistance, like a native scroll view's rubber band).
+  private var overscroll: CGFloat = 0
+  /// Springing back from past an end: momentum is ignored until the next
+  /// gesture.
+  private var settling = false
+
+  private func rubberBand(_ distance: CGFloat) -> CGFloat {
+    let range = max(bounds.height, 1)
+    return (distance < 0 ? -1 : 1) * (1 - 1 / (abs(distance) * 0.55 / range + 1)) * range
+  }
+
+  private func setScrollOffset(_ offset: CGFloat, duration: CFTimeInterval = 0, completion: (() -> Void)? = nil) {
+    scrollOffset = offset
+    CATransaction.begin()
+    CATransaction.setDisableActions(duration == 0 || Motion.reduceMotion)
+    CATransaction.setAnimationDuration(duration)
+    CATransaction.setAnimationTimingFunction(Motion.easeOut)
+    CATransaction.setCompletionBlock(completion)
+    positionRows()
+    CATransaction.commit()
+  }
+
   override func scrollWheel(with event: NSEvent) {
     guard overflows else {
       // Let the page keep scrolling underneath.
       (superview as? ColumnPageView)?.scrollView.scrollWheel(with: event)
       return
     }
-    let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.scrollingDeltaY * 12
-    let offset = min(max(0, scrollOffset - delta), maxScrollOffset)
-    guard offset != scrollOffset else { return }
-    scrollOffset = offset
-    Motion.withoutAnimation { positionRows() }
+    let limit = maxScrollOffset
+    // A mouse wheel stops at the ends.
+    guard event.hasPreciseScrollingDeltas else {
+      let offset = min(max(0, scrollOffset - event.scrollingDeltaY * 12), limit)
+      guard offset != scrollOffset else { return }
+      setScrollOffset(offset)
+      trackMouse(event)
+      return
+    }
+    if event.phase == .began || event.phase == .mayBegin { settling = false }
+    let momentum = !event.momentumPhase.isEmpty
+    if momentum && settling { return }
+    if event.phase == .ended || event.phase == .cancelled {
+      // Let go past an end: back to it.
+      if overscroll != 0 {
+        overscroll = 0
+        settling = true
+        setScrollOffset(min(max(0, scrollOffset), limit), duration: 0.35)
+      }
+      return
+    }
+    let delta = event.scrollingDeltaY
+    if momentum {
+      let next = scrollOffset - delta
+      guard next < 0 || next > limit else {
+        setScrollOffset(next)
+        trackMouse(event)
+        return
+      }
+      // Momentum reaching an end: a short bounce past it, then back.
+      let end: CGFloat = next < 0 ? 0 : limit
+      settling = true
+      setScrollOffset(end + (next < 0 ? -1 : 1) * min(abs(delta) * 4, 36), duration: 0.12) { [weak self] in
+        self?.setScrollOffset(end, duration: 0.3)
+      }
+      return
+    }
+    // Fingers on the trackpad: past an end, the list follows with resistance.
+    let raw = (overscroll == 0 ? scrollOffset : (overscroll < 0 ? 0 : limit) + overscroll) - delta
+    if raw >= 0 && raw <= limit {
+      overscroll = 0
+      setScrollOffset(raw)
+    } else {
+      let end: CGFloat = raw < 0 ? 0 : limit
+      overscroll = raw - end
+      setScrollOffset(end + rubberBand(overscroll))
+    }
     trackMouse(event)
   }
+
 }

@@ -209,13 +209,14 @@ enum TestHooks {
       case "drag-note-to": if let y = Double(argument) { list?.debugDragTo(y) }
       default: list?.debugEndDrag(drop: argument == "drop")
       }
-    case "drop-note", "toggle-group", "delete-group", "rename-group", "notes-toc":
+    case "drop-note", "toggle-group", "delete-group", "rename-group", "notes-toc", "scroll-notes":
       // drop-note:<name>|<row>|on (or above) drops a note in All Notes as if
       // dragged there; toggle-group:<name> ("" for ungrouped) and
       // delete-group:<name>.
       let list = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? NotesListView }.first
       if parts[0] == "toggle-group" { list?.debugToggleGroup(argument) }
       if parts[0] == "delete-group" { list?.debugDeleteGroup(argument) }
+      if parts[0] == "scroll-notes", let y = Double(argument) { list?.debugScroll(to: y) }
       if parts[0] == "notes-toc", let index = Int(argument) { list?.debugSelectTocEntry(index) }
       if parts[0] == "rename-group", case let names = argument.split(separator: "|").map(String.init), names.count == 2 {
         list?.debugRenameGroup(names[0], to: names[1])
@@ -382,6 +383,11 @@ enum TestHooks {
       if parts.count == 2, let ref = NoteStore.shared.resolve(linkName: parts[0]) {
         do { try NoteStore.shared.export(ref, to: URL(fileURLWithPath: parts[1])) } catch { NSLog("Glea export failed: %@", "\(error)") }
       }
+    case "log-scroll":
+      // Logs the visible page's scroll position.
+      let pages = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? ColumnPageView }
+        .filter { !$0.isHiddenOrHasHiddenAncestor }
+      if let page = pages.first { NSLog("Glea scroll y=%.1f %@", page.scrollView.contentView.bounds.minY, argument) }
     case "scroll-page":
       let pages = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? ColumnPageView }
         .filter { !$0.isHiddenOrHasHiddenAncestor }

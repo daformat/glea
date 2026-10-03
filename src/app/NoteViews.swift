@@ -92,25 +92,7 @@ class ColumnPageView: NSView {
   private let topFadeHeight: CGFloat = 14
 
   private func updateTopFade() {
-    guard let layer = scrollView.layer else { return }
-    let offset = scrollView.contentView.bounds.minY
-    let strength = min(max(offset / topFadeHeight, 0), 1)
-    Motion.withoutAnimation {
-      topFade.frame = layer.bounds
-      // Top of the view is location 0 (the gradient runs top to bottom).
-      topFade.startPoint = CGPoint(x: 0.5, y: layer.isGeometryFlipped ? 0 : 1)
-      topFade.endPoint = CGPoint(x: 0.5, y: layer.isGeometryFlipped ? 1 : 0)
-      // Eased (ease-in-out) rather than linear, so the fade has no hard edge.
-      let top = 1 - strength
-      let end = Double(topFadeHeight / max(layer.bounds.height, 1))
-      let steps = 8
-      topFade.colors = (0...steps).map { i -> CGColor in
-        let t = CGFloat(i) / CGFloat(steps)
-        return NSColor.black.withAlphaComponent(top + (1 - top) * t * t * (3 - 2 * t)).cgColor
-      }
-      topFade.locations = (0...steps).map { NSNumber(value: end * Double($0) / Double(steps)) }
-      if layer.mask !== topFade { layer.mask = topFade }
-    }
+    scrollView.updateTopFade(topFade, height: topFadeHeight)
   }
 
   override func layout() {
@@ -242,6 +224,32 @@ class ColumnPageView: NSView {
     CATransaction.setCompletionBlock { highlight.removeFromSuperview() }
     highlight.layer?.add(fade, forKey: "flash")
     CATransaction.commit()
+  }
+}
+
+extension NSScrollView {
+  /// Content fades out under the top edge once scrolled (`fade` masks the
+  /// scroll view's layer; call again as it scrolls or resizes).
+  func updateTopFade(_ fade: CAGradientLayer, height: CGFloat) {
+    guard let layer else { return }
+    let offset = contentView.bounds.minY - contentView.contentInsets.top
+    let strength = min(max(offset / height, 0), 1)
+    Motion.withoutAnimation {
+      fade.frame = layer.bounds
+      // Top of the view is location 0 (the gradient runs top to bottom).
+      fade.startPoint = CGPoint(x: 0.5, y: layer.isGeometryFlipped ? 0 : 1)
+      fade.endPoint = CGPoint(x: 0.5, y: layer.isGeometryFlipped ? 1 : 0)
+      // Eased (ease-in-out) rather than linear, so the fade has no hard edge.
+      let top = 1 - strength
+      let end = Double(height / max(layer.bounds.height, 1))
+      let steps = 8
+      fade.colors = (0...steps).map { i -> CGColor in
+        let t = CGFloat(i) / CGFloat(steps)
+        return NSColor.black.withAlphaComponent(top + (1 - top) * t * t * (3 - 2 * t)).cgColor
+      }
+      fade.locations = (0...steps).map { NSNumber(value: end * Double($0) / Double(steps)) }
+      if layer.mask !== fade { layer.mask = fade }
+    }
   }
 }
 
@@ -1281,6 +1289,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
   override func layout() {
     super.layout()
+    scroll.updateTopFade(topFade, height: 14)
     // Labels may use the margin up to the column; the dashes step aside
     // when they'd run under the notes' checkboxes.
     toc.labelRoom = header.frame.minX - 26 - 28
@@ -1327,7 +1336,13 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     updateActiveGroup()
   }
 
-  @objc private func listScrolled() { updateActiveGroup() }
+  @objc private func listScrolled() {
+    scroll.updateTopFade(topFade, height: 14)
+    updateActiveGroup()
+  }
+
+  /// The list fades out under its top edge once scrolled, like a page.
+  private let topFade = CAGradientLayer()
 
   /// The active group is the last one whose header has reached the top.
   private func updateActiveGroup() {
@@ -1861,6 +1876,10 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// none), or deletes it.
   func debugToggleGroup(_ name: String) { toggleGroup(name.isEmpty ? nil : name) }
   func debugDeleteGroup(_ name: String) { deleteGroup(name) }
+  func debugScroll(to y: CGFloat) {
+    scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+    scroll.reflectScrolledClipView(scroll.contentView)
+  }
   /// For automated checks: clicks a group in the table of contents.
   func debugSelectTocEntry(_ index: Int) { scrollToGroup(index) }
   func debugRenameGroup(_ name: String, to newName: String) { renameGroup(name, to: newName) }
