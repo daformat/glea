@@ -180,7 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let view = submenu(main, "View")
     view.addItem(withTitle: "Show Web", action: #selector(BrowserWindowController.toggleJournal(_:)), keyEquivalent: "d")
     item(view, "Journal", #selector(BrowserWindowController.showJournal(_:)), "j", [.command, .shift])
-    item(view, "All Notes", #selector(BrowserWindowController.showAllNotes(_:)), "n", [.command, .option, .shift])
+    item(view, "All Notes", #selector(BrowserWindowController.showAllNotes(_:)), "h", [.command, .shift])
     view.addItem(.separator())
     view.addItem(withTitle: "Reload Page", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
     view.addItem(withTitle: "Stop", action: #selector(BrowserWindowController.stopLoading(_:)), keyEquivalent: ".")

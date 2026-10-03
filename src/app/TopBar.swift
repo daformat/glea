@@ -362,7 +362,7 @@ final class TopBarView: NSView {
   }()
   private lazy var notesButton: TextButton = {
     let button = TextButton(title: "All Notes", target: self, action: #selector(showNotes))
-    button.toolTip = "All Notes (⌥⇧⌘N)"
+    button.toolTip = "All Notes (⇧⌘H)"
     return button
   }()
   private lazy var extensionsButton = IconButton(symbol: "puzzlepiece.extension", size: 13, tooltip: "Extensions", target: self, action: #selector(showExtensions))

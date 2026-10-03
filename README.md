@@ -143,7 +143,7 @@ Timings follow Beam's: short ease-in-outs for state changes and firm springs for
 | --- | --- |
 | ⌘T / ⌘L | New tab (start page) / edit the current tab's address |
 | ⌘D | Toggle web ↔ journal & notes |
-| ⇧⌘J / ⌥⇧⌘N | Journal / All notes |
+| ⇧⌘J / ⇧⌘H | Journal / All notes |
 | ⇧⌘N | New incognito window |
 | ⌘N / ⌥⌘N | New window / new note |
 | ⌘K | Omnibox (from anywhere) |
