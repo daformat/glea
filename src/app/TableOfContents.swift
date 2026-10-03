@@ -49,6 +49,12 @@ final class TableOfContentsView: NSView {
   var onSelect: ((Int) -> Void)?
   /// Horizontal room available for labels before they'd overlap the text.
   var labelRoom: CGFloat = 200 { didSet { if labelRoom != oldValue { needsLayout = true } } }
+  /// How many levels down its top entries are drawn: 1 gives them a
+  /// heading 2's shorter dashes.
+  var dashLevel = 0
+  /// Entries come in (and go) animated even from none or to none; a note's
+  /// headings show at once when it opens.
+  var animatesAllChanges = false
 
   private(set) var entries: [TocEntry] = []
   private var activeIndex: Int?
@@ -84,7 +90,7 @@ final class TableOfContentsView: NSView {
     guard newEntries != entries else { return }
     // Keep the rows of entries that are still there (matched in order), so
     // only added and removed headings animate; everything else slides.
-    let animate = window != nil && !rows.isEmpty && !Motion.reduceMotion
+    let animate = window != nil && (!rows.isEmpty || animatesAllChanges) && !Motion.reduceMotion
     var used = Array(repeating: false, count: rows.count)
     var kept: [(dash: CALayer, label: CATextLayer)] = []
     var inserted: [Int] = []
@@ -105,7 +111,15 @@ final class TableOfContentsView: NSView {
     entries = newEntries
     rows = kept
     if activeIndex.map({ $0 >= entries.count }) ?? false { activeIndex = nil }
-    isHidden = entries.count < 2  // one heading: nothing to navigate
+    // One heading: nothing to navigate. (Going, its rows leave first.)
+    if entries.count >= 2 || !(animate && animatesAllChanges) {
+      isHidden = entries.count < 2
+    } else {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        guard let self, self.entries.count < 2 else { return }
+        self.isHidden = true
+      }
+    }
 
     guard animate else {
       for row in removed {
@@ -210,7 +224,7 @@ final class TableOfContentsView: NSView {
 
   private func dashWidth(_ entry: TocEntry, active: Bool) -> CGFloat {
     let width: CGFloat
-    switch entry.depth {
+    switch entry.depth + dashLevel {
     case 0: width = 26 + (active ? 4 : 0)
     case 1: width = 20 + (active ? 8 : 0)
     default: width = 14 + (active ? 10 : 0)

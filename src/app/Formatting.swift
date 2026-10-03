@@ -285,6 +285,18 @@ extension MarkdownTextView {
   /// Markdown for images on a pasteboard (files, or image data such as a
   /// picture dragged from a web page), each copied into assets/.
   func imageMarkdown(from pasteboard: NSPasteboard, preferText: Bool = false) -> [String]? {
+    // (Links relative to the note's folder, a group's or notes/.)
+    imageMarkdownFromNotes(pasteboard, preferText: preferText)?.map { markdown in
+      var view: NSView? = self
+      while let current = view, !(current is MarkdownEditorView) { view = current.superview }
+      guard let editor = view as? MarkdownEditorView else { return markdown }
+      return NoteStore.rebasingLinks(in: markdown, from: NoteStore.shared.notesDirectory,
+                                     to: NoteStore.shared.fileURL(for: editor.ref).deletingLastPathComponent())
+    }
+  }
+
+  /// The images' Markdown, linked from notes/.
+  private func imageMarkdownFromNotes(_ pasteboard: NSPasteboard, preferText: Bool) -> [String]? {
     let store = NoteStore.shared
     let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
     if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] {

@@ -1090,6 +1090,14 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
 // MARK: - All notes
 
+/// A row of the notes list: a note or, once there are groups, a group's
+/// header (nil: the notes in none) and the line an empty group shows.
+private enum NotesListItem: Hashable {
+  case note(NoteRef)
+  case header(String?)
+  case placeholder(String?)
+}
+
 final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
   weak var navigator: NoteNavigator?
   var onNewNote: (() -> Void)?
@@ -1098,14 +1106,23 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   var onExport: ((NoteRef) -> Void)?
   var onDelete: (([NoteRef]) -> Void)?
 
+  /// The name the notes in no group go under, once there are groups.
+  static let ungroupedTitle = "Ungrouped"
+
   private let tableView = NotesTableView()
+  private let scroll = NSScrollView()
   private let header = NSStackView()
   /// Rows span the window so the scroller sits at its edge; their content is
   /// inset to line up with the header column.
   private var rowInset: CGFloat = 0
+  /// The groups, in the left margin like a note's headings.
+  private let toc = TableOfContentsView()
+  /// Set after a click so the chosen group stays active even when the list
+  /// can't scroll it to the top; cleared when the reader scrolls.
+  private var pinnedGroup: (index: Int, origin: CGFloat)?
   private let searchField = BorderlessSearchField()
   private let countLabel = NSTextField.label("", size: 13, color: Theme.tertiaryText)
-  private var refs: [NoteRef] = []
+  private var items: [NotesListItem] = []
   /// Notes checked with their row's checkbox.
   private(set) var checkedNotes: Set<NoteRef> = [] {
     didSet { if checkedNotes.isEmpty != oldValue.isEmpty { updateTrashButton() } }
@@ -1119,6 +1136,27 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// end, doesn't move).
   private let trashSlot = NSView()
   private lazy var trashSlotWidth = trashSlot.widthAnchor.constraint(equalToConstant: 0)
+
+  /// Collapsed groups, by name ("" for the notes in none).
+  private var collapsed = Set(UserDefaults.standard.stringArray(forKey: "collapsedNoteGroups") ?? []) {
+    didSet { UserDefaults.standard.set(Array(collapsed).sorted(), forKey: "collapsedNoteGroups") }
+  }
+  /// While several changes are made at once: they show as one.
+  private var batching = false
+  /// A group's name being edited: the list waits to show changes (as it
+  /// does while a note is dragged).
+  private var renaming: String?
+  private var pendingReload = false
+  /// Where a note dragged over the list would go, and what shows it.
+  private var dropTarget: DropTarget?
+  private let dropHighlight = DropHighlightView()
+
+  private enum DropTarget: Equatable {
+    /// Into a new group with this note (dropped on it).
+    case newGroup(with: NoteRef)
+    /// Into this group (nil: out of its group).
+    case group(String?)
+  }
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
@@ -1168,16 +1206,26 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     tableView.selectionHighlightStyle = .regular
     tableView.dataSource = self
     tableView.delegate = self
-    tableView.target = self
-    tableView.action = #selector(rowClicked)
+    // A click opens a note (or opens or closes a group); a drag lifts a
+    // note out to move it into a group or out of one.
+    tableView.onRowClick = { [weak self] row in self?.rowClicked(row) }
+    tableView.canLift = { [weak self] row in self?.canLift(row) ?? false }
+    tableView.onLift = { [weak self] row, point in self?.beginNoteDrag(row: row, at: point) }
+    tableView.onDragMove = { [weak self] point in self?.moveNoteDrag(to: point) }
+    tableView.onDragEnd = { [weak self] drop in self?.endNoteDrag(drop: drop) }
+    dropHighlight.isHidden = true
+    tableView.addSubview(dropHighlight)
     // Right click: the same menu as a row's ⋮ button.
     tableView.menuForRow = { [weak self] row in
-      guard let self, self.refs.indices.contains(row) else { return nil }
+      guard let self, self.items.indices.contains(row) else { return nil }
       let menu = NSMenu()
-      self.addNoteItems(for: self.refs[row], to: menu)
+      switch self.items[row] {
+      case .note(let ref): self.addNoteItems(for: ref, to: menu)
+      case .header(let group?): self.addGroupItems(for: group, to: menu)
+      default: return nil
+      }
       return menu
     }
-    let scroll = NSScrollView()
     scroll.documentView = tableView
     scroll.drawsBackground = false
     scroll.hasVerticalScroller = true
@@ -1188,6 +1236,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     scroll.automaticallyAdjustsContentInsets = false
     scroll.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 48, right: 0)
     scroll.scrollerInsets = NSEdgeInsets(top: 0, left: 0, bottom: -48, right: 0)
+    scroll.wantsLayer = true
     scroll.translatesAutoresizingMaskIntoConstraints = false
 
     addSubview(header)
@@ -1210,6 +1259,21 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
       scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
     ])
+    toc.translatesAutoresizingMaskIntoConstraints = false
+    toc.isHidden = true
+    toc.dashLevel = 1
+    toc.animatesAllChanges = true
+    toc.onSelect = { [weak self] index in self?.scrollToGroup(index) }
+    addSubview(toc)
+    NSLayoutConstraint.activate([
+      toc.leadingAnchor.constraint(equalTo: leadingAnchor),
+      toc.topAnchor.constraint(equalTo: topAnchor),
+      toc.bottomAnchor.constraint(equalTo: bottomAnchor),
+      toc.widthAnchor.constraint(equalToConstant: 320),
+    ])
+    scroll.contentView.postsBoundsChangedNotifications = true
+    NotificationCenter.default.addObserver(self, selector: #selector(listScrolled), name: NSView.boundsDidChangeNotification,
+                                           object: scroll.contentView)
     NotificationCenter.default.addObserver(self, selector: #selector(notesChanged), name: .notesDidChange, object: nil)
   }
 
@@ -1217,57 +1281,120 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
   override func layout() {
     super.layout()
+    // Labels may use the margin up to the column; the dashes step aside
+    // when they'd run under the notes' checkboxes.
+    toc.labelRoom = header.frame.minX - 26 - 28
+    toc.setTucked(header.frame.minX - 40 < toc.dashesExtent + 8, animated: window?.isVisible == true)
     let inset = max(0, header.frame.minX - 12)
     guard inset != rowInset else { return }
     rowInset = inset
     tableView.enumerateAvailableRowViews { rowView, _ in (rowView as? RoundedRowView)?.inset = inset }
   }
 
-  func reload() {
-    let filter = searchField.stringValue.trimmingCharacters(in: .whitespaces)
-    let fresh: [NoteRef]
-    if filter.isEmpty {
-      fresh = NoteStore.shared.notes
-    } else {
-      fresh = NoteStore.shared.search(filter, limit: 200).map(\.ref).filter { $0.kind == .note }
-    }
-    let total = NoteStore.shared.notes.count
-    countLabel.stringValue = "\(total)"
-    // Notes gone (moved to the Trash) fade out as their rows close up;
-    // notes back (put back from it) open up and fade in.
-    if window?.isVisible == true, !isHidden {
-      if let removed = Self.removedRows(from: refs, to: fresh) {
-        refs = fresh
-        NSAnimationContext.runAnimationGroup { context in
-          context.duration = 0.3
-          tableView.removeRows(at: removed, withAnimation: Motion.reduceMotion ? [] : [.effectFade, .slideUp])
-        }
-        return
-      }
-      if let added = Self.removedRows(from: fresh, to: refs) {
-        refs = fresh
-        NSAnimationContext.runAnimationGroup { context in
-          context.duration = 0.3
-          tableView.insertRows(at: added, withAnimation: Motion.reduceMotion ? [] : [.effectFade, .slideDown])
-        }
-        return
-      }
-    }
-    refs = fresh
-    tableView.reloadData()
+  // MARK: Table of contents
+
+  /// Briefly highlights a group's header, the width of the column.
+  private func flashHeader(_ row: Int) {
+    guard let text = textBounds(ofRow: row, making: true) else { return }
+    let left = rowInset + 12
+    let highlight = NSView(frame: NSRect(x: left, y: text.minY, width: tableView.bounds.width - 2 * left, height: text.height)
+      .insetBy(dx: -8, dy: -2))
+    highlight.wantsLayer = true
+    highlight.layer?.cornerRadius = 8
+    highlight.layer?.cornerCurve = .continuous
+    highlight.layer?.backgroundColor = resolvedCGColor(Theme.accentWash)
+    highlight.layer?.zPosition = -1
+    tableView.addSubview(highlight)
+    let fade = Motion.basic("opacity", duration: 1.1, timing: Motion.easeInOut)
+    fade.fromValue = 1
+    fade.toValue = 0
+    fade.beginTime = CACurrentMediaTime() + 0.5
+    fade.fillMode = .both
+    fade.isRemovedOnCompletion = false
+    CATransaction.begin()
+    CATransaction.setCompletionBlock { highlight.removeFromSuperview() }
+    highlight.layer?.add(fade, forKey: "flash")
+    CATransaction.commit()
   }
 
-  /// The rows to remove when `new` is `old` less some notes (same order),
-  /// else nil (anything else reloads). Reversed: the rows added.
-  private static func removedRows(from old: [NoteRef], to new: [NoteRef]) -> IndexSet? {
-    guard new.count < old.count else { return nil }
-    var removed = IndexSet()
-    var next = new.makeIterator()
-    var wanted = next.next()
-    for (index, ref) in old.enumerated() {
-      if ref == wanted { wanted = next.next() } else { removed.insert(index) }
+  /// The groups' headers, in order (the notes in none last).
+  private var groupHeaders: [String?] {
+    items.compactMap { if case .header(let group) = $0 { group } else { nil } }
+  }
+
+  private func updateToc() {
+    toc.setEntries(groupHeaders.map { TocEntry(depth: 0, title: $0 ?? Self.ungroupedTitle) })
+    updateActiveGroup()
+  }
+
+  @objc private func listScrolled() { updateActiveGroup() }
+
+  /// The active group is the last one whose header has reached the top.
+  private func updateActiveGroup() {
+    let headers = groupHeaders
+    guard !headers.isEmpty else { return }
+    let visible = scroll.contentView.bounds
+    if let pinned = pinnedGroup {
+      if abs(pinned.origin - visible.minY) < 1 {
+        toc.setActiveIndex(pinned.index)
+        return
+      }
+      pinnedGroup = nil
     }
-    return wanted == nil ? removed : nil
+    var active = 0
+    for (index, group) in headers.enumerated() {
+      guard let row = items.firstIndex(of: .header(group)) else { continue }
+      if tableView.rect(ofRow: row).minY <= visible.minY + 24 { active = index }
+    }
+    toc.setActiveIndex(active)
+  }
+
+  private func scrollToGroup(_ index: Int) {
+    let headers = groupHeaders
+    guard headers.indices.contains(index), let row = items.firstIndex(of: .header(headers[index])) else { return }
+    let clip = scroll.contentView
+    let maxY = max(0, tableView.frame.height + scroll.contentInsets.bottom - clip.bounds.height)
+    let y = min(max(0, tableView.rect(ofRow: row).minY), maxY)
+    // Its header lights up at once and rides in with the list, fading once
+    // it has arrived (like a note's heading).
+    flashHeader(row)
+    Motion.animate(0.5, timing: Motion.easeOut, {
+      clip.animator().setBoundsOrigin(NSPoint(x: 0, y: y))
+    }, completion: { [weak self] in
+      guard let self else { return }
+      self.scroll.reflectScrolledClipView(clip)
+      self.pinnedGroup = (index, clip.bounds.minY)
+      self.toc.setActiveIndex(index)
+    })
+  }
+
+  private var filter: String { searchField.stringValue.trimmingCharacters(in: .whitespaces) }
+
+  func reload() {
+    if renaming != nil || noteDrag != nil {
+      pendingReload = true
+      return
+    }
+    let store = NoteStore.shared
+    countLabel.stringValue = "\(store.notes.count)"
+    var fresh: [NotesListItem] = []
+    let groups = store.groups
+    if !filter.isEmpty {
+      fresh = store.search(filter, limit: 200).map(\.ref).filter { $0.kind == .note }.map { .note($0) }
+    } else if groups.isEmpty {
+      fresh = store.notes.map { .note($0) }
+    } else {
+      // Each group, then the notes in none.
+      var byGroup: [String: [NoteRef]] = [:]
+      for ref in store.notes { byGroup[store.group(of: ref) ?? "", default: []].append(ref) }
+      for group in groups.map(Optional.some) + [nil] {
+        fresh.append(.header(group))
+        guard !collapsed.contains(group ?? "") else { continue }
+        let refs = byGroup[group ?? ""] ?? []
+        fresh += refs.isEmpty ? [.placeholder(group)] : refs.map { .note($0) }
+      }
+    }
+    show(fresh)
   }
 
   /// Shows the notes matching `query` (a "#tag" from a note).
@@ -1283,17 +1410,22 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   @objc private func notesChanged() {
     // Notes moved to the Trash are no longer checked.
     checkedNotes = checkedNotes.filter { NoteStore.shared.exists($0) }
-    if !isHidden { reload() }
+    if !isHidden && !batching { reload() }
   }
 
   func controlTextDidChange(_ obj: Notification) { reload() }
 
   func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
-    if selector == #selector(NSResponder.insertNewline(_:)), let first = refs.first {
+    if selector == #selector(NSResponder.insertNewline(_:)), let first = notes.first {
       navigator?.openNote(first)
       return true
     }
     return false
+  }
+
+  /// The notes shown, in order.
+  private var notes: [NoteRef] {
+    items.compactMap { if case .note(let ref) = $0 { ref } else { nil } }
   }
 
   @objc private func newNote() { onNewNote?() }
@@ -1367,49 +1499,648 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
   /// For automated checks: checks or unchecks the note in `row`.
   func debugToggleCheck(_ row: Int) {
-    guard refs.indices.contains(row) else { return }
-    let ref = refs[row]
+    guard items.indices.contains(row), case .note(let ref) = items[row] else { return }
     if checkedNotes.contains(ref) { checkedNotes.remove(ref) } else { checkedNotes.insert(ref) }
     (tableView.rowView(atRow: row, makeIfNecessary: false) as? NoteRowView)?.isChecked = checkedNotes.contains(ref)
   }
 
-  @objc private func rowClicked() {
-    let row = tableView.clickedRow
-    guard row >= 0, row < refs.count else { return }
-    navigator?.openNote(refs[row])
+  private func rowClicked(_ row: Int) {
+    guard items.indices.contains(row) else { return }
+    switch items[row] {
+    case .note(let ref): navigator?.openNote(ref)
+    case .header(let group): toggleGroup(group)
+    case .placeholder: break
+    }
   }
 
-  /// Export and Move to Trash for `ref`.
+  /// Export, Move to Group and Move to Trash for `ref`.
   private func addNoteItems(for ref: NoteRef, to menu: NSMenu) {
     menu.addItem(ClosureMenuItem(title: "Export as Markdown…") { [weak self] in self?.onExport?(ref) })
+    let groups = NSMenu()
+    let current = NoteStore.shared.group(of: ref)
+    for group in NoteStore.shared.groups {
+      let item = ClosureMenuItem(title: group) { [weak self] in self?.move([ref], to: group) }
+      if group == current {
+        item.state = .on
+        item.isEnabled = false
+      }
+      groups.addItem(item)
+    }
+    if !groups.items.isEmpty { groups.addItem(.separator()) }
+    groups.addItem(ClosureMenuItem(title: "New Group") { [weak self] in self?.makeGroup(with: [ref]) })
+    if current != nil {
+      groups.addItem(ClosureMenuItem(title: "Remove from Group") { [weak self] in self?.move([ref], to: nil) })
+    }
+    let groupsItem = NSMenuItem(title: "Move to Group", action: nil, keyEquivalent: "")
+    groupsItem.submenu = groups
+    menu.addItem(groupsItem)
     menu.addItem(.separator())
     menu.addItem(ClosureMenuItem(title: "Move to Trash…") { [weak self] in self?.onDelete?([ref]) })
   }
 
-  func numberOfRows(in tableView: NSTableView) -> Int { refs.count }
+  /// Rename and Delete for `group`.
+  private func addGroupItems(for group: String, to menu: NSMenu) {
+    menu.addItem(ClosureMenuItem(title: "Rename Group") { [weak self] in self?.beginRenaming(group) })
+    menu.addItem(.separator())
+    menu.addItem(ClosureMenuItem(title: "Delete Group") { [weak self] in self?.deleteGroup(group) })
+  }
+
+  // MARK: Groups
+
+  private func toggleGroup(_ group: String?) {
+    let key = group ?? ""
+    if collapsed.contains(key) { collapsed.remove(key) } else { collapsed.insert(key) }
+    turning = group
+    reload()
+    turning = nil
+  }
+
+  /// The group whose chevron turns as the list changes.
+  private var turning: String??
+  /// Rows of a group being renamed, by what they become: the same rows.
+  private var renamedItems: [NotesListItem: NotesListItem] = [:]
+
+  private func move(_ refs: [NoteRef], to group: String?) {
+    place(refs.map { ($0, group) }, actionName: group == nil ? "Remove from Group" : "Move to Group")
+  }
+
+  /// Puts `refs` in a new group, and starts naming it.
+  private func makeGroup(with refs: [NoteRef]) {
+    let name = NoteStore.shared.uniqueGroupName()
+    place(refs.map { ($0, name) }, making: [name], actionName: "New Group")
+    beginRenaming(name)
+  }
+
+  /// Moves its notes out and removes it.
+  private func deleteGroup(_ group: String) {
+    let refs = NoteStore.shared.notes.filter { NoteStore.shared.group(of: $0) == group }
+    place(refs.map { ($0, nil) }, removing: [group], actionName: "Delete Group")
+  }
+
+  /// Makes the `making` groups, puts each note in its group, and removes the
+  /// `removing` groups (once empty), as one step: Undo puts it all back
+  /// (Redo does it again).
+  private func place(_ placements: [(ref: NoteRef, group: String?)], making: [String] = [], removing: [String] = [],
+                     actionName: String) {
+    // (Undone while a new group is being named: the naming stops.)
+    cancelRenaming()
+    let store = NoteStore.shared
+    let before = placements.map { (ref: $0.ref, group: store.group(of: $0.ref)) }
+    batching = true
+    let made = making.filter { store.createGroup(named: $0) != nil }
+    for (group, moving) in Dictionary(grouping: placements, by: \.group) { store.move(moving.map(\.ref), toGroup: group) }
+    let removed = removing.filter { group in store.hasGroup(named: group) && !store.notes.contains { store.group(of: $0) == group } }
+    for group in removed {
+      store.deleteGroup(group)
+      collapsed.remove(group)
+    }
+    batching = false
+    reload()
+    guard let undo = window?.undoManager else { return }
+    undo.registerUndo(withTarget: self) { list in
+      list.place(before, making: removed, removing: made, actionName: actionName)
+    }
+    undo.setActionName(actionName)
+  }
+
+  private func renameGroup(_ group: String, to name: String) {
+    cancelRenaming()
+    // (Shown below, once: the store's own notice would show it without the
+    // slide.)
+    batching = true
+    let result = NoteStore.shared.renameGroup(group, to: name)
+    batching = false
+    guard let renamed = result else {
+      reload()
+      return NSSound.beep()
+    }
+    if collapsed.remove(group) != nil { collapsed.insert(renamed) }
+    // Its rows slide to where its new name puts it.
+    renamedItems = [.header(group): .header(renamed), .placeholder(group): .placeholder(renamed)]
+    reload()
+    renamedItems = [:]
+    guard renamed != group, let undo = window?.undoManager else { return }
+    undo.registerUndo(withTarget: self) { $0.renameGroup(renamed, to: group) }
+    undo.setActionName("Rename Group")
+  }
+
+  private func beginRenaming(_ group: String) {
+    guard let row = items.firstIndex(of: .header(group)) else { return }
+    tableView.scrollRowToVisible(row)
+    guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: true) as? GroupHeaderCell else { return }
+    renaming = group
+    cell.beginRenaming()
+  }
+
+  /// Stops naming a group, keeping its name. Typing in the name is undone
+  /// first, then what came before (making the group).
+  private func cancelRenaming() {
+    guard let group = renaming else { return }
+    if let row = items.firstIndex(of: .header(group)),
+       let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? GroupHeaderCell, cell.isRenaming {
+      cell.cancelRenaming()
+    }
+    // (Ending the edit calls finishRenaming.)
+    if renaming != nil { finishRenaming(group, to: nil) }
+  }
+
+  private func finishRenaming(_ group: String, to name: String?) {
+    renaming = nil
+    pendingReload = false
+    if let name, name != group, NoteStore.shared.hasGroup(named: group) {
+      renameGroup(group, to: name)
+    } else {
+      reload()
+    }
+  }
+
+  // MARK: Dragging notes
+
+  /// A note being dragged: a copy of its row lifts out of the list and
+  /// follows the pointer (like a block in a note), its place staying blank
+  /// until it's dropped.
+  private final class NoteDrag {
+    let ref: NoteRef
+    let preview: NSView
+    let lifted: CALayer
+    let blank: NSView
+    /// From the copy's top to the pointer.
+    let grab: CGFloat
+
+    init(ref: NoteRef, preview: NSView, lifted: CALayer, blank: NSView, grab: CGFloat) {
+      self.ref = ref
+      self.preview = preview
+      self.lifted = lifted
+      self.blank = blank
+      self.grab = grab
+    }
+  }
+
+  private var noteDrag: NoteDrag?
+
+  private func canLift(_ row: Int) -> Bool {
+    guard filter.isEmpty, renaming == nil, noteDrag == nil, items.indices.contains(row), case .note = items[row] else { return false }
+    return true
+  }
+
+  private func beginNoteDrag(row: Int, at point: NSPoint) {
+    guard canLift(row), case .note(let ref) = items[row], let rowView = tableView.rowView(atRow: row, makeIfNecessary: false) else { return }
+    endSlide()
+    // The row's content, with its checkbox's gutter.
+    let side = max(0, rowInset - 36)
+    let rect = NSRect(x: side, y: rowView.frame.minY, width: rowView.frame.width - 2 * side, height: rowView.frame.height)
+    let picture = rowView.picture(of: NSRect(x: side, y: 0, width: rect.width, height: rect.height))
+    let blank = SlideOverlayView(frame: rect)
+    blank.wantsLayer = true
+    blank.layer?.backgroundColor = resolvedCGColor(Theme.background)
+    blank.layer?.zPosition = 2
+    tableView.addSubview(blank)
+    let preview = NSView(frame: rect)
+    preview.wantsLayer = true
+    preview.layer?.zPosition = 3
+    let lifted = CALayer()
+    // Grows from its left edge, at the pointer.
+    let grabbed = min(max(0, point.y - rect.minY), rect.height)
+    lifted.anchorPoint = CGPoint(x: 0, y: 1 - grabbed / max(1, rect.height))
+    lifted.frame = preview.bounds
+    lifted.masksToBounds = true
+    let content = CALayer()
+    content.contents = picture
+    content.contentsScale = window?.backingScaleFactor ?? 2
+    content.frame = CGRect(origin: .zero, size: rect.size)
+    lifted.addSublayer(content)
+    preview.layer?.addSublayer(lifted)
+    tableView.addSubview(preview)
+    let scale = CATransform3DMakeScale(1.06, 1.06, 1)
+    let grow = CABasicAnimation(keyPath: "transform")
+    grow.fromValue = CATransform3DIdentity
+    grow.toValue = scale
+    let fade = CABasicAnimation(keyPath: "opacity")
+    fade.fromValue = 1
+    fade.toValue = 0.5
+    for animation in [grow, fade] {
+      animation.duration = BlockDragDebug.liftDuration
+      animation.timingFunction = Motion.standard
+    }
+    lifted.transform = scale
+    lifted.opacity = 0.5
+    lifted.add(grow, forKey: "grow")
+    lifted.add(fade, forKey: "fade")
+    noteDrag = NoteDrag(ref: ref, preview: preview, lifted: lifted, blank: blank, grab: point.y - rect.minY)
+    moveNoteDrag(to: point)
+  }
+
+  private func moveNoteDrag(to point: NSPoint) {
+    guard let drag = noteDrag else { return }
+    drag.preview.setFrameOrigin(NSPoint(x: drag.preview.frame.minX, y: point.y - drag.grab))
+    let (row, operation) = dropPosition(at: point)
+    setDropTarget(target(for: drag.ref, row: row, operation: operation))
+  }
+
+  /// Where the pointer would drop a note: on a row, or between two (a
+  /// note's top and bottom quarters; without groups, notes are only dropped
+  /// on).
+  private func dropPosition(at point: NSPoint) -> (row: Int, operation: NSTableView.DropOperation) {
+    let row = tableView.row(at: point)
+    guard row >= 0 else { return (point.y < 0 ? 0 : items.count, .above) }
+    guard case .note = items[row], !NoteStore.shared.groups.isEmpty else { return (row, .on) }
+    let rect = tableView.rect(ofRow: row)
+    let t = (point.y - rect.minY) / max(1, rect.height)
+    if t < 0.25 { return (row, .above) }
+    if t > 0.75 { return (row + 1, .above) }
+    return (row, .on)
+  }
+
+  /// Drops the note (or puts it back): the list changes, and the copy
+  /// glides to the note's place, turning back into it.
+  private func endNoteDrag(drop: Bool) {
+    guard let drag = noteDrag else { return }
+    noteDrag = nil
+    let target = drop ? dropTarget : nil
+    setDropTarget(nil)
+    if let target {
+      // (What moves slides; its old place is taken by what follows.)
+      drag.blank.removeFromSuperview()
+      pendingReload = false
+      perform(target, with: drag.ref)
+    } else if pendingReload {
+      pendingReload = false
+      reload()
+    }
+    var destination: NSPoint?
+    var landing: NSView?
+    if let row = items.firstIndex(of: .note(drag.ref)) {
+      let rect = tableView.rect(ofRow: row)
+      destination = NSPoint(x: drag.preview.frame.minX, y: rect.minY)
+      // Its row shows when the copy gets there.
+      landing = tableView.rowView(atRow: row, makeIfNecessary: false)
+      landing?.alphaValue = 0
+    }
+    let duration = BlockDragDebug.liftDuration * 1.25
+    NSAnimationContext.runAnimationGroup({ context in
+      context.duration = duration
+      context.timingFunction = Motion.standard
+      if let destination { drag.preview.animator().setFrameOrigin(destination) }
+    }, completionHandler: {
+      landing?.alphaValue = 1
+      drag.preview.removeFromSuperview()
+      drag.blank.removeFromSuperview()
+    })
+    // Into a closed group: it fades away there.
+    let lifted = drag.lifted
+    let shrink = CABasicAnimation(keyPath: "transform")
+    shrink.fromValue = lifted.presentation()?.transform ?? lifted.transform
+    shrink.toValue = CATransform3DIdentity
+    let fade = CABasicAnimation(keyPath: "opacity")
+    fade.fromValue = lifted.presentation()?.opacity ?? lifted.opacity
+    fade.toValue = destination == nil ? 0 : 1
+    for animation in [shrink, fade] {
+      animation.duration = duration
+      animation.timingFunction = Motion.standard
+    }
+    lifted.transform = CATransform3DIdentity
+    lifted.opacity = destination == nil ? 0 : 1
+    lifted.add(shrink, forKey: "grow")
+    lifted.add(fade, forKey: "fade")
+  }
+
+  /// For automated checks: lifts the note in `row`, drags it to `y` (in the
+  /// list), and drops it (or puts it back).
+  func debugLift(_ row: Int) {
+    let rect = tableView.rect(ofRow: row)
+    beginNoteDrag(row: row, at: NSPoint(x: rect.midX, y: rect.midY))
+  }
+  func debugDragTo(_ y: CGFloat) { moveNoteDrag(to: NSPoint(x: tableView.bounds.midX, y: y)) }
+  func debugEndDrag(drop: Bool) { endNoteDrag(drop: drop) }
+
+  /// Where `ref` dropped at `row` goes: on a note in no group, into a new
+  /// group with it; on a group's header, empty line or one of its notes, or
+  /// between its rows, into that group (the notes in none: out of its
+  /// group). Nil where it wouldn't move.
+  private func target(for ref: NoteRef, row: Int, operation: NSTableView.DropOperation) -> DropTarget? {
+    guard filter.isEmpty else { return nil }
+    let store = NoteStore.shared
+    let from = store.group(of: ref)
+    if operation == .on, items.indices.contains(row) {
+      switch items[row] {
+      case .note(let other):
+        guard other != ref else { return nil }
+        guard let group = store.group(of: other) else { return .newGroup(with: other) }
+        return group != from ? .group(group) : nil
+      case .header(let group), .placeholder(let group):
+        return group != from ? .group(group) : nil
+      }
+    }
+    // Between rows: the group of the row above (below the last, the notes
+    // in none). Without groups, the order is the notes' own.
+    guard !store.groups.isEmpty, row > 0, row <= items.count else { return nil }
+    let group: String?
+    switch items[row - 1] {
+    case .note(let other): group = store.group(of: other)
+    case .header(let g), .placeholder(let g): group = g
+    }
+    return group != from ? .group(group) : nil
+  }
+
+  private func perform(_ target: DropTarget, with ref: NoteRef) {
+    switch target {
+    case .newGroup(let other): makeGroup(with: [other, ref])
+    case .group(let group): move([ref], to: group)
+    }
+  }
+
+  /// For automated checks: drops the note named `name` at `row`, on it or
+  /// above it, as if dragged there.
+  func debugDrop(_ name: String, row: Int, on: Bool) {
+    let ref = NoteRef(kind: .note, name: name)
+    guard NoteStore.shared.exists(ref), let target = target(for: ref, row: row, operation: on ? .on : .above) else { return }
+    perform(target, with: ref)
+  }
+
+  /// For automated checks: collapses or expands a group ("" for the notes in
+  /// none), or deletes it.
+  func debugToggleGroup(_ name: String) { toggleGroup(name.isEmpty ? nil : name) }
+  func debugDeleteGroup(_ name: String) { deleteGroup(name) }
+  /// For automated checks: clicks a group in the table of contents.
+  func debugSelectTocEntry(_ index: Int) { scrollToGroup(index) }
+  func debugRenameGroup(_ name: String, to newName: String) { renameGroup(name, to: newName) }
+
+  /// The rows a drop target covers: the note it's on, or the group's header
+  /// and rows.
+  private func rows(of target: DropTarget) -> ClosedRange<Int>? {
+    switch target {
+    case .newGroup(let ref):
+      return items.firstIndex(of: .note(ref)).map { $0...$0 }
+    case .group(let group):
+      guard let start = items.firstIndex(of: .header(group)) else { return nil }
+      var end = start
+      while end + 1 < items.count, !{ if case .header = items[end + 1] { true } else { false } }() { end += 1 }
+      return start...end
+    }
+  }
+
+  /// Shows where a dragged note would go: a soft wash over the note it'd
+  /// make a group with, or the group it'd go in, gliding between them.
+  private func setDropTarget(_ target: DropTarget?) {
+    guard target != dropTarget else { return }
+    dropTarget = target
+    guard let target, let rows = rows(of: target) else {
+      dropHighlight.hide()
+      return
+    }
+    // As much room above the first row's text as below the last one's.
+    let pad: CGFloat = 12
+    let top = (textBounds(ofRow: rows.lowerBound)?.minY).map { $0 - pad } ?? tableView.rect(ofRow: rows.lowerBound).minY + 1
+    let bottom = (textBounds(ofRow: rows.upperBound)?.maxY).map { $0 + pad } ?? tableView.rect(ofRow: rows.upperBound).maxY - 1
+    let frame = NSRect(x: rowInset + 4, y: top, width: tableView.bounds.width - 2 * (rowInset + 4), height: bottom - top)
+    dropHighlight.show(in: frame)
+  }
+
+  /// Where a row's text is (in the table), if it's showing.
+  private func textBounds(ofRow row: Int, making: Bool = false) -> NSRect? {
+    guard let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: making) else { return nil }
+    cell.layoutSubtreeIfNeeded()
+    let texts = cell.subviews.filter { $0 is NSTextField && !$0.isHidden && !($0 as! NSTextField).stringValue.isEmpty }
+    guard !texts.isEmpty else { return nil }
+    return texts.map { tableView.convert($0.frame, from: cell) }.reduce(NSRect.null) { $0.union($1) }
+  }
+
+  // MARK: Animating changes
+
+  /// The list changes in one go, then animates there the way a note's
+  /// sections fold: run by the render server, rows that stay slide from where
+  /// they were (opaque, over the rest), rows that come fade in under them,
+  /// and rows that go stay as pictures fading where they were until what
+  /// follows slides over them.
+  private func show(_ fresh: [NotesListItem]) {
+    let animated = window?.isVisible == true && !isHidden && !Motion.reduceMotion && !items.isEmpty && fresh != items
+    endSlide()
+    defer { updateToc() }
+    guard animated else {
+      items = fresh
+      tableView.reloadData()
+      return
+    }
+    let clip = scroll.contentView
+    let oldOrigin = clip.bounds.minY
+    // Where each row was on screen, and pictures of those showing.
+    let renamed = renamedItems
+    var oldTops: [NotesListItem: CGFloat] = [:]
+    for (row, item) in items.enumerated() { oldTops[renamed[item] ?? item] = tableView.rect(ofRow: row).minY - oldOrigin }
+    var pictures: [(item: NotesListItem, frame: NSRect, image: NSImage)] = []
+    let before = tableView.rows(in: tableView.visibleRect)
+    for row in before.lowerBound..<before.upperBound {
+      guard let rowView = tableView.rowView(atRow: row, makeIfNecessary: false) else { continue }
+      pictures.append((renamed[items[row]] ?? items[row], rowView.frame, rowView.picture()))
+    }
+    let turning = self.turning
+    items = fresh
+    tableView.reloadData()
+    tableView.layoutSubtreeIfNeeded()
+
+    let newOrigin = clip.bounds.minY
+    let background = resolvedCGColor(Theme.background)
+    var shown = Set<NotesListItem>()
+    let after = tableView.rows(in: tableView.visibleRect)
+    for row in after.lowerBound..<after.upperBound {
+      guard let rowView = tableView.rowView(atRow: row, makeIfNecessary: true) else { continue }
+      rowView.wantsLayer = true
+      guard let layer = rowView.layer else { continue }
+      let item = items[row]
+      shown.insert(item)
+      if case .header(let group) = item, let turning, turning == group {
+        (rowView as? GroupRowView)?.turnChevron()
+      }
+      if let old = oldTops[item] {
+        let offset = old - (rowView.frame.minY - newOrigin)
+        guard abs(offset) > 0.5 else { continue }
+        slideLayer(layer, by: offset)
+        layer.zPosition = 1
+        layer.backgroundColor = background
+        slideMoved.append(rowView)
+      } else {
+        fadeLayer(layer, in: true)
+      }
+    }
+    for picture in pictures where !shown.contains(picture.item) {
+      let overlay = SlideOverlayView(frame: picture.frame.offsetBy(dx: 0, dy: newOrigin - oldOrigin))
+      overlay.wantsLayer = true
+      let image = NSImageView(frame: overlay.bounds)
+      image.imageScaling = .scaleAxesIndependently
+      image.image = picture.image
+      overlay.addSubview(image)
+      tableView.addSubview(overlay)
+      slideOverlays.append(overlay)
+      guard let layer = overlay.layer else { continue }
+      if let row = items.firstIndex(of: picture.item) {
+        // Moved out of sight: it goes there.
+        let target = tableView.rect(ofRow: row)
+        overlay.frame.origin.y = target.minY
+        layer.zPosition = 1
+        layer.backgroundColor = background
+        slideLayer(layer, by: (picture.frame.minY - oldOrigin) - (target.minY - newOrigin))
+      } else {
+        overlay.alphaValue = 0
+        fadeLayer(layer, in: false)
+      }
+    }
+    slideGeneration += 1
+    let generation = slideGeneration
+    DispatchQueue.main.asyncAfter(deadline: .now() + Motion.foldDuration + 0.05) { [weak self] in
+      guard let self, self.slideGeneration == generation else { return }
+      self.endSlide()
+    }
+  }
+
+  /// Pictures over the list and rows sliding, put back at the end.
+  private var slideOverlays: [NSView] = []
+  private var slideMoved: [NSView] = []
+  private var slideGeneration = 0
+
+  private func endSlide() {
+    slideOverlays.forEach { $0.removeFromSuperview() }
+    for view in slideMoved {
+      view.layer?.removeAnimation(forKey: "glea.list.slide")
+      view.layer?.zPosition = 0
+      view.layer?.backgroundColor = nil
+    }
+    slideOverlays = []
+    slideMoved = []
+  }
+
+  private func slideLayer(_ layer: CALayer, by offset: CGFloat) {
+    let animation = CABasicAnimation(keyPath: "position")
+    animation.isAdditive = true
+    animation.fromValue = NSValue(point: NSPoint(x: 0, y: offset))
+    animation.toValue = NSValue(point: .zero)
+    animation.duration = Motion.foldDuration
+    animation.timingFunction = CubicBezier.fold.timingFunction
+    layer.add(animation, forKey: "glea.list.slide")
+  }
+
+  private func fadeLayer(_ layer: CALayer, in fadingIn: Bool) {
+    let fade = CABasicAnimation(keyPath: "opacity")
+    fade.fromValue = fadingIn ? 0 : 1
+    fade.toValue = fadingIn ? 1 : 0
+    fade.duration = Motion.foldDuration
+    fade.timingFunction = CubicBezier.fold.timingFunction
+    layer.add(fade, forKey: "glea.list.fade")
+  }
+
+  // MARK: Table
+
+  func numberOfRows(in tableView: NSTableView) -> Int { items.count }
+
+  func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+    switch items[row] {
+    case .note: 58
+    case .header: GroupRowView.height
+    case .placeholder: 40
+    }
+  }
+
+  func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+    if case .note = items[row] { true } else { false }
+  }
 
   func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-    let cell = (tableView.makeView(withIdentifier: NoteCell.identifier, owner: self) as? NoteCell) ?? NoteCell()
-    let ref = refs[row]
-    cell.configure(title: ref.name, excerpt: NoteStore.shared.excerpt(of: ref), date: NoteStore.shared.modified(ref))
-    cell.onMore = { [weak self] button in
-      guard let self else { return }
-      let menu = NSMenu()
-      self.addNoteItems(for: ref, to: menu)
-      menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    switch items[row] {
+    case .note(let ref):
+      let cell = (tableView.makeView(withIdentifier: NoteCell.identifier, owner: self) as? NoteCell) ?? NoteCell()
+      cell.configure(title: ref.name, excerpt: NoteStore.shared.excerpt(of: ref), date: NoteStore.shared.modified(ref))
+      cell.onMore = { [weak self] button in
+        guard let self else { return }
+        let menu = NSMenu()
+        self.addNoteItems(for: ref, to: menu)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+      }
+      return cell
+    case .header(let group):
+      let cell = (tableView.makeView(withIdentifier: GroupHeaderCell.identifier, owner: self) as? GroupHeaderCell) ?? GroupHeaderCell()
+      let count = NoteStore.shared.notes.filter { NoteStore.shared.group(of: $0) == group }.count
+      cell.configure(name: group ?? Self.ungroupedTitle, count: count, hasMenu: group != nil)
+      cell.onMore = { [weak self] button in
+        guard let self, let group else { return }
+        let menu = NSMenu()
+        self.addGroupItems(for: group, to: menu)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+      }
+      cell.onRename = { [weak self] name in
+        guard let group else { return }
+        self?.finishRenaming(group, to: name)
+      }
+      return cell
+    case .placeholder:
+      return (tableView.makeView(withIdentifier: GroupPlaceholderCell.identifier, owner: self) as? GroupPlaceholderCell)
+        ?? GroupPlaceholderCell()
     }
-    return cell
   }
 
   func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
-    let rowView = NoteRowView()
-    rowView.inset = rowInset
-    let ref = refs[row]
-    rowView.isChecked = checkedNotes.contains(ref)
-    rowView.onCheck = { [weak self] checked in
-      if checked { self?.checkedNotes.insert(ref) } else { self?.checkedNotes.remove(ref) }
+    switch items[row] {
+    case .note(let ref):
+      let rowView = NoteRowView()
+      rowView.inset = rowInset
+      rowView.isChecked = checkedNotes.contains(ref)
+      rowView.onCheck = { [weak self] checked in
+        if checked { self?.checkedNotes.insert(ref) } else { self?.checkedNotes.remove(ref) }
+      }
+      return rowView
+    case .header(let group):
+      let rowView = GroupRowView()
+      rowView.inset = rowInset
+      rowView.isCollapsed = collapsed.contains(group ?? "")
+      return rowView
+    case .placeholder:
+      let rowView = RoundedRowView()
+      rowView.inset = rowInset
+      return rowView
     }
-    return rowView
+  }
+}
+
+/// Shows where a dragged note would go: a rounded wash behind the rows that
+/// fades in, glides from target to target, and fades out.
+private final class DropHighlightView: NSView {
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layer?.cornerRadius = 10
+    layer?.cornerCurve = .continuous
+    layer?.zPosition = -1
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override func updateLayer() {
+    layer?.backgroundColor = Theme.accentWash.cgColor
+  }
+
+  override var wantsUpdateLayer: Bool { true }
+
+  private var showing = false
+
+  func show(in frame: NSRect) {
+    if showing {
+      springFrame(to: frame, stiffness: 520, damping: 36)
+      return
+    }
+    showing = true
+    isHidden = false
+    self.frame = frame
+    alphaValue = 1
+    animateIn(scale: 0.98, fade: 0.12, duration: 0.18)
+  }
+
+  func hide() {
+    guard showing else { return }
+    showing = false
+    animateOut(scale: 0.98, fade: 0.12, duration: 0.16) { [weak self] in
+      guard let self, !self.showing else { return }
+      self.isHidden = true
+    }
   }
 }
 
@@ -1419,6 +2150,61 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 private final class NotesTableView: NSTableView {
   /// The menu a right click (or ⌃-click) anywhere on a row opens.
   var menuForRow: ((Int) -> NSMenu?)?
+  /// A click on a row (not on one of its controls).
+  var onRowClick: ((Int) -> Void)?
+  /// Dragging a row: whether it lifts, then where the pointer goes (in the
+  /// table), and whether it's dropped (not canceled with Escape).
+  var canLift: ((Int) -> Bool)?
+  var onLift: ((Int, NSPoint) -> Void)?
+  var onDragMove: ((NSPoint) -> Void)?
+  var onDragEnd: ((Bool) -> Void)?
+
+  /// The row under `point` as it shows: rows sliding into place are where
+  /// they are on screen, not where they're going.
+  private func rowShown(at point: NSPoint) -> Int {
+    var found = -1
+    enumerateAvailableRowViews { rowView, row in
+      guard found < 0 else { return }
+      var frame = rowView.frame
+      if let layer = rowView.layer, let shown = layer.presentation() { frame.origin.y += shown.position.y - layer.position.y }
+      if frame.contains(point) { found = row }
+    }
+    return found >= 0 ? found : row(at: point)
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    let start = convert(event.locationInWindow, from: nil)
+    let row = rowShown(at: start)
+    // Its controls (and a name being edited) take their own clicks.
+    let hit = superview.flatMap { $0.hitTest($0.convert(event.locationInWindow, from: nil)) }
+    guard row >= 0, !(hit is IconButton), !(hit is SelectionCheckbox), !(hit is NSTextView) else {
+      return super.mouseDown(with: event)
+    }
+    var lifted = false
+    while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp, .keyDown]) {
+      switch next.type {
+      case .leftMouseDragged:
+        let point = convert(next.locationInWindow, from: nil)
+        if !lifted, hypot(point.x - start.x, point.y - start.y) > 4, canLift?(row) == true {
+          lifted = true
+          onLift?(row, start)
+        }
+        guard lifted else { continue }
+        autoscroll(with: next)
+        onDragMove?(convert(next.locationInWindow, from: nil))
+      case .keyDown where next.keyCode == 53:  // Escape
+        if lifted {
+          onDragEnd?(false)
+          return
+        }
+      case .leftMouseUp:
+        if lifted { onDragEnd?(true) } else { onRowClick?(row) }
+        return
+      default:
+        break
+      }
+    }
+  }
 
   /// Without NSTableView's own handling, which outlines the clicked row.
   override func menu(for event: NSEvent) -> NSMenu? {
@@ -1526,7 +2312,7 @@ private final class NoteCell: NSTableCellView {
 
   @objc private func showMore() { onMore?(moreButton) }
 
-  private static let verticalEllipsis: NSImage? = {
+  static let verticalEllipsis: NSImage? = {
     guard let symbol = Theme.symbol("ellipsis", size: 13) else { return nil }
     let size = NSSize(width: symbol.size.height, height: symbol.size.width)
     let image = NSImage(size: size, flipped: false) { rect in
@@ -1657,6 +2443,222 @@ private final class NoteRowView: RoundedRowView {
 
   private func updateCheckbox(animated: Bool) {
     checkbox.setShown(hovering || checkbox.isChecked, animated: animated)
+  }
+}
+
+/// A group's header row: a chevron in the gutter (where notes have their
+/// checkbox), turned down while the group is open.
+private final class GroupRowView: RoundedRowView {
+  static let height: CGFloat = 50
+  /// How far below the row's middle its content sits (room above it, from
+  /// the group before).
+  static let drop: CGFloat = 6
+
+  private let chevron = ChevronView()
+  var isCollapsed = false {
+    didSet { chevron.isOpen = !isCollapsed }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    chevron.isOpen = true
+    addSubview(chevron)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func didAddSubview(_ subview: NSView) {
+    super.didAddSubview(subview)
+    if subview !== chevron { addSubview(chevron, positioned: .above, relativeTo: nil) }
+  }
+
+  override func layout() {
+    super.layout()
+    let size: CGFloat = 16
+    let center = max(4 + SelectionCheckbox.boxSize / 2, inset - 12)
+    chevron.frame = NSRect(x: (center - size / 2).rounded(), y: ((bounds.height - size) / 2 + Self.drop).rounded(), width: size, height: size)
+  }
+
+  /// Turns the chevron from where it was to where it is.
+  func turnChevron() { chevron.turn(fromOpen: isCollapsed) }
+
+  override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+/// A chevron pointing right, turned down while open. It's drawn in a layer of
+/// its own: AppKit leaves that one's transform alone.
+private final class ChevronView: NSView {
+  private let glyph = CALayer()
+  var isOpen = false {
+    didSet { needsLayout = true }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layer?.addSublayer(glyph)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+  override var wantsUpdateLayer: Bool { true }
+
+  override func updateLayer() {
+    guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold) else { return }
+    let tinted = NSImage(size: symbol.size, flipped: false) { rect in
+      symbol.draw(in: rect)
+      Theme.tertiaryText.set()
+      rect.fill(using: .sourceAtop)
+      return true
+    }
+    glyph.contents = tinted.layerContents(forContentsScale: window?.backingScaleFactor ?? 2)
+    glyph.contentsGravity = .center
+    glyph.contentsScale = window?.backingScaleFactor ?? 2
+  }
+
+  override func layout() {
+    super.layout()
+    Motion.withoutAnimation {
+      glyph.bounds = bounds
+      glyph.position = CGPoint(x: bounds.midX, y: bounds.midY)
+      glyph.transform = rotation(open: isOpen)
+    }
+  }
+
+  private func rotation(open: Bool) -> CATransform3D {
+    // (Clockwise: y goes up in the layer.)
+    CATransform3DMakeRotation(open ? -.pi / 2 : 0, 0, 0, 1)
+  }
+
+  func turn(fromOpen wasOpen: Bool) {
+    layoutSubtreeIfNeeded()
+    let animation = Motion.basic("transform", duration: Motion.foldDuration, timing: CubicBezier.fold.timingFunction)
+    animation.fromValue = rotation(open: wasOpen)
+    animation.toValue = rotation(open: isOpen)
+    glyph.add(animation, forKey: "glea.chevron")
+  }
+}
+
+/// A group's name (renamed in place) and how many notes it has, with a ⋮
+/// menu.
+private final class GroupHeaderCell: NSTableCellView, NSTextFieldDelegate {
+  static let identifier = NSUserInterfaceItemIdentifier("GroupHeaderCell")
+  private let nameField = NSTextField.label("", size: 15, weight: .semibold)
+  private let countLabel = NSTextField.label("", size: 12, color: Theme.tertiaryText)
+  private let moreButton = IconButton(symbol: "ellipsis", size: 13, tooltip: "More", target: nil, action: nil)
+  private lazy var editingWidth = nameField.widthAnchor.constraint(greaterThanOrEqualToConstant: 220)
+  var onMore: ((NSView) -> Void)?
+  /// Renaming ended: the new name, or nil if it was canceled.
+  var onRename: ((String?) -> Void)?
+  private var original = ""
+  private var canceled = false
+
+  init() {
+    super.init(frame: .zero)
+    identifier = GroupHeaderCell.identifier
+    for view in [nameField, countLabel, moreButton] { addSubview(view) }
+    nameField.delegate = self
+    nameField.focusRingType = .none
+    nameField.lineBreakMode = .byTruncatingTail
+    nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    moreButton.setSymbolImage(NoteCell.verticalEllipsis)
+    moreButton.restingTint = Theme.tertiaryText
+    moreButton.target = self
+    moreButton.action = #selector(showMore)
+    NSLayoutConstraint.activate([
+      nameField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+      nameField.centerYAnchor.constraint(equalTo: centerYAnchor, constant: GroupRowView.drop),
+      nameField.trailingAnchor.constraint(lessThanOrEqualTo: countLabel.leadingAnchor, constant: -8),
+      countLabel.firstBaselineAnchor.constraint(equalTo: nameField.firstBaselineAnchor),
+      countLabel.trailingAnchor.constraint(lessThanOrEqualTo: moreButton.leadingAnchor, constant: -16),
+      moreButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+      moreButton.centerYAnchor.constraint(equalTo: nameField.centerYAnchor),
+    ])
+    countLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  @objc private func showMore() { onMore?(moreButton) }
+
+  func configure(name: String, count: Int, hasMenu: Bool) {
+    nameField.stringValue = name
+    countLabel.stringValue = "\(count)"
+    moreButton.isHidden = !hasMenu
+  }
+
+  var isRenaming: Bool { nameField.isEditable }
+
+  func cancelRenaming() {
+    guard nameField.isEditable else { return }
+    canceled = true
+    nameField.stringValue = original
+    window?.makeFirstResponder(nil)
+  }
+
+  func beginRenaming() {
+    original = nameField.stringValue
+    canceled = false
+    nameField.isEditable = true
+    nameField.isSelectable = true
+    editingWidth.isActive = true
+    window?.makeFirstResponder(nameField)
+    nameField.currentEditor()?.selectAll(nil)
+  }
+
+  func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+    if selector == #selector(NSResponder.cancelOperation(_:)) {
+      canceled = true
+      nameField.stringValue = original
+      window?.makeFirstResponder(nil)
+      return true
+    }
+    if selector == #selector(NSResponder.insertNewline(_:)) {
+      window?.makeFirstResponder(nil)
+      return true
+    }
+    return false
+  }
+
+  func controlTextDidEndEditing(_ obj: Notification) {
+    guard nameField.isEditable else { return }
+    nameField.isEditable = false
+    nameField.isSelectable = false
+    editingWidth.isActive = false
+    let name = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    onRename?(canceled || name.isEmpty ? nil : name)
+  }
+}
+
+/// What an empty group shows: where to drag notes.
+private final class GroupPlaceholderCell: NSTableCellView {
+  static let identifier = NSUserInterfaceItemIdentifier("GroupPlaceholderCell")
+
+  init() {
+    super.init(frame: .zero)
+    identifier = GroupPlaceholderCell.identifier
+    let label = NSTextField.label("Drag a note here", size: 12.5, color: Theme.tertiaryText)
+    addSubview(label)
+    NSLayoutConstraint.activate([
+      label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+      label.centerYAnchor.constraint(equalTo: centerYAnchor),
+    ])
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+}
+
+private extension NSView {
+  /// What the view shows (in `rect`), as an image.
+  func picture(of rect: NSRect? = nil) -> NSImage {
+    let rect = rect ?? bounds
+    let image = NSImage(size: rect.size)
+    if let rep = bitmapImageRepForCachingDisplay(in: rect) {
+      cacheDisplay(in: rect, to: rep)
+      image.addRepresentation(rep)
+    }
+    return image
   }
 }
 

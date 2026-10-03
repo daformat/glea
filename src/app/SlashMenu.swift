@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 // The slash menu: typing "/" at the start of a line or after a space offers
 // the blocks a note can have. Typing on filters it, ↑/↓ move through it,
@@ -23,19 +24,42 @@ struct SlashItem {
     lineItem("Heading 1", ["h1", "title"], "textformat.size.larger", "# "),
     lineItem("Heading 2", ["h2", "subtitle"], "textformat.size", "## "),
     lineItem("Heading 3", ["h3"], "textformat.size.smaller", "### "),
+    lineItem("Heading 4", ["h4"], "textformat.size.smaller", "#### "),
     lineItem("Bulleted List", ["ul", "bullet", "unordered"], "list.bullet", "- "),
     lineItem("Numbered List", ["ol", "ordered", "number"], "list.number", "1. "),
     lineItem("To-do List", ["todo", "task", "checkbox", "check"], "checklist", "- [ ] "),
     lineItem("Quote", ["blockquote", "citation"], "text.quote", "> "),
+    calloutItem("Callout", "note", ["note", "admonition", "info"], "text.bubble"),
+    calloutItem("Tip", "tip", ["hint"], "lightbulb"),
+    calloutItem("Warning", "warning", ["caution", "attention"], "exclamationmark.triangle"),
+    calloutItem("Danger", "danger", ["error", "bug"], "xmark.octagon"),
+    calloutItem("Success", "success", ["done", "check"], "checkmark.circle"),
+    calloutItem("Question", "question", ["help", "faq"], "questionmark.circle"),
+    calloutItem("Example", "example", [], "list.bullet.rectangle"),
     SlashItem(title: "Code Block", keywords: ["code", "snippet", "fence"], symbol: "chevron.left.forwardslash.chevron.right",
               hint: "```", apply: { $0.insertCodeBlock() }),
+    SlashItem(title: "Math Block", keywords: ["equation", "latex", "formula", "tex"], symbol: "function", hint: "$$",
+              apply: { $0.insertMathBlock() }),
+    SlashItem(title: "Inline Math", keywords: ["equation", "latex", "formula", "tex"], symbol: "x.squareroot", hint: "$ $",
+              apply: { $0.insertInlineMath() }),
     SlashItem(title: "Table", keywords: ["grid"], symbol: "tablecells", hint: "| |", apply: { $0.insertTable() }),
+    SlashItem(title: "Image, Video or Sound", keywords: ["picture", "photo", "file", "movie", "audio", "media", "attachment"],
+              symbol: "photo", hint: "![]( )", apply: { $0.chooseMedia() }),
+    SlashItem(title: "Web Embed", keywords: ["youtube", "vimeo", "video", "url", "embed"], symbol: "play.rectangle", hint: "URL",
+              apply: { $0.insertWebEmbed() }),
     SlashItem(title: "Divider", keywords: ["hr", "rule", "line", "separator"], symbol: "minus", hint: "---",
               apply: { $0.insertDivider() }),
     SlashItem(title: "Link", keywords: ["url", "web"], symbol: "link", hint: "[ ]( )", apply: { $0.insertLink() }),
     SlashItem(title: "Link to Note", keywords: ["note", "wiki", "page", "mention"], symbol: "doc.text", hint: "[[ ]]",
               apply: { $0.insertText("[[", replacementRange: $0.selectedRange()) }),
+    SlashItem(title: "Embedded Note", keywords: ["embed", "transclude", "include", "note"], symbol: "doc.richtext", hint: "![[ ]]",
+              apply: { $0.insertText("![[", replacementRange: $0.selectedRange()) }),
   ]
+
+  /// Turns the line into a callout of `type` (its text, if any, the title).
+  @MainActor private static func calloutItem(_ title: String, _ type: String, _ keywords: [String], _ symbol: String) -> SlashItem {
+    SlashItem(title: title, keywords: keywords + ["callout"], symbol: symbol, hint: "> [!\(type)]") { $0.makeCallout(type) }
+  }
 
   /// Turns the line into a `prefix` line (whatever prefix it had before).
   @MainActor private static func lineItem(_ title: String, _ keywords: [String], _ symbol: String, _ prefix: String) -> SlashItem {
@@ -279,6 +303,74 @@ extension MarkdownTextView {
     let after = location < s.length && s.character(at: location) == 0x0A ? "" : "\n"
     let caret = location + (before as NSString).length + 4
     replace(NSRange(location: location, length: 0), with: before + "---" + after, select: NSRange(location: caret, length: 0))
+  }
+
+  /// The line becomes a callout's first line: "> [!type] " before its text
+  /// (after its "> " if it's already quoted), the cursor at its end.
+  func makeCallout(_ type: String) {
+    let s = string as NSString
+    var line = s.lineRange(for: NSRange(location: selectedRange().location, length: 0))
+    if NSMaxRange(line) > line.location, s.character(at: NSMaxRange(line) - 1) == 0x0A { line.length -= 1 }
+    let text = s.substring(with: line)
+    let quoted = text.hasPrefix("> ")
+    let insert = (quoted ? "" : "> ") + "[!\(type)] "
+    let at = line.location + (quoted ? 2 : 0)
+    replace(NSRange(location: at, length: 0), with: insert,
+            select: NSRange(location: NSMaxRange(line) + (insert as NSString).length, length: 0))
+  }
+
+  /// A `$$` block on lines of its own, the cursor between them.
+  func insertMathBlock() {
+    let s = string as NSString
+    let location = selectedRange().location
+    let lineStart = s.lineRange(for: NSRange(location: location, length: 0)).location
+    let before = location == lineStart ? "" : "\n"
+    let after = location < s.length && s.character(at: location) != 0x0A ? "\n" : ""
+    replace(NSRange(location: location, length: 0), with: before + "$$\n\n$$" + after,
+            select: NSRange(location: location + (before as NSString).length + 3, length: 0))
+  }
+
+  /// `$x$`, the x selected to type over. (A bare `$$` would open a block.)
+  func insertInlineMath() {
+    let location = selectedRange().location
+    replace(NSRange(location: location, length: 0), with: "$x$", select: NSRange(location: location + 1, length: 1))
+  }
+
+  /// Images, videos or sounds chosen from disk, copied into assets/ like
+  /// dropped ones, each on its own line.
+  func chooseMedia() {
+    guard let window else { return }
+    let location = selectedRange().location
+    let panel = NSOpenPanel()
+    panel.allowsMultipleSelection = true
+    panel.canChooseDirectories = false
+    panel.allowedContentTypes = [.image, .movie, .audio]
+    panel.beginSheetModal(for: window) { [weak self] response in
+      guard let self, response == .OK, !panel.urls.isEmpty else { return }
+      let board = NSPasteboard(name: NSPasteboard.Name("app.glea.media-" + UUID().uuidString))
+      board.clearContents()
+      board.writeObjects(panel.urls as [NSURL])
+      if let images = self.imageMarkdown(from: board), !images.isEmpty { self.insertImages(images, at: location) }
+      board.releaseGlobally()
+    }
+  }
+
+  /// A web page or video (YouTube, Vimeo...) on its own line: the URL on the
+  /// clipboard, or "https://" to finish.
+  func insertWebEmbed() {
+    let s = string as NSString
+    let location = selectedRange().location
+    let lineStart = s.lineRange(for: NSRange(location: location, length: 0)).location
+    let before = location == lineStart ? "" : "\n"
+    let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    let start = location + (before as NSString).length
+    if (clipboard.hasPrefix("http://") || clipboard.hasPrefix("https://")) && !clipboard.contains(where: \.isWhitespace) {
+      let text = before + clipboard + "\n"
+      replace(NSRange(location: location, length: 0), with: text,
+              select: NSRange(location: location + (text as NSString).length, length: 0))
+    } else {
+      replace(NSRange(location: location, length: 0), with: before + "https://", select: NSRange(location: start + 8, length: 0))
+    }
   }
 }
 
@@ -592,13 +684,21 @@ final class SlashMenuPanel: NSPanel {
     hasShadow = false
     isReleasedWhenClosed = false
     let container = SlashMenuContainer()
-    container.card.addSubview(menuView)
-    menuView.translatesAutoresizingMaskIntoConstraints = false
+    // Taller than the card when there are many items: it scrolls freely.
+    let scroll = NSScrollView()
+    scroll.drawsBackground = false
+    scroll.hasVerticalScroller = true
+    scroll.autohidesScrollers = true
+    scroll.scrollerStyle = .overlay
+    scroll.automaticallyAdjustsContentInsets = false
+    scroll.documentView = menuView
+    scroll.translatesAutoresizingMaskIntoConstraints = false
+    container.card.addSubview(scroll)
     NSLayoutConstraint.activate([
-      menuView.leadingAnchor.constraint(equalTo: container.card.leadingAnchor),
-      menuView.trailingAnchor.constraint(equalTo: container.card.trailingAnchor),
-      menuView.topAnchor.constraint(equalTo: container.card.topAnchor),
-      menuView.bottomAnchor.constraint(equalTo: container.card.bottomAnchor),
+      scroll.leadingAnchor.constraint(equalTo: container.card.leadingAnchor),
+      scroll.trailingAnchor.constraint(equalTo: container.card.trailingAnchor),
+      scroll.topAnchor.constraint(equalTo: container.card.topAnchor),
+      scroll.bottomAnchor.constraint(equalTo: container.card.bottomAnchor),
     ])
     contentView = container
   }
@@ -707,16 +807,26 @@ final class SlashMenuView: NSView {
   static let padding: CGFloat = 5
   private static let rowHeight: CGFloat = 30
   private static let width: CGFloat = 250
+  /// Rows shown at once; the others scroll into view.
+  private static let maxRows = 10
 
   var items: [SlashItem] = [] {
     didSet {
-      invalidateIntrinsicContentSize()
+      setFrameSize(NSSize(width: Self.width, height: CGFloat(items.count) * Self.rowHeight + Self.padding * 2))
+      // (Shown again as the page scrolls: the same items stay where they are.)
+      if items.map(\.title) != oldValue.map(\.title) { scroll(.zero) }
       needsDisplay = true
     }
   }
   var selected = 0 {
-    didSet { needsDisplay = true }
+    didSet {
+      // Chosen with the keyboard, it scrolls into view (not under the
+      // pointer: the list would move under it).
+      if !hoverSelecting { scrollToVisible(rowRect(selected).insetBy(dx: 0, dy: -Self.padding)) }
+      needsDisplay = true
+    }
   }
+  private var hoverSelecting = false
   var onHover: ((Int) -> Void)?
   var onChoose: ((Int) -> Void)?
   private var tracking: NSTrackingArea?
@@ -727,10 +837,14 @@ final class SlashMenuView: NSView {
     NSSize(width: Self.width, height: CGFloat(items.count) * Self.rowHeight + Self.padding * 2)
   }
 
-  override var fittingSize: NSSize { intrinsicContentSize }
+  /// The card's size: up to `maxRows` rows (the rest scroll).
+  override var fittingSize: NSSize {
+    NSSize(width: Self.width, height: CGFloat(min(items.count, Self.maxRows)) * Self.rowHeight + Self.padding * 2)
+  }
 
   private func rowRect(_ index: Int) -> NSRect {
-    NSRect(x: Self.padding, y: Self.padding + CGFloat(index) * Self.rowHeight, width: bounds.width - Self.padding * 2, height: Self.rowHeight)
+    NSRect(x: Self.padding, y: Self.padding + CGFloat(index) * Self.rowHeight, width: bounds.width - Self.padding * 2,
+           height: Self.rowHeight)
   }
 
   private func row(at point: NSPoint) -> Int? {
@@ -738,7 +852,8 @@ final class SlashMenuView: NSView {
   }
 
   override func draw(_ dirtyRect: NSRect) {
-    for (index, item) in items.enumerated() {
+    for index in items.indices where rowRect(index).intersects(dirtyRect) {
+      let item = items[index]
       let rect = rowRect(index)
       if index == selected {
         Theme.selected.setFill()
@@ -788,7 +903,10 @@ final class SlashMenuView: NSView {
   override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
   override func mouseMoved(with event: NSEvent) {
-    if let index = row(at: convert(event.locationInWindow, from: nil)), index != selected { onHover?(index) }
+    guard let index = row(at: convert(event.locationInWindow, from: nil)), index != selected else { return }
+    hoverSelecting = true
+    onHover?(index)
+    hoverSelecting = false
   }
 
   override func mouseDown(with event: NSEvent) {}

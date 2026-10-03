@@ -928,6 +928,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     case .web: if !isShowingNewTab { activeTab?.browserView?.isHidden = false }
     case .note: break
     }
+    // What floats over the page's text (the format bar, the slash and link
+    // menus) leaves with it, not once it's hidden at the end of the fade.
+    if outgoing !== incoming, let responder = window?.firstResponder as? NSView, responder.isDescendant(of: outgoing) {
+      window?.makeFirstResponder(nil)
+    }
     crossfade(from: outgoing, to: incoming)
     restoredNotesFocus = false
     if newMode != .web, newMode == notesFocusMode, let view = notesFocusView, view.window === window, view.isDescendant(of: incoming) {

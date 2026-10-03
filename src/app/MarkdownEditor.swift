@@ -31,6 +31,8 @@ extension NSAttributedString.Key {
   static let gleaCellLink = NSAttributedString.Key("gleaCellLink")
   /// MathRender: an inline formula (`$…$`), drawn over its hidden source.
   static let gleaMath = NSAttributedString.Key("gleaMath")
+  /// Inline code (`…`): its line keeps a line of text's height.
+  static let gleaInlineCode = NSAttributedString.Key("gleaInlineCode")
   /// MathBlock: a `$$…$$` block shown as its formula, on its first line (the
   /// others are folded away).
   static let gleaMathBlock = NSAttributedString.Key("gleaMathBlock")
@@ -175,6 +177,8 @@ struct MarkdownStyler {
 
   nonisolated static let lineSpacing: CGFloat = 3
   nonisolated static let paragraphSpacing: CGFloat = 6
+  /// How tall a line of body text is.
+  static let bodyLineHeight = NSLayoutManager().defaultLineHeight(for: Theme.bodyFont)
   /// How far each level of heading nesting indents its section.
   nonisolated static let sectionIndent: CGFloat = 20
 
@@ -347,6 +351,18 @@ struct MarkdownStyler {
     }
     for block in codeBlocks where NSIntersectionRange(block.content, target).length > 0 {
       SyntaxHighlighter.highlight(storage, range: block.content, language: block.language)
+    }
+    // Inline code's font has a shorter line than the text's: its lines are
+    // at least as tall as a line of text (the room going above, so its
+    // baseline is where the text's would be).
+    let clamped = NSIntersectionRange(target, NSRange(location: 0, length: storage.length))
+    storage.enumerateAttribute(.gleaInlineCode, in: clamped) { value, range, _ in
+      guard value != nil else { return }
+      let paragraph = string.paragraphRange(for: range)
+      guard let style = (storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil) as? NSParagraphStyle)?
+        .mutableCopy() as? NSMutableParagraphStyle, style.minimumLineHeight < MarkdownStyler.bodyLineHeight else { return }
+      style.minimumLineHeight = MarkdownStyler.bodyLineHeight
+      storage.addAttribute(.paragraphStyle, value: style, range: paragraph)
     }
     storage.endEditing()
   }
@@ -1223,7 +1239,7 @@ struct MarkdownStyler {
 
     for m in MarkdownStyler.inlineCode.matches(in: line, range: local) {
       construct = m.range
-      storage.addAttributes([.font: Theme.monoFont, .backgroundColor: Theme.codeBackground], range: abs(m.range))
+      storage.addAttributes([.font: Theme.monoFont, .backgroundColor: Theme.codeBackground, .gleaInlineCode: true], range: abs(m.range))
       syntax(NSRange(location: m.range.location, length: 1))
       syntax(NSRange(location: m.range.upperBound - 1, length: 1))
       taken.append(m.range)
@@ -1461,13 +1477,6 @@ final class MarkdownLayoutManager: NSLayoutManager {
               NSBezierPath(roundedRect: rect.insetBy(dx: 0, dy: -2), xRadius: 6, yRadius: 6).fill()
             } else {
               let calloutColor = value as? NSColor
-              if let calloutColor {
-                // A callout: tinted, its bar in its color.
-                calloutColor.withAlphaComponent(0.08).setFill()
-                let tint = NSRect(x: origin.x + indent, y: rect.minY - 2, width: container.size.width - indent, height: rect.height + 4)
-                NSBezierPath(roundedRect: tint, xRadius: 6, yRadius: 6).fill()
-              }
-              (calloutColor?.withAlphaComponent(0.8) ?? Theme.tertiaryText.withAlphaComponent(0.35)).setFill()
               // Down to the last line's descender, not its fragment: the
               // note's last line gets no paragraph spacing, which would make
               // its bar shorter.
@@ -1476,7 +1485,21 @@ final class MarkdownLayoutManager: NSLayoutManager {
               let lastRect = lineFragmentRect(forGlyphAt: max(0, lastGlyph), effectiveRange: &lastLine)
               let baseline = origin.y + lastRect.minY + self.location(forGlyphAt: lastLine.location).y
               let bottom = baseline - Theme.bodyFont.descender
-              let bar = NSRect(x: origin.x + indent + 2, y: rect.minY + 2, width: 3, height: bottom - rect.minY - 2)
+              var bar = NSRect(x: origin.x + indent + 2, y: rect.minY + 2, width: 3, height: bottom - rect.minY - 2)
+              if let calloutColor {
+                // A callout: tinted, as much above its text as below (its
+                // fragments start and end with spacing), its bar centered
+                // in it.
+                var firstLine = NSRange()
+                let firstGlyph = glyphRange(forCharacterRange: run, actualCharacterRange: nil).location
+                let firstRect = lineFragmentRect(forGlyphAt: firstGlyph, effectiveRange: &firstLine)
+                let top = origin.y + firstRect.minY + self.location(forGlyphAt: firstLine.location).y - Theme.bodyFont.ascender
+                calloutColor.withAlphaComponent(0.08).setFill()
+                let tint = NSRect(x: origin.x + indent, y: top - 6, width: container.size.width - indent, height: bottom - top + 12)
+                NSBezierPath(roundedRect: tint, xRadius: 6, yRadius: 6).fill()
+                bar = NSRect(x: tint.minX + 4, y: tint.minY + 5, width: 3, height: tint.height - 10)
+              }
+              (calloutColor?.withAlphaComponent(0.8) ?? Theme.tertiaryText.withAlphaComponent(0.35)).setFill()
               NSBezierPath(roundedRect: bar, xRadius: 1.5, yRadius: 1.5).fill()
             }
           }
@@ -1672,11 +1695,12 @@ final class FoldingLayoutDelegate: NSObject, NSLayoutManagerDelegate {
               storage.attribute(.gleaFoldEnd, at: start, effectiveRange: nil) != nil {
       height = 0
     } else {
-      // A formula going lower than the text: the line makes room below.
       guard let storage = layoutManager.textStorage else { return false }
-      let chars = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
+      let chars = NSIntersectionRange(layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil),
+                                      NSRange(location: 0, length: storage.length))
+      // A formula going lower than the text: the line makes room below.
       var depth: CGFloat = 0
-      storage.enumerateAttribute(.gleaMath, in: NSIntersectionRange(chars, NSRange(location: 0, length: storage.length))) { value, _, _ in
+      storage.enumerateAttribute(.gleaMath, in: chars) { value, _, _ in
         if let piece = value as? MathPiece { depth = max(depth, piece.render.descent) }
       }
       let extra = ceil(baselineOffset.pointee + depth + 2 - lineFragmentUsedRect.pointee.height)
@@ -1998,7 +2022,17 @@ final class MarkdownTextView: NSTextView {
   /// The cursor stays as tall as the text it's in, on lines a tall formula
   /// makes taller.
   override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
-    super.drawInsertionPoint(in: caretRect(rect), color: color, turnedOn: flag)
+    var caret = caretRect(rect)
+    // At the start of a line AppKit puts it half outside the view, where
+    // half of it is clipped (thinner than elsewhere): kept inside.
+    caret.origin.x = max(0, caret.minX)
+    super.drawInsertionPoint(in: caret, color: color, turnedOn: flag)
+  }
+
+  /// (Wider than AppKit's, for a cursor moved back inside the view: it
+  /// redraws where it was.)
+  override func setNeedsDisplay(_ rect: NSRect, avoidAdditionalLayout flag: Bool) {
+    super.setNeedsDisplay(rect.width <= 2 ? rect.insetBy(dx: -1, dy: 0) : rect, avoidAdditionalLayout: flag)
   }
 
   private func caretRect(_ rect: NSRect) -> NSRect {

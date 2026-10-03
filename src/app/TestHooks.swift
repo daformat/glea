@@ -56,7 +56,8 @@ enum TestHooks {
       // Types into the key window's (or an incognito window's) focused field, "\r" chooses.
       let target = NSApp.keyWindow ?? NSApp.windows.last { ($0.windowController as? BrowserWindowController)?.isIncognito == true && $0.isVisible }
         ?? controller.window
-      guard let editor = target?.firstResponder as? NSTextView else { NSLog("Glea test: no field in \(String(describing: target?.title)) parent=\(String(describing: target?.parent?.title)): \(String(describing: target?.firstResponder)) main=\(String(describing: NSApp.mainWindow?.title)) active=\(NSApp.isActive)"); break }
+      // (A transition's overlay can hold key: the window's own field then.)
+      guard let editor = (target?.firstResponder as? NSTextView) ?? (controller.window?.firstResponder as? NSTextView) else { NSLog("Glea test: no field in \(String(describing: target?.title)) parent=\(String(describing: target?.parent?.title)): \(String(describing: target?.firstResponder)) main=\(String(describing: NSApp.mainWindow?.title)) active=\(NSApp.isActive)"); break }
       if argument == "\r" { editor.doCommand(by: #selector(NSResponder.insertNewline(_:))) } else { editor.insertText(argument, replacementRange: editor.selectedRange()) }
     case "cmd-w":
       // cmd-w:main|incognito: ⌘W in that window.
@@ -199,6 +200,28 @@ enum TestHooks {
       // check-note:<row> checks or unchecks a note in All Notes.
       let list = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? NotesListView }.first
       if let row = Int(argument) { list?.debugToggleCheck(row) }
+    case "lift-note", "drag-note-to", "end-note-drag":
+      // lift-note:<row>, drag-note-to:<y in the list>, end-note-drag:drop (or
+      // cancel) drag a note in All Notes.
+      let list = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? NotesListView }.first
+      switch parts[0] {
+      case "lift-note": if let row = Int(argument) { list?.debugLift(row) }
+      case "drag-note-to": if let y = Double(argument) { list?.debugDragTo(y) }
+      default: list?.debugEndDrag(drop: argument == "drop")
+      }
+    case "drop-note", "toggle-group", "delete-group", "rename-group", "notes-toc":
+      // drop-note:<name>|<row>|on (or above) drops a note in All Notes as if
+      // dragged there; toggle-group:<name> ("" for ungrouped) and
+      // delete-group:<name>.
+      let list = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? NotesListView }.first
+      if parts[0] == "toggle-group" { list?.debugToggleGroup(argument) }
+      if parts[0] == "delete-group" { list?.debugDeleteGroup(argument) }
+      if parts[0] == "notes-toc", let index = Int(argument) { list?.debugSelectTocEntry(index) }
+      if parts[0] == "rename-group", case let names = argument.split(separator: "|").map(String.init), names.count == 2 {
+        list?.debugRenameGroup(names[0], to: names[1])
+      }
+      let fields = argument.split(separator: "|").map(String.init)
+      if parts[0] == "drop-note", fields.count == 3, let row = Int(fields[1]) { list?.debugDrop(fields[0], row: row, on: fields[2] == "on") }
     case "toc-hover", "toc-click":
       let page = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? ColumnPageView }.first { !$0.isHiddenOrHasHiddenAncestor }
       let index = Int(argument)
