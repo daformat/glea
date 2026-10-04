@@ -463,6 +463,8 @@ final class TopBarView: NSView {
   private lazy var soundButton = IconButton(symbol: "speaker.wave.2.fill", size: 12, tooltip: "Mute Sound", target: self,
                                             action: #selector(toggleSound))
   private lazy var modeButton = IconButton(symbol: "note.text", size: 14, tooltip: "Switch to Notes (⌘D)", target: self, action: #selector(toggleMode))
+  /// An update downloaded and ready (see Updater): relaunches onto it.
+  private lazy var updatePill = UpdatePill(target: self, action: #selector(installUpdate))
   /// Left of the search button in incognito windows.
   private lazy var incognitoBadge = IncognitoBadge()
   var isIncognito = false {
@@ -565,6 +567,13 @@ final class TopBarView: NSView {
     NotificationCenter.default.addObserver(forName: SoundMonitor.didChange, object: nil, queue: .main) { [weak self] _ in
       MainActor.assumeIsolated { self?.updateSoundButton() }
     }
+    updatePill.translatesAutoresizingMaskIntoConstraints = true
+    updatePill.isHidden = true
+    addSubview(updatePill)
+    NotificationCenter.default.addObserver(forName: .gleaUpdateReadyChanged, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.updateUpdatePill() }
+    }
+    updateUpdatePill()
     pinnedStrip.wantsLayer = true
     addSubview(pinnedStrip, positioned: .below, relativeTo: newTabButton)
     addSubview(pinnedSeparator, positioned: .below, relativeTo: newTabButton)
@@ -784,7 +793,13 @@ final class TopBarView: NSView {
       extensionX -= 2 + 28
       place(entry.button, NSRect(x: extensionX, y: buttonY, width: 28, height: 28), animated: animated)
     }
-    let rightEdge = (isWeb && showsExtensions ? extensionX : buttonsLeft) - 12
+    var rightEdge = (isWeb && showsExtensions ? extensionX : buttonsLeft) - 12
+    if !updatePill.isHidden {
+      let size = updatePill.fittingSize
+      place(updatePill, NSRect(x: rightEdge + 6 - size.width, y: ((h - size.height) / 2).rounded(),
+                               width: size.width, height: size.height), animated: false)
+      rightEdge = updatePill.frame.minX - 12
+    }
 
     // Notes: Journal / All Notes, centered over the page (but never under
     // Back / Forward or the right-hand buttons).
@@ -807,7 +822,8 @@ final class TopBarView: NSView {
     x += 10
     // Tabs keep their web layout in notes mode (where the extensions are
     // hidden), so switching modes doesn't resize them.
-    let tabsRightEdge = (showsExtensions ? extensionX : buttonsLeft) - 12
+    var tabsRightEdge = (showsExtensions ? extensionX : buttonsLeft) - 12
+    if !updatePill.isHidden { tabsRightEdge = min(tabsRightEdge, updatePill.frame.minX - 12) }
     layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
   }
 
@@ -867,6 +883,79 @@ final class TopBarView: NSView {
 }
 
 /// "Incognito", with its glasses, at the right of an incognito window's bar.
+extension TopBarView {
+  /// Shows the pill once an update is ready (popping in), hides it otherwise.
+  fileprivate func updateUpdatePill() {
+    let version = Updater.shared.readyVersion
+    let show = version != nil
+    updatePill.toolTip = version.map { "Glea \($0) is ready: relaunch to install it" }
+    guard show == updatePill.isHidden else { return }
+    updatePill.isHidden = !show
+    needsLayout = true
+    layoutSubtreeIfNeeded()
+    if show && window != nil { updatePill.popIn() }
+  }
+
+  @objc fileprivate func installUpdate() {
+    Updater.shared.installAndRelaunch()
+  }
+}
+
+/// "Relaunch to Update" once an update is downloaded: a light wash of the
+/// accent color, edged and written in it.
+private final class UpdatePill: NSControl {
+  private let stack: NSStackView
+  private var hovering = false { didSet { needsDisplay = true } }
+  private var pressed = false { didSet { needsDisplay = true } }
+
+  init(target: AnyObject, action: Selector) {
+    let icon = NSImageView(image: Theme.symbol("arrow.down.circle.fill", size: 12, weight: .semibold) ?? NSImage())
+    icon.contentTintColor = Theme.accent
+    let label = NSTextField.label("Relaunch to Update", size: 12, weight: .semibold, color: Theme.accent)
+    stack = NSStackView(views: [icon, label])
+    stack.spacing = 5
+    stack.edgeInsets = NSEdgeInsets(top: 0, left: 9, bottom: 0, right: 11)
+    super.init(frame: .zero)
+    self.target = target
+    self.action = action
+    addSubview(stack)
+    stack.pinEdges(to: self)
+    stack.heightAnchor.constraint(equalToConstant: 26).isActive = true
+    addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func draw(_ dirtyRect: NSRect) {
+    let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+    let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+    Theme.accent.withAlphaComponent(pressed ? 0.26 : hovering ? 0.18 : 0.12).setFill()
+    path.fill()
+    Theme.accent.setStroke()
+    path.lineWidth = 1
+    path.stroke()
+  }
+
+  override func mouseEntered(with event: NSEvent) { hovering = true }
+  override func mouseExited(with event: NSEvent) { hovering = false }
+
+  override func mouseDown(with event: NSEvent) {
+    pressed = true
+    // Tracks the press until release, like a button.
+    while let next = window?.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+      let inside = bounds.contains(convert(next.locationInWindow, from: nil))
+      if next.type == .leftMouseUp {
+        pressed = false
+        if inside { sendAction(action, to: target) }
+        return
+      }
+      pressed = inside
+    }
+  }
+
+  override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
 private final class IncognitoBadge: NSView {
   private let stack: NSStackView
 

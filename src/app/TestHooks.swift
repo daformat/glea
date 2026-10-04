@@ -103,6 +103,9 @@ enum TestHooks {
         let owner = window.windowController as! BrowserWindowController
         NSLog("Glea test window: \(window.title) incognito=\(owner.isIncognito) tabs=\(owner.tabs.count) \(owner.tabs.map { URL(string: $0.url)?.host ?? "" }) active=\(owner.activeTab.map { URL(string: $0.url)?.host ?? "" } ?? "-") mode=\(owner.mode) visible=\(window.isVisible) key=\(window.isKeyWindow) field=\(window.firstResponder is NSTextView)")
       }
+    case "update-ready": Updater.shared.simulateReady(argument.isEmpty ? nil : argument)
+    case "update-check-background": Updater.shared.checkInBackground()
+    case "update-install": Updater.shared.installAndRelaunch()
     case "open": controller.openTab(argument)
     case "omnibox":
       controller.showOmnibox(target: .newTab)

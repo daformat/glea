@@ -3,3 +3,4 @@ third_party/cef/
 .DS_Store
 *.xcuserstate
 dist/
+third_party/sparkle/

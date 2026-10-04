@@ -71,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       MainActor.assumeIsolated { self?.controller.chromeOpenedWindow(showing: url) }
     }
     TestHooks.install(controller: controller)
+    Updater.shared.start()
     ActivityLog.shared.startTrackingReading {
       // The key window may be a page's own window, above Glea's.
       var window = NSApp.keyWindow
@@ -149,6 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     let app = submenu(main, "Glea")
     app.addItem(withTitle: "About Glea", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+    app.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "").target = self
     app.addItem(.separator())
     let engines = NSMenu(title: "Search Engine")
     for (index, engine) in SearchEngine.allCases.enumerated() {
@@ -391,6 +393,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     incognito.showWindow(nil)
   }
 
+  @objc private func checkForUpdates(_ sender: Any?) {
+    Updater.shared.checkForUpdates()
+  }
+
   @objc private func setSearchEngine(_ sender: NSMenuItem) {
     SearchEngine.current = SearchEngine.allCases[sender.tag]
   }
@@ -399,6 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     if item.action == #selector(setSearchEngine(_:)) {
       item.state = SearchEngine.allCases[item.tag] == SearchEngine.current ? .on : .off
     }
+    // (Builds that don't update, or a check already running.)
+    if item.action == #selector(checkForUpdates(_:)) { return Updater.shared.canCheckForUpdates }
     return true
   }
 }

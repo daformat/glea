@@ -71,6 +71,13 @@ set_target_properties(SwiftMath PROPERTIES
 )
 target_compile_options(SwiftMath PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:-O>" "$<$<COMPILE_LANGUAGE:Swift>:-suppress-warnings>")
 
+# --- Sparkle (updates; downloaded by scripts/setup_sparkle.sh) ----------------
+
+set(SPARKLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sparkle")
+if(NOT EXISTS "${SPARKLE_DIR}/Sparkle.framework")
+  message(FATAL_ERROR "Sparkle not found. Run ./scripts/setup_sparkle.sh first.")
+endif()
+
 # --- The Swift application ---------------------------------------------------
 
 file(GLOB GLEA_SWIFT_SOURCES CONFIGURE_DEPENDS src/app/*.swift)
@@ -88,9 +95,13 @@ set_target_properties(Glea PROPERTIES
 )
 target_compile_options(Glea PRIVATE
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-I ${BRIDGE_INCLUDE}>"
+  "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-F ${SPARKLE_DIR}>"
   "$<$<COMPILE_LANGUAGE:Swift>:-O>"
 )
 target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+# (swiftc links: linker flags go through -Xlinker.)
+target_link_options(Glea PRIVATE "SHELL:-F ${SPARKLE_DIR}" "SHELL:-framework Sparkle"
+  "SHELL:-Xlinker -rpath -Xlinker @executable_path/../Frameworks")
 add_dependencies(Glea ${GLEA_HELPERS})
 
 # Copy the CEF framework fresh each build. (CEF's COPY_MAC_FRAMEWORK macro uses
@@ -106,6 +117,14 @@ add_custom_command(TARGET Glea POST_BUILD
   COMMAND ln -sfn "Versions/Current/Chromium Embedded Framework" "${CEF_FRAMEWORK_DIR}/Chromium Embedded Framework"
   COMMAND ln -sfn Versions/Current/Libraries "${CEF_FRAMEWORK_DIR}/Libraries"
   COMMAND ln -sfn Versions/Current/Resources "${CEF_FRAMEWORK_DIR}/Resources"
+  VERBATIM)
+# Sparkle, with ditto (it keeps the framework's symlinks). Its XPC services are
+# for sandboxed apps; Glea isn't one.
+set(SPARKLE_FRAMEWORK_DIR "${GLEA_APP}/Contents/Frameworks/Sparkle.framework")
+add_custom_command(TARGET Glea POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${SPARKLE_FRAMEWORK_DIR}"
+  COMMAND ditto "${SPARKLE_DIR}/Sparkle.framework" "${SPARKLE_FRAMEWORK_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${SPARKLE_FRAMEWORK_DIR}/Versions/B/XPCServices" "${SPARKLE_FRAMEWORK_DIR}/XPCServices"
   VERBATIM)
 foreach(_helper_name ${GLEA_HELPER_NAMES})
   add_custom_command(TARGET Glea POST_BUILD
@@ -139,6 +158,9 @@ add_custom_command(TARGET Glea POST_BUILD
   VERBATIM)
 add_custom_command(TARGET Glea POST_BUILD
   COMMAND codesign --force --sign - "${GLEA_APP}/Contents/Frameworks/Chromium Embedded Framework.framework"
+  COMMAND codesign --force --sign - "${SPARKLE_FRAMEWORK_DIR}/Versions/B/Autoupdate"
+  COMMAND codesign --force --sign - "${SPARKLE_FRAMEWORK_DIR}/Versions/B/Updater.app"
+  COMMAND codesign --force --sign - "${SPARKLE_FRAMEWORK_DIR}"
   VERBATIM)
 foreach(_helper_name ${GLEA_HELPER_NAMES})
   add_custom_command(TARGET Glea POST_BUILD
