@@ -172,7 +172,9 @@
     // display:contents keeps the host from creating a stacking context, so the
     // portal's multiply blend mixes with the page itself.
     const host = document.createElement('glea-pns');
-    host.style.cssText = 'display: contents !important;';
+    // all: initial undoes page rules that reach it, like Reddit's
+    // ":not(:defined) { visibility: hidden }" (it's never a defined element).
+    host.style.cssText = 'all: initial !important; display: contents !important;';
     const shadow = host.attachShadow({ mode: 'closed' });
     el('style', null, shadow).textContent = CSS;
     container = el('div', 'root blank', shadow);
@@ -819,6 +821,14 @@
     return src.startsWith('data:') ? src : absolute(src);
   }
 
+  // Shown at 32px or less both ways (or sized so in its attributes, for
+  // selections, which are copies off the page).
+  function isIcon(img) {
+    const width = img.isConnected ? img.width : parseInt(img.getAttribute('width'), 10);
+    const height = img.isConnected ? img.height : parseInt(img.getAttribute('height'), 10);
+    return width > 0 && height > 0 && width <= 32 && height <= 32;
+  }
+
   function escapeText(text) {
     return text.replace(/([\\`*_[\]])/g, '\\$1');
   }
@@ -929,6 +939,8 @@
         return /^!\[/.test(text) ? text : `[${text}](${absolute(href)})`;
       }
       case 'img': {
+        // Icons (portal badges, "source" pens, flags) clutter a note.
+        if (isIcon(node)) return '';
         const src = imageSource(node);
         if (!src) return '';
         const alt = (node.getAttribute('alt') || '').replace(/[\[\]\n]/g, ' ').trim();
