@@ -90,7 +90,7 @@ Modelled on Beam and Kosmik.
 - ⌘S (*Collect Page*) saves the page itself as a link. The page's context menu also offers *Collect Selection* and *Collect Image*.
 
 ### Collecting from other browsers
-[Glea Clipper](https://github.com/daformat/glea-extensions) collects from Chrome, Edge, Arc, Brave, Firefox and Safari. It brings point and shoot (hold ⌥, click or drag), plus the selection, a page's main content as an article, an image or a link. It goes into today's journal, a new note, or Glea's capture picker.
+[Glea Clipper](https://github.com/daformat/glea-extensions) collects from Chrome, Edge, Arc, Brave, Firefox and Safari. Its Safari version comes inside Glea: turn it on in *Safari ▸ Settings ▸ Extensions*. It brings point and shoot (hold ⌥, click or drag), plus the selection, a page's main content as an article, an image or a link. It goes into today's journal, a new note, or Glea's capture picker.
 
 - The extension sends it as a `glea://capture?kind=…&url=…&markdown=…&to=journal` URL, like Obsidian's Web Clipper. Very long captures go through the clipboard instead (`clipboard=1`).
 - If Glea isn't running, macOS launches it. After a capture, focus goes back to the browser unless the extension asked to open the note.
@@ -196,6 +196,8 @@ src/app/               Swift — the app
   SyntaxHighlighter        code block colors, one regex grammar per language
   NoteStore                Markdown files, search, backlinks, rename, captures
   Updater, UpdateWindow    Sparkle updates, the top bar's pill, the update window
+src/clipper/           Glea Clipper for Safari, an app extension in Glea.app/Contents/PlugIns
+                         (its files synced from glea-extensions by scripts/sync_clipper.sh)
   ExternalCapture          glea://capture URLs from the browser extensions
   BrowsingData             history, session, search engines, image cache
 src/resources/content-script.js   point-and-shoot + HTML→Markdown, runs in pages

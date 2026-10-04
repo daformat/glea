@@ -1,0 +1,194 @@
+/* Glea's colors (glea/src/app/Theme.swift). */
+:root {
+  --accent: rgb(84 89 242);
+  --background: #fff;
+  --text: rgb(0 0 0 / 0.85);
+  --secondary: rgb(0 0 0 / 0.5);
+  --separator: rgb(0 0 0 / 0.07);
+  --hover: rgb(0 0 0 / 0.05);
+  --fill: rgb(0 0 0 / 0.04);
+  --accent-wash: rgb(84 89 242 / 0.1);
+  --button: rgb(84 89 242);
+  --segment: #fff;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: rgb(140 148 255);
+    --background: rgb(28 28 31);
+    --text: rgb(255 255 255 / 0.88);
+    --secondary: rgb(255 255 255 / 0.5);
+    --separator: rgb(255 255 255 / 0.08);
+    --hover: rgb(255 255 255 / 0.07);
+    --fill: rgb(0 0 0 / 0.18);
+    --accent-wash: rgb(140 148 255 / 0.14);
+    --button: rgb(94 99 245);
+    --segment: rgb(255 255 255 / 0.13);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  width: 300px;
+  margin: 0;
+  padding: 12px;
+  background: var(--background);
+  color: var(--text);
+  font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--separator);
+}
+
+header img { border-radius: 4px; flex: none; }
+
+.page {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+section { margin-bottom: 12px; }
+
+h2 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--secondary);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out, transform 0.1s ease-in-out;
+}
+
+button:active:not(:disabled) { transform: scale(0.98); }
+
+.choices { display: grid; gap: 4px; }
+
+.choices button {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--separator);
+  text-align: left;
+}
+
+.choices button span { color: var(--secondary); font-size: 12px; }
+.choices button:hover:not(:disabled) { background: var(--hover); }
+.choices button[aria-checked="true"] {
+  background: var(--accent-wash);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.choices button:disabled { opacity: 0.4; cursor: default; }
+
+.segmented {
+  display: flex;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--separator);
+}
+
+.segmented button {
+  flex: 1;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.segmented button:hover { background: var(--hover); }
+.segmented button[aria-checked="true"] {
+  background: var(--segment);
+  box-shadow: 0 0 0 1px var(--separator), 0 1px 2px rgb(0 0 0 / 0.12);
+  font-weight: 600;
+}
+
+input[type="text"] {
+  width: 100%;
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--separator);
+  color: inherit;
+  font: inherit;
+  outline: none;
+}
+
+input[type="text"]:focus { box-shadow: inset 0 0 0 1.5px var(--accent); }
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+  color: var(--secondary);
+  cursor: pointer;
+}
+
+.check input { accent-color: var(--accent); margin: 0; }
+
+.primary {
+  width: 100%;
+  padding: 7px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--button);
+  color: #fff;
+  font-weight: 600;
+}
+
+.primary:hover:not(:disabled) { filter: brightness(1.06); }
+.primary:disabled { opacity: 0.5; cursor: default; }
+
+#status {
+  min-height: 1em;
+  margin: 8px 0 0;
+  font-size: 12px;
+  text-align: center;
+  color: var(--secondary);
+}
+
+#status.error { color: rgb(220 60 60); }
+
+.tip {
+  margin: 6px 0 0;
+  padding-top: 10px;
+  border-top: 1px solid var(--separator);
+  font-size: 12px;
+  text-align: center;
+  color: var(--secondary);
+}
+
+kbd {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--separator);
+  font: inherit;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button { transition: none; }
+  button:active:not(:disabled) { transform: none; }
+}

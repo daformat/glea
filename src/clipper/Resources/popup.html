@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width">
+  <title>Glea Clipper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon-32.png" width="18" height="18" alt="">
+    <span class="page" id="page-title">This page</span>
+  </header>
+
+  <section>
+    <h2>Collect</h2>
+    <div class="choices" role="radiogroup" id="what">
+      <button role="radio" data-what="selection" disabled>
+        <strong>Selection</strong><span>The highlighted text</span>
+      </button>
+      <button role="radio" data-what="article">
+        <strong>Article</strong><span>The page’s main content</span>
+      </button>
+      <button role="radio" data-what="page">
+        <strong>Link</strong><span>Just the page’s address</span>
+      </button>
+    </div>
+  </section>
+
+  <section>
+    <h2>Into</h2>
+    <div class="segmented" role="radiogroup" id="to">
+      <button role="radio" data-to="journal">Today</button>
+      <button role="radio" data-to="note">New note</button>
+      <button role="radio" data-to="ask">Choose in Glea</button>
+    </div>
+    <input id="note-name" type="text" placeholder="Note name" spellcheck="false" hidden>
+  </section>
+
+  <label class="check">
+    <input id="open" type="checkbox"> Open Glea afterwards
+  </label>
+
+  <button id="collect" class="primary">Collect</button>
+  <p id="status" role="status"></p>
+  <p class="tip">Hold <kbd>⌥</kbd> on a page to point and shoot</p>
+
+  <script src="popup.js"></script>
+</body>
+</html>

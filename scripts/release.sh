@@ -75,6 +75,8 @@ SPARKLE="$APP/Contents/Frameworks/Sparkle.framework"
 sign "$SPARKLE/Versions/B/Autoupdate"
 sign "$SPARKLE/Versions/B/Updater.app"
 sign "$SPARKLE"
+# Glea Clipper for Safari: sandboxed, as Safari requires of web extensions.
+sign --entitlements "$ENT/clipper.plist" "$APP/Contents/PlugIns/Glea Clipper.appex"
 sign --entitlements "$ENT/app.plist" "$APP"
 
 codesign --verify --deep --strict --verbose=2 "$APP"

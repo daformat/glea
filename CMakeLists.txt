@@ -86,6 +86,36 @@ if(NOT EXISTS "${SPARKLE_DIR}/Sparkle.framework")
   message(FATAL_ERROR "Sparkle not found. Run ./scripts/setup_sparkle.sh first.")
 endif()
 
+# --- Glea Clipper for Safari (an app extension embedded in Glea) -------------
+#
+# The browser extension's files (src/clipper/Resources, synced from
+# glea-extensions by scripts/sync_clipper.sh) in a sandboxed .appex, plus
+# Glea's own point-and-shoot script. Safari lists it once Glea has run.
+
+set(CLIPPER_APPEX "${CMAKE_CURRENT_BINARY_DIR}/Glea Clipper.appex")
+configure_file(src/clipper/Info.plist.in "${CMAKE_CURRENT_BINARY_DIR}/Clipper-Info.plist" @ONLY)
+add_executable(GleaClipper src/clipper/SafariWebExtensionHandler.swift)
+set_target_properties(GleaClipper PROPERTIES
+  Swift_MODULE_NAME GleaClipper
+  Swift_LANGUAGE_VERSION 5
+  OUTPUT_NAME "Glea Clipper"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/clipper"
+)
+target_compile_options(GleaClipper PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:-O>" "$<$<COMPILE_LANGUAGE:Swift>:-application-extension>")
+# An app extension starts in NSExtensionMain, not main.
+target_link_options(GleaClipper PRIVATE "SHELL:-Xlinker -e -Xlinker _NSExtensionMain"
+  "SHELL:-application-extension" "SHELL:-framework SafariServices")
+file(GLOB_RECURSE CLIPPER_RESOURCES CONFIGURE_DEPENDS src/clipper/Resources/*)
+add_custom_command(TARGET GleaClipper POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${CLIPPER_APPEX}"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${CLIPPER_APPEX}/Contents/MacOS"
+  COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:GleaClipper>" "${CLIPPER_APPEX}/Contents/MacOS/Glea Clipper"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_BINARY_DIR}/Clipper-Info.plist" "${CLIPPER_APPEX}/Contents/Info.plist"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/src/clipper/Resources" "${CLIPPER_APPEX}/Contents/Resources"
+  COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/content-script.js"
+          "${CLIPPER_APPEX}/Contents/Resources/vendor/glea-content-script.js"
+  VERBATIM)
+
 # --- The Swift application ---------------------------------------------------
 
 file(GLOB GLEA_SWIFT_SOURCES CONFIGURE_DEPENDS src/app/*.swift)
@@ -110,7 +140,7 @@ target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CE
 # (swiftc links: linker flags go through -Xlinker.)
 target_link_options(Glea PRIVATE "SHELL:-F ${SPARKLE_DIR}" "SHELL:-framework Sparkle"
   "SHELL:-Xlinker -rpath -Xlinker @executable_path/../Frameworks")
-add_dependencies(Glea ${GLEA_HELPERS})
+add_dependencies(Glea ${GLEA_HELPERS} GleaClipper)
 
 # Copy the CEF framework fresh each build. (CEF's COPY_MAC_FRAMEWORK macro uses
 # `ln -sf`, which on rebuilds follows the existing directory symlinks and
@@ -133,6 +163,11 @@ add_custom_command(TARGET Glea POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E rm -rf "${SPARKLE_FRAMEWORK_DIR}"
   COMMAND ditto "${SPARKLE_DIR}/Sparkle.framework" "${SPARKLE_FRAMEWORK_DIR}"
   COMMAND ${CMAKE_COMMAND} -E rm -rf "${SPARKLE_FRAMEWORK_DIR}/Versions/B/XPCServices" "${SPARKLE_FRAMEWORK_DIR}/XPCServices"
+  VERBATIM)
+add_custom_command(TARGET Glea POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E rm -rf "${GLEA_APP}/Contents/PlugIns/Glea Clipper.appex"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${GLEA_APP}/Contents/PlugIns"
+  COMMAND ditto "${CLIPPER_APPEX}" "${GLEA_APP}/Contents/PlugIns/Glea Clipper.appex"
   VERBATIM)
 foreach(_helper_name ${GLEA_HELPER_NAMES})
   add_custom_command(TARGET Glea POST_BUILD
@@ -176,5 +211,7 @@ foreach(_helper_name ${GLEA_HELPER_NAMES})
     VERBATIM)
 endforeach()
 add_custom_command(TARGET Glea POST_BUILD
+  COMMAND codesign --force --sign - --entitlements "${CMAKE_CURRENT_SOURCE_DIR}/src/mac/entitlements/clipper.plist"
+          "${GLEA_APP}/Contents/PlugIns/Glea Clipper.appex"
   COMMAND codesign --force --sign - "${GLEA_APP}"
   VERBATIM)
