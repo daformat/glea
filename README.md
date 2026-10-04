@@ -90,7 +90,7 @@ Modelled on Beam and Kosmik.
 - ⌘S (*Collect Page*) saves the page itself as a link. The page's context menu also offers *Collect Selection* and *Collect Image*.
 
 ### Collecting from other browsers
-Glea Clipper, in `../glea-extensions`, collects from Chrome, Edge, Arc, Brave, Firefox and Safari. It brings point and shoot (hold ⌥, click or drag), plus the selection, a page's main content as an article, an image or a link. It goes into today's journal, a new note, or Glea's capture picker.
+[Glea Clipper](https://github.com/daformat/glea-extensions) collects from Chrome, Edge, Arc, Brave, Firefox and Safari. It brings point and shoot (hold ⌥, click or drag), plus the selection, a page's main content as an article, an image or a link. It goes into today's journal, a new note, or Glea's capture picker.
 
 - The extension sends it as a `glea://capture?kind=…&url=…&markdown=…&to=journal` URL, like Obsidian's Web Clipper. Very long captures go through the clipboard instead (`clipboard=1`).
 - If Glea isn't running, macOS launches it. After a capture, focus goes back to the browser unless the extension asked to open the note.
