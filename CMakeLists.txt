@@ -4,7 +4,15 @@ cmake_minimum_required(VERSION 3.21)
 set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 set(CMAKE_CONFIGURATION_TYPES Release CACHE STRING "Configurations" FORCE)
 
-project(Glea VERSION 0.14.0 LANGUAGES C CXX Swift)
+project(Glea VERSION 0.15.0 LANGUAGES C CXX Swift)
+# Shown after the version (About, the update window): "0.15.0 Beta". The build
+# number Sparkle compares (CFBundleVersion) is the plain version.
+set(GLEA_VERSION_LABEL "Beta")
+if(GLEA_VERSION_LABEL)
+  set(GLEA_DISPLAY_VERSION "${PROJECT_VERSION} ${GLEA_VERSION_LABEL}")
+else()
+  set(GLEA_DISPLAY_VERSION "${PROJECT_VERSION}")
+endif()
 
 set(CEF_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cef")
 if(NOT EXISTS "${CEF_ROOT}/cmake/FindCEF.cmake")

@@ -5,7 +5,8 @@
 # release of daformat/glea, whose latest appcast glea.app/appcast.xml
 # serves (Updater.swift). GLEA_PUBLISH=0 stops before publishing.
 #
-# Release notes are the body of the "Glea <version>" commit (its "- " items).
+# Release notes are the body of the "Glea <shown version>" commit (its "- "
+# items), e.g. "Glea 0.15.0 Beta".
 # The appcast is signed with the Sparkle key in the login keychain (account
 # "glea", made by third_party/sparkle/bin/generate_keys - -account glea).
 #
@@ -44,7 +45,10 @@ echo "Signing as: $IDENTITY"
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release >/dev/null
 ninja -C build
 
-VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/Glea.app/Contents/Info.plist)
+# The build number names files and the tag ("0.15.0"); the version shown in
+# the app titles the release ("0.15.0 Beta").
+VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleVersion" build/Glea.app/Contents/Info.plist)
+DISPLAY_VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" build/Glea.app/Contents/Info.plist)
 DIST=$ROOT/dist
 APP=$DIST/Glea.app
 # (Finder may recreate .DS_Store while the folder is being deleted.)
@@ -177,8 +181,8 @@ TAG="v$VERSION"
 FEED=$DIST/feed
 rm -rf "$FEED"; mkdir -p "$FEED"
 cp "$ZIP" "$FEED/"
-NOTES_COMMIT=$(git log -1 --format=%H --grep="^Glea $VERSION\$")
-[ -n "$NOTES_COMMIT" ] || { echo "No \"Glea $VERSION\" commit for the release notes." >&2; exit 1; }
+NOTES_COMMIT=$(git log -1 --format=%H --grep="^Glea $DISPLAY_VERSION\$")
+[ -n "$NOTES_COMMIT" ] || { echo "No \"Glea $DISPLAY_VERSION\" commit for the release notes." >&2; exit 1; }
 git log -1 --format=%b "$NOTES_COMMIT" | python3 -c '
 import html, re, sys
 version = sys.argv[1]
@@ -196,7 +200,7 @@ def render(text):
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", text)
 print("<h2>Glea %s</h2>" % version)
 print("<ul>" + "".join("<li>%s</li>" % render(" ".join(i)) for i in items) + "</ul>")
-' "$VERSION" > "$FEED/Glea-$VERSION.html"
+' "$DISPLAY_VERSION" > "$FEED/Glea-$VERSION.html"
 if gh release download -R "$REPO" -p appcast.xml -D "$FEED" 2>/dev/null; then
   echo "Previous appcast: $(grep -c '<item>' "$FEED/appcast.xml") entries"
 else
@@ -215,11 +219,11 @@ cp "$DMG" "$STABLE_DMG"
 # The tag first, on the release commit and pushed with it: the appcast points
 # at a URL with the tag's name in it.
 git push origin "$NOTES_COMMIT:refs/heads/main" 2>/dev/null || git push origin HEAD:main
-git tag -a "$TAG" -m "Glea $VERSION" "$NOTES_COMMIT" 2>/dev/null || echo "Tag $TAG already exists."
+git tag -a "$TAG" -m "Glea $DISPLAY_VERSION" "$NOTES_COMMIT" 2>/dev/null || echo "Tag $TAG already exists."
 git push origin "$TAG"
 NOTES_MD=$DIST/notes.md
 git log -1 --format=%b "$NOTES_COMMIT" | sed '/^Co-Authored-By:/,$d' > "$NOTES_MD"
-gh release create "$TAG" -R "$REPO" --draft --verify-tag --title "Glea $VERSION" --notes-file "$NOTES_MD" \
+gh release create "$TAG" -R "$REPO" --draft --verify-tag --title "Glea $DISPLAY_VERSION" --notes-file "$NOTES_MD" \
   "$STABLE_DMG" "$DMG" "$ZIP" "$FEED/appcast.xml"
 ASSETS=$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name')
 for want in Glea.dmg "Glea-$VERSION.dmg" "Glea-$VERSION.zip" appcast.xml; do
