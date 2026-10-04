@@ -9,6 +9,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   /// Regular windows besides the main one (⌘N on the web).
   private var extraControllers: [BrowserWindowController] = []
   private var pendingURLs: [URL] = []
+  private var pendingCaptures: [(ExternalCapture, returnFocus: Bool)] = []
+  /// The last other app in front, given focus back after a capture sent
+  /// from it (see `ExternalCapture`), and since when Glea has been in front.
+  private var previousApp: NSRunningApplication?
+  private var activeSince: Date?
 
   /// The window in front: the main one, an extra or an incognito one.
   /// (Pages and overlays are child windows of theirs.)
@@ -19,6 +24,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
       window = current.parent
     }
     return controller
+  }
+
+  func applicationWillFinishLaunching(_ notification: Notification) {
+    // Launched by a capture: the browser it came from is still in front.
+    if let front = NSWorkspace.shared.frontmostApplication, front != .current { previousApp = front }
+    NSWorkspace.shared.notificationCenter.addObserver(
+      forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+    ) { [weak self] note in
+      guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+            app != .current else { return }
+      MainActor.assumeIsolated { self?.previousApp = app }
+    }
   }
 
   func applicationDidFinishLaunching(_ notification: Notification) {
@@ -66,22 +83,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     for url in pendingURLs { controller.openTab(url.absoluteString) }
     pendingURLs = []
+    for (capture, returnFocus) in pendingCaptures { collect(capture, returnFocus: returnFocus) }
+    pendingCaptures = []
 
     // Testing hook: open a URL at launch without touching the saved session.
     if let url = ProcessInfo.processInfo.environment["GLEA_OPEN_URL"] { controller.openTab(url) }
   }
 
   func application(_ application: NSApplication, open urls: [URL]) {
+    let captures = urls.filter { $0.scheme?.lowercased() == ExternalCapture.scheme }
+    let pages = urls.filter { $0.scheme?.lowercased() != ExternalCapture.scheme }
+    // Glea was brought forward to take it (not in use already): the browser
+    // gets focus back afterwards.
+    let returnFocus = activeSince.map { Date().timeIntervalSince($0) < 1.5 } ?? true
+    for url in captures {
+      guard let capture = ExternalCapture(url: url) else {
+        NSLog("Glea: ignored capture URL \(url.absoluteString.prefix(200))")
+        continue
+      }
+      if controller == nil { pendingCaptures.append((capture, returnFocus)) } else { collect(capture, returnFocus: returnFocus) }
+    }
+    guard !pages.isEmpty else { return }
     guard let controller else {
-      pendingURLs += urls
+      pendingURLs += pages
       return
     }
     reopenMain()
-    for url in urls { controller.openTab(url.absoluteString) }
+    for url in pages { controller.openTab(url.absoluteString) }
+  }
+
+  /// Collects a capture sent by a browser extension, asking where with the
+  /// capture picker in the main window if it didn't say.
+  private func collect(_ external: ExternalCapture, returnFocus: Bool) {
+    let target = external.resolvedTarget()
+    if target == nil || external.reveal { reopenMain() }
+    let browser = previousApp
+    controller.collectFromOutside(external.capture, into: target, reveal: external.reveal) { ref in
+      guard returnFocus, !(external.reveal && ref != nil) else { return }
+      browser?.activate(options: [])
+    }
   }
 
   func applicationDidBecomeActive(_ notification: Notification) {
+    activeSince = Date()
     controller?.dayMayHaveChanged()
+  }
+
+  func applicationDidResignActive(_ notification: Notification) {
+    activeSince = nil
   }
 
   /// ⌘W on the main window without tabs only closes it: Glea keeps running.

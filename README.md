@@ -85,6 +85,15 @@ Modelled on Beam and Kosmik.
 - Each capture is appended as a quote with a link back to the source page.
 - ⌘S (*Collect Page*) saves the page itself as a link. The page's context menu also offers *Collect Selection* and *Collect Image*.
 
+### Collecting from other browsers
+Glea Clipper, in `../glea-extensions`, collects from Chrome, Edge, Arc, Brave, Firefox and Safari. It brings point and shoot (hold ⌥, click or drag), plus the selection, a page's main content as an article, an image or a link. It goes into today's journal, a new note, or Glea's capture picker.
+
+- The extension sends it as a `glea://capture?kind=…&url=…&markdown=…&to=journal` URL, like Obsidian's Web Clipper. Very long captures go through the clipboard instead (`clipboard=1`).
+- If Glea isn't running, macOS launches it. After a capture, focus goes back to the browser unless the extension asked to open the note.
+- Point and shoot there runs Glea's own `content-script.js`. The extension takes the app's part: it watches the ⌥ key and takes the screenshots for dragged areas.
+- Captures are formatted and their images downloaded like point-and-shoot's. Images inlined as data URLs, such as those screenshots, are saved into `assets/` too. A clipped article becomes the body under a link to its source.
+- Any page can open a `glea://` URL (the browser asks first), so these captures only ever append, and only from `http` and `https` sources.
+
 ### Table of contents
 Notes and the journal have a scroll-aware table of contents in the left margin, after [hello-mat.com's component](https://hello-mat.com/design-engineering/table-of-contents).
 
@@ -176,6 +185,7 @@ src/app/               Swift — the app
   MarkdownEditor           live-preview editor (TextKit 1, custom layout manager)
   SyntaxHighlighter        code block colors, one regex grammar per language
   NoteStore                Markdown files, search, backlinks, rename, captures
+  ExternalCapture          glea://capture URLs from the browser extensions
   BrowsingData             history, session, search engines, image cache
 src/resources/content-script.js   point-and-shoot + HTML→Markdown, runs in pages
 ```

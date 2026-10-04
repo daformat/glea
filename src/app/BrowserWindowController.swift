@@ -1792,7 +1792,31 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if ref == NoteStore.shared.today { showJournal(nil) } else { openNote(ref) }
   }
 
-  private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from tab: Tab) {
+  /// A capture from another browser (`ExternalCapture`): into `ref`, or
+  /// through the capture picker when nil. `chosen` runs once its note is
+  /// known (nil: the picker was dismissed); `reveal` then shows the note.
+  func collectFromOutside(_ capture: Capture, into ref: NoteRef?, reveal: Bool,
+                          chosen: @escaping (NoteRef?) -> Void) {
+    let collect = { [weak self] (ref: NoteRef) in
+      self?.lastCaptureTarget = ref
+      chosen(ref)
+      NoteStore.shared.collect(capture, into: ref) {
+        guard let self else { return }
+        if reveal {
+          self.openCollected(ref)
+        } else {
+          let name = ref == NoteStore.shared.today ? "Today" : ref.displayTitle
+          self.toast.show("Collected to", linkTitle: name) { [weak self] in self?.openCollected(ref) }
+        }
+      }
+    }
+    if let ref { return collect(ref) }
+    showCapturePanel(capture, anchorInWindow: nil, from: nil, onDismiss: { chosen(nil) }, onCollect: collect)
+  }
+
+  /// `onCollect` replaces collecting into the chosen note (and its toast).
+  private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from tab: Tab?,
+                                onDismiss: (() -> Void)? = nil, onCollect: ((NoteRef) -> Void)? = nil) {
     let root = rootView
     var anchor = NSRect(x: root.bounds.midX - 170, y: Theme.topBarHeight + 8, width: 0, height: 0)
     if let rect = anchorInWindow {
@@ -1803,10 +1827,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     panel.onDismiss = { [weak self] in
       self?.releasePendingCapture()
       self?.dismissOverlay()
+      onDismiss?()
     }
     panel.onCollect = { [weak self, weak tab] ref in
       guard let self else { return }
       self.captureTab = nil
+      if let onCollect {
+        self.dismissOverlay()
+        return onCollect(ref)
+      }
       self.lastCaptureTarget = ref
       self.dismissOverlay()
       let name = ref == NoteStore.shared.today ? "Today" : ref.displayTitle

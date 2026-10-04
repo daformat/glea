@@ -32,10 +32,12 @@ extension Notification.Name {
   static let notesDidChange = Notification.Name("GleaNotesDidChange")
 }
 
-/// Content collected from a web page with point-and-shoot or the context menu.
+/// Content collected from a web page with point-and-shoot, the context menu
+/// or a browser extension (see `ExternalCapture`).
 struct Capture {
   enum Kind: String {
-    case element, selection, image, page
+    /// `article`: a whole page's main content, clipped by an extension.
+    case element, selection, image, page, article
   }
 
   var kind: Kind
@@ -775,7 +777,7 @@ final class NoteStore {
       }
     }
     let imageRegex = try! NSRegularExpression(pattern: "!\\[([^\\]]*)\\]\\((https?://[^)\\s]+)\\)")
-    let markdown = capture.markdown
+    let markdown = storingInlineImages(capture.markdown)
     let matches = imageRegex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown))
     let remoteURLs = Set(matches.compactMap { Range($0.range(at: 2), in: markdown).map { String(markdown[$0]) } })
 
@@ -801,6 +803,23 @@ final class NoteStore {
       ActivityLog.shared.collected(into: ref)
       completion()
     }
+  }
+
+  /// Images inlined as data URLs (screenshots from the browser extensions,
+  /// small images on pages) become files in assets/.
+  private func storingInlineImages(_ markdown: String) -> String {
+    guard markdown.contains("](data:image/") else { return markdown }
+    let regex = try! NSRegularExpression(pattern: "\\]\\(data:image/(png|jpeg|gif|webp);base64,([A-Za-z0-9+/=]+)\\)")
+    var result = markdown
+    for match in regex.matches(in: markdown, range: NSRange(markdown.startIndex..., in: markdown)).reversed() {
+      guard let type = Range(match.range(at: 1), in: markdown), let payload = Range(match.range(at: 2), in: markdown),
+            let whole = Range(match.range, in: result),
+            let data = Data(base64Encoded: String(markdown[payload])),
+            let path = saveImageAsset(data: data, fileExtension: markdown[type] == "jpeg" ? "jpg" : String(markdown[type]))
+      else { continue }
+      result.replaceSubrange(whole, with: "](\(path))")
+    }
+    return result
   }
 
   private func downloadAsset(_ url: URL, completion: @escaping (String?) -> Void) {
@@ -849,6 +868,8 @@ final class NoteStore {
       .replacingOccurrences(of: ")", with: "%29")
     let source = "[\(title)](\(url))"
     if capture.kind == .page { return "- \(source)" }
+    // A clipped article stands as itself (quoting it all would bury it), its source above.
+    if capture.kind == .article { return "\(source)\n\n\(body.trimmingCharacters(in: .whitespacesAndNewlines))" }
 
     // A lone image or video, or a post or video the notes embed (its bare
     // address), stands as a media block, credited below.
