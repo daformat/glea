@@ -1942,6 +1942,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   func topBarGoForward() { goForward(nil) }
   func topBarReload() { reload(nil) }
   func topBarSearch() { showOmnibox(target: .newTab) }
+  func topBarNewNote() { newNote(nil) }
   func topBarToggleMode() { toggleJournal(nil) }
 
   // MARK: Session

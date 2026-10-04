@@ -361,7 +361,14 @@ final class NoteStore {
       }.map { $0.trimmingCharacters(in: .whitespaces) }
       if !lines.isEmpty { result.append((other, lines)) }
     }
-    return result.sorted { ($0.0.kind == .journal ? $0.0.name : "~" + $0.0.name) > ($1.0.kind == .journal ? $1.0.name : "~" + $1.0.name) }
+    // Notes A to Z, then days newest first.
+    return result.sorted { a, b in
+      switch (a.0.kind == .journal, b.0.kind == .journal) {
+      case (false, false): return a.0.name.localizedStandardCompare(b.0.name) == .orderedAscending
+      case (true, true): return a.0.name > b.0.name
+      case (let aIsDay, _): return !aIsDay
+      }
+    }
   }
 
   /// A place where a note's name appears as plain text, not as a link.

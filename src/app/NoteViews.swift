@@ -326,6 +326,20 @@ final class HoverView: NSView {
   override func mouseEntered(with event: NSEvent) { hovering = true }
   override func mouseExited(with event: NSEvent) { hovering = false }
 
+  /// Tracks the pointer over `view` from behind it, leaving its clicks to it.
+  @discardableResult
+  static func track(_ view: NSView, onHover: @escaping (Bool) -> Void) -> HoverView {
+    let area = HoverView()
+    area.passesClicks = true
+    area.onHover = onHover
+    view.addSubview(area, positioned: .below, relativeTo: nil)
+    area.pinEdges(to: view)
+    return area
+  }
+
+  private var passesClicks = false
+  override func hitTest(_ point: NSPoint) -> NSView? { passesClicks ? nil : super.hitTest(point) }
+
   /// For automated checks: the pointer as if over it or not.
   func debugSetHovering(_ value: Bool) { hovering = value }
 
@@ -367,8 +381,6 @@ extension NSView {
 final class QuietButton: NSView {
   var onClick: (() -> Void)?
   private let label: NSTextField
-  private var tracking: NSTrackingArea?
-  private var hovering = false { didSet { label.textColor = hovering ? Theme.text : Theme.tertiaryText } }
 
   init(title: String) {
     label = NSTextField.label(title, size: 12, weight: .regular, color: Theme.tertiaryText)
@@ -376,6 +388,9 @@ final class QuietButton: NSView {
     translatesAutoresizingMaskIntoConstraints = false
     addSubview(label)
     label.pinEdges(to: self, insets: NSEdgeInsets(top: 3, left: 4, bottom: 3, right: 4))
+    // A hover view rather than its own tracking area: it also lets go when
+    // the page scrolls out from under a still pointer.
+    HoverView.track(self) { [weak label] hovering in label?.textColor = hovering ? Theme.text : Theme.tertiaryText }
     setAccessibilityRole(.button)
     setAccessibilityLabel(title)
   }
@@ -385,16 +400,6 @@ final class QuietButton: NSView {
   /// Its label's baseline, to line it up with the text it acts on.
   override var firstBaselineOffsetFromTop: CGFloat { 3 + label.firstBaselineOffsetFromTop }
 
-  override func updateTrackingAreas() {
-    super.updateTrackingAreas()
-    if let tracking { removeTrackingArea(tracking) }
-    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
-    addTrackingArea(area)
-    tracking = area
-  }
-
-  override func mouseEntered(with event: NSEvent) { hovering = true }
-  override func mouseExited(with event: NSEvent) { hovering = false }
   override func mouseDown(with event: NSEvent) {}
   override func mouseUp(with event: NSEvent) {
     // Once the click is over: what it does may remove this button.
@@ -871,8 +876,9 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     }
     unlinkedLinkAll.alphaValue = 0
     unlinkedLinkAll.isHidden = true
-    let headerRow = HoverView()
-    headerRow.onHover = { [weak self] hovering in self?.unlinkedLinkAll.fade(in: hovering) }
+    // Shows while the pointer is anywhere over the section.
+    HoverView.track(unlinked) { [weak self] hovering in self?.unlinkedLinkAll.fade(in: hovering) }
+    let headerRow = NSView()
     headerRow.translatesAutoresizingMaskIntoConstraints = false
     headerRow.addSubview(unlinkedHeader)
     headerRow.addSubview(unlinkedLinkAll)
@@ -886,7 +892,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
     unlinkedBody.orientation = .vertical
     unlinkedBody.alignment = .leading
-    unlinkedBody.spacing = 10
+    unlinkedBody.spacing = 18
     unlinkedBody.translatesAutoresizingMaskIntoConstraints = false
     unlinkedClip.wantsLayer = true
     unlinkedClip.layer?.masksToBounds = true
@@ -920,28 +926,10 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     let count = sources.reduce(0) { $0 + $1.mentions.count }
     unlinkedHeader.title = "\(count) unlinked reference\(count == 1 ? "" : "s")".uppercased()
     for source in sources {
-      let title = LinkLabel(source.ref.displayTitle, size: 14, weight: .semibold, color: Theme.accent)
-      title.onClick = { [weak self] in self?.navigator?.openNote(source.ref) }
-      unlinkedBody.addArrangedSubview(title)
-      unlinkedBody.setCustomSpacing(4, after: title)
-      let shown = source.mentions.prefix(5)
-      for mention in shown {
-        let row = mentionRow(mention) { [weak self] in
-          guard let ref = self?.ref else { return }
-          MarkdownEditorView.flushAll()
-          NoteStore.shared.link([mention], in: source.ref, to: ref)
-        }
-        unlinkedBody.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: unlinkedBody.widthAnchor).isActive = true
-        unlinkedBody.setCustomSpacing(4, after: row)
-      }
-      if source.mentions.count > shown.count {
-        let more = NSTextField.label("\(source.mentions.count - shown.count) more", size: 12, color: Theme.tertiaryText)
-        unlinkedBody.addArrangedSubview(more)
-      }
-      if let last = unlinkedBody.arrangedSubviews.last { unlinkedBody.setCustomSpacing(18, after: last) }
+      let block = unlinkedSource(source)
+      unlinkedBody.addArrangedSubview(block)
+      block.widthAnchor.constraint(equalTo: unlinkedBody.widthAnchor).isActive = true
     }
-    if let last = unlinkedBody.arrangedSubviews.last { unlinkedBody.setCustomSpacing(0, after: last) }
     // A fold under way keeps going, to the body's new height.
     if unlinkedFold != nil { applyUnlinkedShown(unlinkedShown) }
   }
@@ -995,7 +983,55 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
   /// The mention's line (around it, when long), the name in bold, and a
   /// Link button on the right while it's hovered.
-  private func mentionRow(_ mention: NoteStore.Mention, onLink: @escaping () -> Void) -> NSView {
+  /// One note's unlinked mentions under its title, with a button on the
+  /// title line that links them all, shown while the pointer is over the block.
+  private func unlinkedSource(_ source: (ref: NoteRef, mentions: [NoteStore.Mention])) -> NSView {
+    let block = NSStackView()
+    block.orientation = .vertical
+    block.alignment = .leading
+    block.spacing = 4
+    block.translatesAutoresizingMaskIntoConstraints = false
+
+    let title = LinkLabel(source.ref.displayTitle, size: 14, weight: .semibold, color: Theme.accent)
+    title.onClick = { [weak self] in self?.navigator?.openNote(source.ref) }
+    let button = QuietButton(title: "Link")
+    button.onClick = { [weak self] in
+      guard let ref = self?.ref else { return }
+      MarkdownEditorView.flushAll()
+      NoteStore.shared.link(source.mentions, in: source.ref, to: ref)
+    }
+    button.alphaValue = 0
+    button.isHidden = true
+    let titleRow = NSView()
+    titleRow.translatesAutoresizingMaskIntoConstraints = false
+    titleRow.addSubview(title)
+    titleRow.addSubview(button)
+    NSLayoutConstraint.activate([
+      title.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
+      title.topAnchor.constraint(equalTo: titleRow.topAnchor),
+      title.bottomAnchor.constraint(equalTo: titleRow.bottomAnchor),
+      title.trailingAnchor.constraint(lessThanOrEqualTo: button.leadingAnchor, constant: -12),
+      button.trailingAnchor.constraint(equalTo: titleRow.trailingAnchor, constant: 4),
+      button.firstBaselineAnchor.constraint(equalTo: title.firstBaselineAnchor),
+    ])
+    block.addArrangedSubview(titleRow)
+    titleRow.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
+
+    let shown = source.mentions.prefix(5)
+    for mention in shown {
+      let row = mentionRow(mention)
+      block.addArrangedSubview(row)
+      row.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
+    }
+    if source.mentions.count > shown.count {
+      let more = NSTextField.label("\(source.mentions.count - shown.count) more", size: 12, color: Theme.tertiaryText)
+      block.addArrangedSubview(more)
+    }
+    HoverView.track(block) { [weak button] hovering in button?.fade(in: hovering) }
+    return block
+  }
+
+  private func mentionRow(_ mention: NoteStore.Mention) -> NSView {
     var line = mention.line as NSString
     var match = mention.rangeInLine
     if line.length > 240 {
@@ -1016,24 +1052,14 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     label.attributedStringValue = text
     label.translatesAutoresizingMaskIntoConstraints = false
     label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-    let button = QuietButton(title: "Link")
-    button.onClick = onLink
-    // Shows while the pointer is over its mention.
-    button.alphaValue = 0
-    button.isHidden = true
-    let row = HoverView()
-    row.onHover = { [weak button] hovering in button?.fade(in: hovering) }
+    let row = NSView()
     row.translatesAutoresizingMaskIntoConstraints = false
     row.addSubview(label)
-    row.addSubview(button)
     NSLayoutConstraint.activate([
       label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
       label.topAnchor.constraint(equalTo: row.topAnchor, constant: 3),
-      label.bottomAnchor.constraint(lessThanOrEqualTo: row.bottomAnchor, constant: -3),
-      label.trailingAnchor.constraint(lessThanOrEqualTo: button.leadingAnchor, constant: -12),
-      button.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: 4),
-      button.firstBaselineAnchor.constraint(equalTo: label.firstBaselineAnchor),
+      label.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3),
+      label.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
     ])
     return row
   }

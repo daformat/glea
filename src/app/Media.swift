@@ -1690,6 +1690,17 @@ final class MediaToggleButton: NSView {
   override func mouseEntered(with event: NSEvent) { hovering = true }
   override func mouseExited(with event: NSEvent) { hovering = false }
 
+  /// The page scrolled under a still pointer (no enter or exit events).
+  private var scrollWatch: NSObjectProtocol?
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    scrollWatch = watchScrolling(replacing: scrollWatch) { [weak self] in
+      guard let self else { return }
+      guard let window = self.window, !self.isHiddenOrHasHiddenAncestor else { return self.hovering = false }
+      self.hovering = self.bounds.intersection(self.visibleRect).contains(self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+  }
+
   required init?(coder: NSCoder) { fatalError() }
 
   private func update() {

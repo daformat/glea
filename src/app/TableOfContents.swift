@@ -446,8 +446,16 @@ final class TableOfContentsView: NSView {
     setHover(expanded: false, index: nil)
   }
 
-  private func trackMouse(_ event: NSEvent) {
-    let point = convert(event.locationInWindow, from: nil)
+  private func trackMouse(_ event: NSEvent) { trackPointer(at: event.locationInWindow) }
+
+  private func syncHoverWithPointer() {
+    guard expanded, let window else { return }
+    let pointer = window.mouseLocationOutsideOfEventStream
+    if bounds.contains(convert(pointer, from: nil)) { trackPointer(at: pointer) } else { setHover(expanded: false, index: nil) }
+  }
+
+  private func trackPointer(at windowPoint: NSPoint) {
+    let point = convert(windowPoint, from: nil)
     let edge = NSRect(x: 0, y: 0, width: 10, height: bounds.height)
     let inside = listRect.contains(point) || (edge.contains(point) && !expanded)
     let row = Int(floor((point.y - listTop) / rowHeight))
@@ -492,7 +500,12 @@ final class TableOfContentsView: NSView {
     CATransaction.setDisableActions(duration == 0 || Motion.reduceMotion)
     CATransaction.setAnimationDuration(duration)
     CATransaction.setAnimationTimingFunction(Motion.easeOut)
-    CATransaction.setCompletionBlock(completion)
+    // Rows moved under a still pointer (a bounce settling, no wheel event):
+    // the hover follows once they're in place.
+    CATransaction.setCompletionBlock { [weak self] in
+      completion?()
+      self?.syncHoverWithPointer()
+    }
     positionRows()
     CATransaction.commit()
   }

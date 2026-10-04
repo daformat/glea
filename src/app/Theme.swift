@@ -140,4 +140,16 @@ extension NSView {
       bottomAnchor.constraint(equalTo: other.bottomAnchor, constant: -insets.bottom),
     ])
   }
+  /// Calls `action` as the scroll view around this view scrolls: content
+  /// scrolled under a still pointer gets no enter or exit events, so hover
+  /// states check the pointer again. Call from viewDidMoveToWindow, keeping
+  /// the result for the next call.
+  func watchScrolling(replacing old: NSObjectProtocol?, _ action: @escaping @MainActor () -> Void) -> NSObjectProtocol? {
+    if let old { NotificationCenter.default.removeObserver(old) }
+    guard window != nil, let clip = enclosingScrollView?.contentView else { return nil }
+    clip.postsBoundsChangedNotifications = true
+    return NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: .main) { _ in
+      MainActor.assumeIsolated { action() }
+    }
+  }
 }

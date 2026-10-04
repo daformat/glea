@@ -13,6 +13,7 @@ protocol TopBarDelegate: AnyObject {
   func topBarGoForward()
   func topBarReload()
   func topBarSearch()
+  func topBarNewNote()
   func topBarToggleMode()
   func topBarShowExtensions(from anchor: NSRect)
   /// A pinned extension's button: open its popup under it.
@@ -188,11 +189,21 @@ final class IconButton: NSControl {
   /// Tabs that move under a still pointer (scrolling the strip) get no
   /// enter/exit events: match the hover to where the pointer is now.
   func syncHoverWithPointer() {
-    guard let window, !isHidden else { return }
+    guard let window, !isHiddenOrHasHiddenAncestor else {
+      if hovering { hovering = false }
+      return
+    }
     let point = window.mouseLocationOutsideOfEventStream
     let inside = bounds.contains(convert(point, from: nil))
       && (superview.map { $0.bounds.contains($0.convert(point, from: nil)) } ?? true)
     if inside != hovering { hovering = inside }
+  }
+
+  /// Also in a scrolling page (a note's header buttons).
+  private var scrollWatch: NSObjectProtocol?
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    scrollWatch = watchScrolling(replacing: scrollWatch) { [weak self] in self?.syncHoverWithPointer() }
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -288,11 +299,21 @@ final class TextButton: NSControl {
   /// Tabs that move under a still pointer (scrolling the strip) get no
   /// enter/exit events: match the hover to where the pointer is now.
   func syncHoverWithPointer() {
-    guard let window, !isHidden else { return }
+    guard let window, !isHiddenOrHasHiddenAncestor else {
+      if hovering { hovering = false }
+      return
+    }
     let point = window.mouseLocationOutsideOfEventStream
     let inside = bounds.contains(convert(point, from: nil))
       && (superview.map { $0.bounds.contains($0.convert(point, from: nil)) } ?? true)
     if inside != hovering { hovering = inside }
+  }
+
+  /// Also in a scrolling page (a note's header buttons).
+  private var scrollWatch: NSObjectProtocol?
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    scrollWatch = watchScrolling(replacing: scrollWatch) { [weak self] in self?.syncHoverWithPointer() }
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -425,6 +446,8 @@ final class TopBarView: NSView {
     delegate?.topBarOpenExtension(entry.id, from: sender.frame)
   }
   private lazy var searchButton = IconButton(symbol: "magnifyingglass", size: 13, tooltip: "Search (⌘T)", target: self, action: #selector(search))
+  /// Notes only: a new note.
+  private lazy var newNoteButton = IconButton(symbol: "plus", tooltip: "New Note (⌥⌘N)", target: self, action: #selector(newNote))
   /// In the notes: sound plays somewhere in the app (a tab, a note's
   /// media); mutes or unmutes all of it.
   private lazy var soundButton = IconButton(symbol: "speaker.wave.2.fill", size: 12, tooltip: "Mute Sound", target: self,
@@ -524,7 +547,7 @@ final class TopBarView: NSView {
     progressLayer.cornerRadius = 1
     layer?.addSublayer(progressLayer)
     for view in [backButton, forwardButton, reloadButton, newTabButton, extensionsButton, journalButton, notesButton, searchButton, modeButton,
-                 soundButton] as [NSView] {
+                 soundButton, newNoteButton] as [NSView] {
       view.translatesAutoresizingMaskIntoConstraints = true
       addSubview(view)
     }
@@ -539,6 +562,7 @@ final class TopBarView: NSView {
       guard let self else { return }
       self.layoutItems(animated: false, added: [])
       for pill in self.pills.values { pill.syncHoverWithPointer() }
+      for capsule in self.capsules.values { capsule.syncHoverWithPointer() }
     }
     addSubview(tabStrip, positioned: .below, relativeTo: newTabButton)
     for view in webOnlyViews { view.alphaValue = 0; view.isHidden = true }
@@ -557,7 +581,7 @@ final class TopBarView: NSView {
     [reloadButton, newTabButton, tabStrip, pinnedStrip, pinnedSeparator]
       + (showsExtensions ? [extensionsButton] + extensionButtons.map(\.button) : [])
   }
-  private var notesOnlyViews: [NSView] { [journalButton, notesButton] }
+  private var notesOnlyViews: [NSView] { [journalButton, notesButton, newNoteButton] }
 
   override var mouseDownCanMoveWindow: Bool { false }
 
@@ -730,9 +754,11 @@ final class TopBarView: NSView {
     // Right: the incognito badge, search, then the web/notes toggle.
     place(modeButton, NSRect(x: bounds.width - 14 - 28, y: buttonY, width: 28, height: 28), animated: false)
     place(searchButton, NSRect(x: modeButton.frame.minX - 4 - 28, y: buttonY, width: 28, height: 28), animated: false)
-    var buttonsLeft = searchButton.frame.minX
+    // (Notes: a new note, before search.)
+    place(newNoteButton, NSRect(x: searchButton.frame.minX - 4 - 28, y: buttonY, width: 28, height: 28), animated: false)
+    var buttonsLeft = isWeb ? searchButton.frame.minX : newNoteButton.frame.minX
     if !soundButton.isHidden {
-      place(soundButton, NSRect(x: searchButton.frame.minX - 4 - 28, y: buttonY, width: 28, height: 28), animated: false)
+      place(soundButton, NSRect(x: buttonsLeft - 4 - 28, y: buttonY, width: 28, height: 28), animated: false)
       buttonsLeft = soundButton.frame.minX
     }
     if isIncognito {
@@ -810,6 +836,7 @@ final class TopBarView: NSView {
   @objc private func reload() { delegate?.topBarReload() }
   @objc private func newTab() { delegate?.topBarNewTab() }
   @objc private func search() { delegate?.topBarSearch() }
+  @objc private func newNote() { delegate?.topBarNewNote() }
   @objc private func toggleSound() { SoundMonitor.shared.toggle() }
 
   /// Shown in the notes while sound plays (muted or not).
@@ -2823,6 +2850,14 @@ private final class GroupCapsule: NSView {
 
   override func mouseEntered(with event: NSEvent) { hovering = true }
   override func mouseExited(with event: NSEvent) { hovering = false }
+
+  /// The strip scrolled under a still pointer (no enter or exit events).
+  func syncHoverWithPointer() {
+    guard let window, !isHiddenOrHasHiddenAncestor else { return hovering = false }
+    let point = window.mouseLocationOutsideOfEventStream
+    hovering = bounds.contains(convert(point, from: nil))
+      && (superview.map { $0.bounds.contains($0.convert(point, from: nil)) } ?? true)
+  }
 
   override func mouseDown(with event: NSEvent) {
     pressStart = event.locationInWindow

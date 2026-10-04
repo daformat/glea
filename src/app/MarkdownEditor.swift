@@ -1861,9 +1861,26 @@ final class NoteGutterView: NSView {
     if dragging { NSCursor.closedHand.set() } else if grip(at: point) != nil { NSCursor.openHand.set() } else { super.cursorUpdate(with: event) }
   }
 
-  private func trackMouse(_ event: NSEvent) {
+  private func trackMouse(_ event: NSEvent) { trackPointer(at: event.locationInWindow) }
+
+  /// The page scrolled under a still pointer (no enter or exit events).
+  private var scrollWatch: NSObjectProtocol?
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    scrollWatch = watchScrolling(replacing: scrollWatch) { [weak self] in
+      guard let self, !self.dragging, let window = self.window else { return }
+      let pointer = window.mouseLocationOutsideOfEventStream
+      if self.visibleRect.contains(self.convert(pointer, from: nil)) {
+        self.trackPointer(at: pointer)
+      } else {
+        self.setHovered(nil)
+      }
+    }
+  }
+
+  private func trackPointer(at windowPoint: NSPoint) {
     guard !dragging else { return }
-    let point = convert(event.locationInWindow, from: nil)
+    let point = convert(windowPoint, from: nil)
     // The innermost block under the pointer (a list item, not its list's
     // heading section).
     let hit = handles.filter { $0.band.contains(point.y) && point.x >= 0 }
