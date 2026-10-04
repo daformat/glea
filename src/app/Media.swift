@@ -584,6 +584,74 @@ struct CubicBezier {
   }
 }
 
+// MARK: - Local images
+
+/// Local pictures, decoded at the size notes show them. A note's photos are
+/// often thousands of pixels wide: drawn as they are, AppKit would decode each
+/// one whole, on the main thread, the first time it shows.
+enum LocalImageLoader {
+  /// The longest side decoded, in pixels: a page column at 2x, with room to
+  /// drag it wider.
+  private static let maxPixels = 2000
+  private static let cache = NSCache<NSURL, NSImage>()
+  private static let queue = DispatchQueue(label: "app.glea.local-images", qos: .userInitiated, attributes: .concurrent)
+
+  /// Its size in points, read from the file's header (the DPI counts, as for
+  /// NSImage). Nil for what isn't one still bitmap (SVG, PDF, an animated
+  /// GIF): those load whole, as NSImages.
+  static func pointSize(of url: URL) -> NSSize? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, [kCGImageSourceShouldCache: false] as CFDictionary),
+          CGImageSourceGetCount(source) == 1,
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          var width = (properties[kCGImagePropertyPixelWidth] as? NSNumber).map({ CGFloat($0.doubleValue) }),
+          var height = (properties[kCGImagePropertyPixelHeight] as? NSNumber).map({ CGFloat($0.doubleValue) }),
+          width > 0, height > 0 else { return nil }
+    // Orientations 5–8 turn it on its side.
+    if let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue, orientation >= 5 {
+      swap(&width, &height)
+    }
+    let dpi = (properties[kCGImagePropertyDPIWidth] as? NSNumber).map { CGFloat($0.doubleValue) } ?? 72
+    let scale = dpi > 0 ? 72 / dpi : 1
+    return NSSize(width: width * scale, height: height * scale)
+  }
+
+  static func cached(_ url: URL) -> NSImage? { cache.object(forKey: url as NSURL) }
+
+  /// Decodes it here and now (for small pictures in a line of text).
+  static func image(at url: URL) -> NSImage? {
+    if let image = cached(url) { return image }
+    guard let size = pointSize(of: url), let image = decode(url, size: size) else { return nil }
+    cache.setObject(image, forKey: url as NSURL)
+    return image
+  }
+
+  /// Decodes it off the main thread.
+  static func load(_ url: URL, size: NSSize, completion: @escaping @MainActor (NSImage?) -> Void) {
+    if let image = cached(url) {
+      MainActor.assumeIsolated { completion(image) }
+      return
+    }
+    queue.async {
+      let image = decode(url, size: size)
+      DispatchQueue.main.async {
+        if let image { cache.setObject(image, forKey: url as NSURL) }
+        MainActor.assumeIsolated { completion(image) }
+      }
+    }
+  }
+
+  private static func decode(_ url: URL, size: NSSize) -> NSImage? {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let picture = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+          ] as CFDictionary) else { return nil }
+    return NSImage(cgImage: picture, size: size)
+  }
+}
+
 // MARK: - Loading order
 
 /// Media blocks load what's on screen first. Blocks on or near the visible
@@ -1061,13 +1129,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   private func configureIcon() {
     switch descriptor.kind {
-    case .image(let url):
-      if url.isFileURL, let image = NSImage(contentsOf: url) {
-        rowIcon.image = image
-        placeholder.image = image
-      } else {
-        rowIcon.image = Theme.symbol("photo", size: 12)
-      }
+    case .image:
+      // (A local picture becomes its own icon once it's loaded.)
+      rowIcon.image = Theme.symbol("photo", size: 12)
       placeholder.image = Theme.symbol("photo", size: 22, weight: .regular)
     case .video:
       let symbol = descriptor.isAudio ? "waveform" : "film"
@@ -1141,7 +1205,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     switch descriptor.kind {
     case .image(let url):
       if url.isFileURL {
-        if let image = NSImage(contentsOf: url) { showImage(image, immediately: true) }
+        if let size = LocalImageLoader.pointSize(of: url) {
+          showLocalImage(url, size: size)
+        } else if let image = NSImage(contentsOf: url) {
+          showImage(image, immediately: true)
+        }
       } else if let cached = ImageCache.shared.image(for: url) {
         showImage(cached, immediately: true)
       } else {
@@ -1282,6 +1350,31 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     naturalSize = image.size
     if descriptor.isLocal { rowIcon.image = image }
     finishLoading(immediately: immediately)
+  }
+
+  /// A local bitmap: its place is taken at once (its size is in its header),
+  /// and the picture fades in once decoded off the main thread.
+  private func showLocalImage(_ url: URL, size: NSSize) {
+    let view = NSImageView()
+    view.imageScaling = .scaleProportionallyUpOrDown
+    install(view)
+    naturalSize = size
+    let cached = LocalImageLoader.cached(url)
+    view.image = cached
+    if let cached { rowIcon.image = cached }
+    finishLoading(immediately: true)
+    guard cached == nil else { return }
+    LocalImageLoader.load(url, size: size) { [weak self, weak view] image in
+      guard let self, let view, let image, self.content === view else { return }
+      self.rowIcon.image = image
+      view.image = image
+      guard !Motion.reduceMotion else { return }
+      view.alphaValue = 0
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = 0.15
+        view.animator().alphaValue = 1
+      }
+    }
   }
 
   private func showPDF(_ document: PDFDocument, immediately: Bool) {
@@ -1490,6 +1583,24 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     handle.setShown(shown, animated: animated)
   }
 
+  /// A picture or video at most `maxWidth` wide and 520 tall.
+  private static func fitted(_ natural: NSSize, maxWidth: CGFloat) -> NSSize {
+    var size = natural
+    if size.width > maxWidth { size = NSSize(width: maxWidth, height: size.height * maxWidth / size.width) }
+    if size.height > 520 { size = NSSize(width: size.width * 520 / size.height, height: 520) }
+    return NSSize(width: round(size.width), height: round(size.height))
+  }
+
+  /// The height a block will have, when that's known before it exists: a
+  /// local picture (its size is in its header). A note reserves it on its
+  /// first pass, instead of laying itself out again once the blocks are made.
+  static func expectedHeight(for descriptor: MediaDescriptor, noteID: String, availableWidth: CGFloat) -> CGFloat? {
+    guard case .image(let url) = descriptor.kind, url.isFileURL else { return nil }
+    if MediaState.isCollapsed(note: noteID, key: descriptor.key) { return rowHeight }
+    guard let natural = LocalImageLoader.pointSize(of: url) else { return nil }
+    return fitted(natural, maxWidth: min(availableWidth, descriptor.preferredWidth ?? availableWidth)).height
+  }
+
   private func targetMediaSize() -> NSSize {
     mediaSize(maxWidth: min(availableWidth, draggedWidth ?? descriptor.preferredWidth ?? availableWidth))
   }
@@ -1505,10 +1616,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       return NSSize(width: min(maxWidth, 480), height: 54)
     case .image, .video:
       guard let natural = naturalSize, natural.width > 0, natural.height > 0 else { return NSSize(width: maxWidth, height: maxWidth * 9 / 16) }
-      var size = natural
-      if size.width > maxWidth { size = NSSize(width: maxWidth, height: size.height * maxWidth / size.width) }
-      if size.height > 520 { size = NSSize(width: size.width * 520 / size.height, height: 520) }
-      return NSSize(width: round(size.width), height: round(size.height))
+      return Self.fitted(natural, maxWidth: maxWidth)
     case .embed(_, let provider, _):
       if case .image = resolution?.target, let natural = naturalSize, natural.width > 0 {
         let width = min(maxWidth, natural.width)

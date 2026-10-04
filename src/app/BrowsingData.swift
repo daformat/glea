@@ -242,7 +242,8 @@ final class ImageCache {
     if let image = images[url] { return image }
     guard !loading.contains(url), !failed.contains(url) else { return nil }
     if url.isFileURL {
-      if let image = NSImage(contentsOf: url) {
+      // Bitmaps decoded at the size notes show them (see LocalImageLoader).
+      if let image = LocalImageLoader.image(at: url) ?? NSImage(contentsOf: url) {
         images[url] = image
         return image
       }

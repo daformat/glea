@@ -135,7 +135,8 @@ struct MarkdownStyler {
   /// for the construct the cursor is in; everything else renders as you type.
   let selection: NSRange?
   /// Current height of a media block, by key (nil until its view exists).
-  var mediaHeight: (String) -> CGFloat? = { _ in nil }
+  /// The space to reserve for a media block (nil: a row, until it's known).
+  var mediaHeight: (MediaDescriptor) -> CGFloat? = { _ in nil }
   /// Keys of the collapsed sections.
   var folded: Set<String> = []
   /// The table the cursor is in shows as Markdown (the table / Markdown
@@ -198,14 +199,28 @@ struct MarkdownStyler {
   /// and their advance is cancelled by kerning. The line keeps its height
   /// (an otherwise empty "> " or "## " line still takes its space) and the
   /// cursor keeps its size next to hidden characters.
+  /// Widths of hidden characters by font and character: a note's link
+  /// addresses alone are thousands of them, each measured on every pass.
+  private static var hiddenWidths: [NSFont: [unichar: CGFloat]] = [:]
+
   private func hide(_ storage: NSTextStorage, _ range: NSRange) {
     guard range.length > 0, NSMaxRange(range) <= storage.length else { return }
     storage.addAttribute(.foregroundColor, value: NSColor.clear, range: range)
+    let string = storage.string as NSString
     for i in range.location..<NSMaxRange(range) {
       let char = NSRange(location: i, length: 1)
       var attributes = storage.attributes(at: i, effectiveRange: nil)
       attributes[.kern] = nil
-      let width = NSAttributedString(string: (storage.string as NSString).substring(with: char), attributes: attributes).size().width
+      let unit = string.character(at: i)
+      // (Halves of a surrogate pair don't measure alone: those aren't cached.)
+      let cacheable = !UTF16.isLeadSurrogate(unit) && !UTF16.isTrailSurrogate(unit)
+      let font = attributes[.font] as? NSFont
+      if cacheable, let font, let width = Self.hiddenWidths[font]?[unit] {
+        storage.addAttribute(.kern, value: -width, range: char)
+        continue
+      }
+      let width = NSAttributedString(string: string.substring(with: char), attributes: attributes).size().width
+      if cacheable, let font { Self.hiddenWidths[font, default: [:]][unit] = width }
       storage.addAttribute(.kern, value: -width, range: char)
     }
   }
@@ -831,7 +846,7 @@ struct MarkdownStyler {
     let content = (line as NSString).substring(from: contentStart)
     if let media = MediaDescriptor.parse(content, baseDirectory: baseDirectory, indent: indent, occurrence: mediaOccurrence) {
       let body = abs(NSRange(location: contentStart, length: local.length - contentStart))
-      let blockHeight = mediaHeight(media.key) ?? MediaBlockView.rowHeight
+      let blockHeight = mediaHeight(media) ?? MediaBlockView.rowHeight
       spacingBefore = 4
       if revealsMarker(NSRange(location: lineRange.location, length: lineRange.length + 1)) {
         // Editing the source: the Markdown shows, the block goes below it.
@@ -885,9 +900,10 @@ struct MarkdownStyler {
       paragraph.lineSpacing = MarkdownStyler.lineSpacing
       paragraph.firstLineHeadIndent = quoteWidth
       paragraph.headIndent = indent
-      paragraph.paragraphSpacing = 3
+      // An image in the item draws below its line: room for it, as after a paragraph.
+      let imageHeight = styleInline(storage, line: line, lineRange: lineRange, imageIndent: indent)
+      paragraph.paragraphSpacing = imageHeight > 0 ? imageHeight + 12 : 3
       storage.addAttribute(.paragraphStyle, value: paragraph, range: enclosing)
-      styleInline(storage, line: line, lineRange: lineRange, imageIndent: indent)
       return
     }
 
@@ -2897,7 +2913,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       textView.isEditable = false
     }
     textView.string = shownContent()
-    restyle()
+    // A page's editor is styled by its first layout, at its real width (its
+    // frame here is a guess: styling now would only be done again).
+    if embedded != nil { restyle() }
   }
 
   /// The note's text, or the part of it it's embedded for.
@@ -2946,7 +2964,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         observedAncestors.add(current)
         view = current.superview
       }
-      DispatchQueue.main.async { [weak self] in self?.restyle() }
+      // Restyled once the view has settled in, unless layout already has.
+      let restyles = fullRestylesInWindow
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.fullRestylesInWindow == restyles else { return }
+        self.restyle()
+      }
     }
     if embedded == nil, let host = window?.appRootView {
       if formatBar.superview !== host { host.addSubview(formatBar) }
@@ -3043,41 +3066,73 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// Restyles everything, or only the lines around `limit`.
   func restyle(limit: NSRange? = nil) {
+    restyle(limits: limit.map { [$0] })
+  }
+
+  /// Full restyles in a window, for the one `viewDidMoveToWindow` schedules
+  /// to skip when layout has already done it.
+  private var fullRestylesInWindow = 0
+
+  /// Restyles everything (nil), or only the lines around each range: the
+  /// text is laid out and the page's blocks placed once for all of them.
+  private func restyle(limits: [NSRange]?) {
     guard !textView.hasMarkedText() else { return }
     let focused = window?.firstResponder === textView
     let selection = focused ? textView.selectedRange() : nil
     styledSelection = selection
     styledWidth = bounds.width
     let length = storage.length
-    var clampedLimit = limit.map { NSRange(location: min($0.location, length), length: min($0.length, length - min($0.location, length))) }
+    var clampedLimits = limits.map { ranges in
+      ranges.map { NSRange(location: min($0.location, length), length: min($0.length, length - min($0.location, length))) }
+    }
     // Layout can't restart inside a collapsed section (its line breaks
     // don't break): restyle whole when the lines start or end in one.
     let collapsed = folded
-    if let limit = clampedLimit, !collapsed.isEmpty {
-      let lines = (storage.string as NSString).paragraphRange(for: limit)
-      if MarkdownStyler.headingSections(in: storage.string as NSString).contains(where: {
-        let body = NSRange(location: $0.body.location, length: $0.body.length + 1)
-        return collapsed.contains($0.key) && NSIntersectionRange(body, lines).length > 0
-          && !(lines.location <= $0.heading.location && NSMaxRange(lines) >= NSMaxRange(body))
-      }) {
-        clampedLimit = nil
+    if let ranges = clampedLimits, !collapsed.isEmpty {
+      let sections = MarkdownStyler.headingSections(in: storage.string as NSString)
+      for limit in ranges {
+        let lines = (storage.string as NSString).paragraphRange(for: limit)
+        if sections.contains(where: {
+          let body = NSRange(location: $0.body.location, length: $0.body.length + 1)
+          return collapsed.contains($0.key) && NSIntersectionRange(body, lines).length > 0
+            && !(lines.location <= $0.heading.location && NSMaxRange(lines) >= NSMaxRange(body))
+        }) {
+          clampedLimits = nil
+          break
+        }
       }
     }
+    if clampedLimits == nil, window != nil { fullRestylesInWindow += 1 }
     var styler = MarkdownStyler(
       baseDirectory: NoteStore.shared.fileURL(for: ref).deletingLastPathComponent(),
       width: max(100, bounds.width),
       selection: selection)
-    styler.mediaHeight = { [weak self] key in self?.mediaViews[key]?.blockHeight }
+    let noteID = ref.id
+    let containerWidth = textView.textContainer?.size.width ?? bounds.width
+    styler.mediaHeight = { [weak self] media in
+      guard let self else { return nil }
+      let height = self.mediaViews[media.key]?.blockHeight
+        ?? MediaBlockView.expectedHeight(for: media, noteID: noteID, availableWidth: max(80, containerWidth - media.indent))
+      self.reservedMediaHeights[media.key] = height ?? MediaBlockView.rowHeight
+      return height
+    }
     styler.folded = folded
     styler.tableAsMarkdown = tableAsMarkdown
     styler.editingCell = cellEditing
     layoutManager.hiddenCell = cellEditing
-    styler.apply(to: storage, limit: clampedLimit)
+    func apply() {
+      if let ranges = clampedLimits {
+        for limit in ranges { styler.apply(to: storage, limit: limit) }
+      } else {
+        styler.apply(to: storage, limit: nil)
+      }
+    }
+    apply()
     textView.typingAttributes = MarkdownStyler.baseAttributes
     updateHeight()
-    if layoutMediaViews() {
-      // New blocks: reserve their real height.
-      styler.apply(to: storage, limit: clampedLimit)
+    if layoutMediaViews(), mediaViews.contains(where: { !reservesHeight(of: $0.key) }) {
+      // New blocks taller or shorter than foreseen: reserve their real height.
+      apply()
       updateHeight()
       _ = layoutMediaViews()
     }
@@ -3086,6 +3141,15 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     layoutTableEditing()
     placedFrame = mediaHost.map { convert(bounds, to: $0) }
     updateMediaSelection()
+  }
+
+  /// The height last reserved for each block in the text.
+  private var reservedMediaHeights: [String: CGFloat] = [:]
+
+  /// Whether the text already makes room for the block as it is.
+  private func reservesHeight(of key: String) -> Bool {
+    guard let view = mediaViews[key], let reserved = reservedMediaHeights[key] else { return true }
+    return abs(view.blockHeight - reserved) < 0.5
   }
 
   /// Media blocks whose line is in the selection show selected.
@@ -3865,11 +3929,15 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       guard let self else { return }
       let keys = self.pendingMediaRestyle
       self.pendingMediaRestyle = []
-      for key in keys {
-        guard let range = self.mediaLines[key], range.location < self.storage.length,
-              self.storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil else { continue }
-        self.restyle(limit: range)
+      // All their lines in one pass (a note's images measure in a burst).
+      let ranges = keys.compactMap { key -> NSRange? in
+        // (Already foreseen: nothing to move.)
+        guard !self.reservesHeight(of: key),
+              let range = self.mediaLines[key], range.location < self.storage.length,
+              self.storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil else { return nil }
+        return range
       }
+      if !ranges.isEmpty { self.restyle(limits: ranges) }
     }
   }
 
