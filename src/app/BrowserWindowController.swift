@@ -764,6 +764,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   func windowDidMove(_ notification: Notification) {
     if isExtra { scheduleSessionSave() }
+    // A child window follows a drag, but not every move (one made through
+    // Accessibility, for one): the toast and overlays would stay behind.
+    syncOverlayWindow()
   }
 
   /// Brings back the main window after ⌘W closed it (without tabs): in

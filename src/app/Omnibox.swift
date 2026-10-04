@@ -967,7 +967,9 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
     case #selector(NSResponder.moveUp(_:)), #selector(NSResponder.insertBacktab(_:)):
       list.moveSelection(by: -1)
       return true
-    case #selector(NSResponder.insertNewline(_:)):
+    // (⌥ may still be held from point-and-shoot: ⌥↩ chooses too, rather
+    // than typing a line break into the field.)
+    case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)):
       if let item = list.selectedItem { choose(item) }
       return true
     case #selector(NSResponder.cancelOperation(_:)):

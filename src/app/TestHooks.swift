@@ -13,8 +13,9 @@ enum TestHooks {
 
   static func install(controller: BrowserWindowController) {
     guard ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] == "1" else { return }
-    // Make this copy unmistakable on screen.
-    if let root = controller.window?.appRootView {
+    // Make this copy unmistakable on screen (unless GLEA_HIDE_TEST_BADGE=1,
+    // for screenshots of a demo profile).
+    if ProcessInfo.processInfo.environment["GLEA_HIDE_TEST_BADGE"] != "1", let root = controller.window?.appRootView {
       let badge = NSTextField.label("TEST COPY – automated checks", size: 11, weight: .bold, color: .white)
       badge.wantsLayer = true
       badge.layer?.backgroundColor = NSColor.systemRed.cgColor
@@ -373,6 +374,12 @@ enum TestHooks {
                 content.subviews.map { String(describing: type(of: $0)) }.joined(separator: ","))
         }
         NSLog("Glea hittest %@ -> %@", argument, hit.map { String(describing: type(of: $0)) } ?? "nil")
+      }
+    case "window-frame":
+      // window-frame:<x>,<y>,<width>,<height>: from the main screen's top left.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      if v.count == 4, let window = controller.window, let screen = window.screen ?? NSScreen.main {
+        window.setFrame(NSRect(x: v[0], y: screen.frame.maxY - v[1] - v[3], width: v[2], height: v[3]), display: true)
       }
     case "window-size":
       // window-size:<width>,<height>
