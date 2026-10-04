@@ -3437,17 +3437,19 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         cut.append(view)
       }
     }
+    let duration = Motion.foldDuration
+    let curve = CubicBezier.fold
     for overlay in overlays {
       overlay.wantsLayer = true
       overlay.alphaValue = 0
       let fade = CABasicAnimation(keyPath: "opacity")
       fade.fromValue = 1
       fade.toValue = 0
-      fade.duration = Motion.foldDuration
-      fade.timingFunction = CubicBezier.fold.timingFunction
+      fade.duration = duration
+      fade.timingFunction = curve.timingFunction
       overlay.layer?.add(fade, forKey: "glea.fold.fade")
     }
-    slidePage(below: after, from: before - after, duration: Motion.foldDuration, curve: .fold,
+    slidePage(below: after, from: before - after, duration: duration, curve: curve,
               overlays: overlays, cut: cut, fadingIn: !collapsing) { [weak self] in
       guard let self, !self.closingMedia.isEmpty else { return }
       self.closingMedia = [:]
@@ -4279,14 +4281,23 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     let screen = host.visibleRect
     let above = max(0, offsets.max() ?? 0), below = max(0, -(offsets.min() ?? 0))
     let visible = NSRect(x: screen.minX, y: screen.minY - above - 40, width: screen.width, height: screen.height + above + below + 80)
+    // Opening a long section, what follows ends far below: going all the way,
+    // it would leave the screen in a frame or two and the section would seem
+    // to open at once. It slides a window's height at most over the whole
+    // slide instead, then on to its place out of sight.
+    let edgeTop = textView.convert(NSPoint(x: 0, y: top), to: host).y
+    let travelled = -shift(at: edgeTop)
+    let endShift = fadingIn && travelled > screen.height ? screen.height - travelled : 0
 
     func move(_ view: NSView, by dy: CGFloat) {
       guard let layer = view.layer, let superview = view.superview else { return }
       let shift = superview.convert(NSPoint(x: 0, y: dy), from: host).y - superview.convert(NSPoint.zero, from: host).y
+      let end = endShift == 0 ? 0
+        : superview.convert(NSPoint(x: 0, y: endShift), from: host).y - superview.convert(NSPoint.zero, from: host).y
       let animation = CABasicAnimation(keyPath: "position")
       animation.isAdditive = true
       animation.fromValue = NSValue(point: NSPoint(x: 0, y: shift))
-      animation.toValue = NSValue(point: .zero)
+      animation.toValue = NSValue(point: NSPoint(x: 0, y: end))
       animation.duration = duration
       animation.timingFunction = curve.timingFunction
       layer.add(animation, forKey: "glea.slide")
@@ -4354,7 +4365,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       let steps = 30
       for step in 0...steps {
         let left = CGFloat(1 - curve(Double(step) / Double(steps)))
-        let shown = min(frame.height, max(0, edge + edgeOffset * left - frame.minY))
+        let shown = min(frame.height, max(0, edge + edgeOffset * left + endShift * (1 - left) - frame.minY))
         let rect = CGRect(x: 0, y: flipped ? 0 : frame.height - shown, width: frame.width, height: shown)
         bounds.append(NSValue(rect: CGRect(origin: .zero, size: rect.size)))
         positions.append(NSValue(point: CGPoint(x: rect.midX, y: rect.midY)))
