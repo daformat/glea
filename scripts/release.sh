@@ -69,12 +69,74 @@ if [ -n "$NOTARY_PROFILE" ]; then
   rm "$ZIP"; ditto -c -k --keepParent "$APP" "$ZIP"
 fi
 
+# The disk image, laid out like Subtitles': a background with the drag-to-
+# install arrow (scripts/makedmgbg.swift), the app and Applications on it.
 DMG=$DIST/Glea-$VERSION.dmg
+RWDMG=$DIST/Glea-rw.dmg
 STAGE=$(mktemp -d)
+mkdir -p "$STAGE/.background"
 ditto "$APP" "$STAGE/Glea.app"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname "Glea" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
+swift scripts/makedmgbg.swift "$STAGE/.background/background.tiff"
+
+# A volume of this name already mounted (a run that died before detaching)
+# makes hdiutil name the new one "Glea 1", and the layout would go to the
+# stale one.
+while read -r stale; do
+  [ -n "$stale" ] || continue
+  echo "Detaching stale volume: $stale"
+  hdiutil detach "$stale" -quiet -force 2>/dev/null || true
+done < <(mount | awk -F' on | \\(' '/\/Volumes\/Glea/ {print $2}')
+
+# Read-write first: the window layout lives in the volume's .DS_Store, which
+# only Finder writes, on a mounted writable image. The compressed image is
+# converted from it at the end.
+hdiutil create -volname "Glea" -srcfolder "$STAGE" -ov -format UDRW -fs HFS+ "$RWDMG" >/dev/null
 rm -rf "$STAGE"
+MOUNT=$(hdiutil attach "$RWDMG" -readwrite -noverify -noautoopen | tail -1 | awk -F'\t' '{print $NF}')
+trap 'hdiutil detach "$MOUNT" -quiet -force 2>/dev/null || true' EXIT
+VOLNAME=$(basename "$MOUNT")
+
+# Coordinates match scripts/makedmgbg.swift (points, from the window's top
+# left). Unquoted heredoc: no dollar sign, backslash or backtick below.
+if ! osascript <<APPLESCRIPT
+tell application "Finder"
+  tell disk "$VOLNAME"
+    open
+    set current view of container window to icon view
+    set toolbar visible of container window to false
+    set statusbar visible of container window to false
+    -- The bounds include the title bar: 428 tall for a 400 point image.
+    set the bounds of container window to {240, 130, 880, 558}
+    set opts to the icon view options of container window
+    set arrangement of opts to not arranged
+    set icon size of opts to 128
+    set text size of opts to 12
+    set background picture of opts to file ".background:background.tiff"
+    set position of item "Glea.app" of container window to {170, 180}
+    set position of item "Applications" of container window to {470, 180}
+    -- Again after the contents change, or Finder falls back to its default width.
+    set the bounds of container window to {240, 130, 880, 558}
+    update without registering applications
+    delay 1
+    -- Closing is what commits .DS_Store.
+    close
+  end tell
+end tell
+APPLESCRIPT
+then
+  echo "Finder refused the layout script: allow your terminal to control Finder in" >&2
+  echo "System Settings > Privacy & Security > Automation, then run this again." >&2
+  exit 1
+fi
+
+# Finder writes .DS_Store lazily: detaching before it lands loses the layout.
+sync
+sleep 2
+hdiutil detach "$MOUNT" -quiet
+trap - EXIT
+hdiutil convert "$RWDMG" -format UDZO -imagekey zlib-level=9 -o "$DMG" -ov >/dev/null
+rm -f "$RWDMG"
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 if [ -n "$NOTARY_PROFILE" ]; then
   echo "Notarizing the disk image…"
