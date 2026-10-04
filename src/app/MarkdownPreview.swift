@@ -47,9 +47,21 @@ enum MarkdownPreview {
     } else if let m = text.range(of: "^[-*+]\\s+", options: .regularExpression) {
       text.removeSubrange(m)
       result.append(NSAttributedString(string: "• ", attributes: base))
+    } else if let m = text.range(of: "^\\d{1,9}[.)]\\s+", options: .regularExpression) {
+      let number = text[m].trimmingCharacters(in: .whitespaces)
+      text.removeSubrange(m)
+      result.append(NSAttributedString(string: number + " ", attributes: base))
     }
 
+    // Wrapped lines line up with the text after a list or task marker,
+    // like in a note.
+    let marker = result.size().width
     result.append(inline(text, attributes))
+    if marker > 0 {
+      let paragraph = NSMutableParagraphStyle()
+      paragraph.headIndent = ceil(marker)
+      result.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: result.length))
+    }
     applyHighlight(result, highlightAttributes)
     return result
   }
@@ -92,9 +104,13 @@ enum MarkdownPreview {
         let target = WikiTarget(name)
         let anchor = target.anchor.map { $0.hasPrefix("^") ? String($0.dropFirst()) : $0 }
         let shown = anchor.map { target.name.isEmpty ? $0 : "\(target.name) › \($0)" } ?? name
-        result.append(NSAttributedString(string: group(4) ?? shown, attributes: link))
+        var a = link
+        a[.link] = URL(string: "glea-note:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name))
+        result.append(NSAttributedString(string: group(4) ?? shown, attributes: a))
       } else if let label = group(5) {
-        result.append(inline(label, link))
+        var a = link
+        a[.link] = group(6).flatMap { URL(string: $0) }
+        result.append(inline(label, a))
       } else if let bold = group(8) {
         var a = attributes
         a[.font] = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask)
@@ -108,7 +124,9 @@ enum MarkdownPreview {
         a[.font] = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
         result.append(inline(italic, a))
       } else {
-        result.append(NSAttributedString(string: ns.substring(with: m.range), attributes: link))
+        var a = link
+        a[.link] = URL(string: ns.substring(with: m.range))
+        result.append(NSAttributedString(string: ns.substring(with: m.range), attributes: a))
       }
     }
     if position < ns.length {

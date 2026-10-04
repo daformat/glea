@@ -280,7 +280,7 @@ extension MarkdownTextView {
 
   // MARK: Images (drop and paste)
 
-  private static let imageExtensions: Set<String> = MediaDescriptor.imageExtensions.union(MediaDescriptor.videoExtensions)
+  private static let imageExtensions: Set<String> = MediaDescriptor.imageExtensions.union(MediaDescriptor.videoExtensions).union(["pdf"])
 
   /// Markdown for images on a pasteboard (files, or image data such as a
   /// picture dragged from a web page), each copied into assets/.
@@ -300,7 +300,7 @@ extension MarkdownTextView {
     let store = NoteStore.shared
     let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
     if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL] {
-      // Images, and anything that plays (video, sound).
+      // Images, PDFs, and anything that plays (video, sound).
       let images = urls.filter { MarkdownTextView.imageExtensions.contains($0.pathExtension.lowercased()) || MediaDescriptor.isPlayable($0) }
       if !images.isEmpty && images.count == urls.count {
         return images.compactMap { url in

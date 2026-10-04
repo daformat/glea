@@ -46,6 +46,16 @@ struct TabMedia: Equatable {
 /// Borderless icon button: its background fades in on hover and darkens
 /// while pressed; the icon dips slightly on press.
 final class IconButton: NSControl {
+  /// The top bar's new note button.
+  static func newNote(target: AnyObject?, action: Selector?) -> IconButton {
+    let button = IconButton(symbol: "long.text.page.and.pencil", tooltip: "New Note (⌥⌘N)", target: target, action: action)
+    // Its page sits high next to round icons (search, globe).
+    button.iconDrop = 1.5
+    return button
+  }
+
+  /// Moves the icon down, for symbols that look high next to the others.
+  var iconDrop: CGFloat = 0 { didSet { needsLayout = true } }
   private let background = HighlightLayer()
   private let icon = NSImageView()
   private var tracking: NSTrackingArea?
@@ -80,7 +90,7 @@ final class IconButton: NSControl {
   override func layout() {
     super.layout()
     Motion.withoutAnimation { background.frame = bounds }
-    icon.frame = bounds
+    icon.frame = bounds.offsetBy(dx: 0, dy: isFlipped ? iconDrop : -iconDrop)
   }
 
   var isActive = false { didSet { refresh() } }
@@ -447,7 +457,7 @@ final class TopBarView: NSView {
   }
   private lazy var searchButton = IconButton(symbol: "magnifyingglass", size: 13, tooltip: "Search (⌘T)", target: self, action: #selector(search))
   /// Notes only: a new note.
-  private lazy var newNoteButton = IconButton(symbol: "plus", tooltip: "New Note (⌥⌘N)", target: self, action: #selector(newNote))
+  private lazy var newNoteButton = IconButton.newNote(target: self, action: #selector(newNote))
   /// In the notes: sound plays somewhere in the app (a tab, a note's
   /// media); mutes or unmutes all of it.
   private lazy var soundButton = IconButton(symbol: "speaker.wave.2.fill", size: 12, tooltip: "Mute Sound", target: self,

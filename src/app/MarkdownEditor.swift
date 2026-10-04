@@ -3705,6 +3705,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       let view: MediaBlockView
       if let existing = mediaViews[media.key] {
         view = existing
+        if existing.descriptor !== media { existing.adopt(media) }
       } else {
         view = MediaBlockView(descriptor: media, noteID: ref.id, embedChain: embedChain + [ref.id])
         let key = media.key
@@ -3714,10 +3715,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
           guard let open = self?.onOpenLink else { return }
           DispatchQueue.main.async { open(url) }
         }
+        view.onResize = { [weak self] width in self?.resizeMedia(key, to: width) }
         mediaViews[media.key] = view
         (mediaHost ?? textView).addSubview(view)
         created = true
       }
+      view.canResize = embedded == nil && MediaDescriptor.line(mediaLineText(range), sizedTo: 100) != nil
       // In a collapsed section the block stays loaded, transparent and out of
       // the way (not hidden: a hidden embed stops drawing, and would take a
       // moment to show again). While the section closes, it stays where it
@@ -3749,6 +3752,37 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       updateHeight()
     }
     return created
+  }
+
+  /// The text of the line a media block stands for (without its newline).
+  private func mediaLineText(_ range: NSRange) -> String {
+    let s = storage.string as NSString
+    var line = s.lineRange(for: NSRange(location: range.location, length: 0))
+    while line.length > 0, [0x0A, 0x0D].contains(s.character(at: NSMaxRange(line) - 1)) { line.length -= 1 }
+    return s.substring(with: line)
+  }
+
+  /// A block's handle was dragged: its line takes the width, in the notation
+  /// that holds one (undoable, like typing it).
+  private func resizeMedia(_ key: String, to width: Int?) {
+    guard let range = mediaLines[key] else { return }
+    let s = storage.string as NSString
+    var line = s.lineRange(for: NSRange(location: range.location, length: 0))
+    while line.length > 0, [0x0A, 0x0D].contains(s.character(at: NSMaxRange(line) - 1)) { line.length -= 1 }
+    let old = s.substring(with: line)
+    guard let new = MediaDescriptor.line(old, sizedTo: width), new != old,
+          textView.shouldChangeText(in: line, replacementString: new) else { return }
+    let selection = textView.selectedRange()
+    storage.replaceCharacters(in: line, with: new)
+    textView.didChangeText()
+    textView.undoManager?.setActionName("Resize")
+    // The cursor stays where it was in the text.
+    let delta = (new as NSString).length - line.length
+    if selection.location >= NSMaxRange(line) {
+      textView.setSelectedRange(NSRange(location: selection.location + delta, length: selection.length))
+    } else {
+      textView.setSelectedRange(selection)
+    }
   }
 
   /// Where a media block goes, in text view coordinates: over its line, or
@@ -3815,6 +3849,13 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       let after = view.frame
       slidePage(below: textView.convert(after, from: host).maxY, from: before.maxY - after.maxY,
                 duration: MediaBlockView.resizeDuration, curve: .media)
+      return
+    }
+    // Dragged by its handle: what's below moves with it, not a turn later
+    // (the gap under it would grow and shrink as it follows).
+    if mediaViews[key]?.isResizing == true, let range = mediaLines[key], range.location < storage.length {
+      pendingMediaRestyle.remove(key)
+      restyle(limit: range)
       return
     }
     let first = pendingMediaRestyle.isEmpty

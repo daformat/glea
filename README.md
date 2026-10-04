@@ -36,7 +36,8 @@ That stock build can't play H.264 or AAC. Release builds use CEF built from sour
 - **Renaming** a note updates every `[[link]]` to it.
 - **Unlinked references**, like Beam's: under the backlinks, a folded list of places where the note's name appears as plain text (whole words, not in code or links). *Link* turns one into a `[[link]]`, *Link All* does them all.
 - **Live Markdown editor**: formatting converts as you type. `**bold**` turns bold the moment it's closed, and `# ` becomes a heading. A construct's syntax shows only while the cursor is inside it.
-- **Rendered:** headings, bold and italic, links, bullets, checkboxes (click to toggle), quotes, code blocks (syntax highlighted from the fence's language, e.g. ```` ```swift ````), inline images and **tables**.
+- **Rendered:** headings, bold and italic, links, bullets, checkboxes (click to toggle), quotes, code blocks (syntax highlighted from the fence's language, e.g. ```` ```swift ````), inline images, videos, sounds and PDFs (dropped, pasted or picked from the slash menu, written as `![](file.pdf)` or a link on its own line), and **tables**.
+- **Resizing media:** hovering an image, video or PDF shows a handle on its right; dragging it sets the width, written in the line as `![alt|300](…)` or `![[file|300]]` (dragging back to full width removes it).
 - **Math** (LaTeX): `$…$` in a line of text, `$$…$$` as a block (on one line or around several). Formulas show typeset and turn back into their source when the cursor goes in. Dollars with a space just inside them, like "$5 and $10", stay text.
 - **Tables** (GFM):
   - Aligned columns, a header row and a grid.
@@ -204,3 +205,7 @@ src/resources/content-script.js   point-and-shoot + HTML→Markdown, runs in pag
 Glea's design is inspired by [Beam](https://github.com/beamlegacy/beam): its journal and notes, point and shoot, omnibox, tab groups and motion. No code or assets are taken from it.
 
 Math is typeset by [SwiftMath](https://github.com/mgriebling/SwiftMath) (MIT License, © 2023 Computer Inspirations), vendored in `third_party/SwiftMath`, with the Latin Modern Math font (GUST Font License).
+
+## License
+
+Glea is source available under the [PolyForm Strict License 1.0.0](LICENSE.md): you may read, build and use it for noncommercial purposes, but not change or redistribute it. Third-party code in `third_party/` keeps its own license. For commercial use, contact the author.

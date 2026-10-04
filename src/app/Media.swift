@@ -1,5 +1,6 @@
 import AppKit
 import AVKit
+import PDFKit
 import UniformTypeIdentifiers
 import GleaBridge
 
@@ -159,7 +160,8 @@ final class MediaDescriptor: NSObject {
     case image(URL)
     case video(URL)
     case embed(URL, EmbedProvider, [String])
-    /// A PDF from the notes folder (`![[paper.pdf]]`), in Chromium's viewer.
+    /// A PDF (`![[paper.pdf]]`, `![](paper.pdf)` or a link on its own
+    /// line), in a PDFKit view.
     case document(URL)
     /// Another note, or a section of it, shown in place (`![[Note#Heading]]`).
     case note(WikiTarget)
@@ -220,6 +222,9 @@ final class MediaDescriptor: NSObject {
     if case .video(let url) = kind { return Self.isAudio(url) }
     return false
   }
+  /// PDFs, shown in a PDFKit view.
+  static func isPDF(_ url: URL) -> Bool { url.pathExtension.lowercased() == "pdf" }
+
   static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "tif", "bmp", "avif", "svg"]
 
   private static let imageLine = try! NSRegularExpression(pattern: "^!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)(?:\\s+\"([^\"]*)\")?\\)$")
@@ -247,17 +252,19 @@ final class MediaDescriptor: NSObject {
     if let m = imageLine.firstMatch(in: text, range: full) {
       let source = ns.substring(with: m.range(at: 2))
       guard let url = resolve(source) else { return nil }
-      let alt = ns.substring(with: m.range(at: 1))
+      // (`![alt|300](…)` sets its width, like Obsidian.)
+      let (alt, width) = splitWidth(ns.substring(with: m.range(at: 1)))
       let title = m.range(at: 3).location != NSNotFound ? ns.substring(with: m.range(at: 3)) : (alt.isEmpty ? nil : alt)
       let key = "\(source)#\(occurrence)"
       if isPlayable(url) {
-        return MediaDescriptor(key: key, kind: .video(url), title: title == "Video" ? nil : title, indent: indent)
+        return MediaDescriptor(key: key, kind: .video(url), title: title == "Video" ? nil : title, indent: indent, preferredWidth: width)
       }
+      if isPDF(url) { return MediaDescriptor(key: key, kind: .document(url), title: title, indent: indent, preferredWidth: width) }
       // An embed link written as an image.
       if let (provider, groups) = EmbedProvider.match(source) {
         return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: title, indent: indent)
       }
-      return MediaDescriptor(key: key, kind: .image(url), title: title, indent: indent)
+      return MediaDescriptor(key: key, kind: .image(url), title: title, indent: indent, preferredWidth: width)
     }
     // A line that is only a link to a video file (older captures) plays too.
     if let m = videoLinkLine.firstMatch(in: text, range: full) {
@@ -275,7 +282,44 @@ final class MediaDescriptor: NSObject {
       let ext = url.pathExtension.lowercased()
       if isPlayable(url) { return MediaDescriptor(key: key, kind: .video(url), title: nil, indent: indent) }
       if imageExtensions.contains(ext) { return MediaDescriptor(key: key, kind: .image(url), title: nil, indent: indent) }
+      if isPDF(url) { return MediaDescriptor(key: key, kind: .document(url), title: nil, indent: indent) }
     }
+    return nil
+  }
+
+  /// "alt|300" (or "alt|300x200"): the alt text, and the width.
+  private static func splitWidth(_ alt: String) -> (String, CGFloat?) {
+    guard let bar = alt.range(of: "\\|\\d+(x\\d+)?$", options: .regularExpression) else { return (alt, nil) }
+    let number = alt[alt.index(after: bar.lowerBound)...].split(separator: "x")[0]
+    return (String(alt[..<bar.lowerBound]), Double(number).map { CGFloat($0) })
+  }
+
+  private static let sizedWikiLine = try! NSRegularExpression(pattern: "^!\\[\\[([^\\]\\n|]+)(?:\\|(\\d+(?:x\\d+)?)?)?\\]\\]$")
+  private static let sizedImageLine = try! NSRegularExpression(pattern: "^!\\[([^\\]\\n]*)\\]\\((.+)\\)$")
+
+  /// The media line `content` showing its media `width` points wide (nil:
+  /// as wide as it goes), in the notation that holds a size: `![[file|300]]`
+  /// stays a wiki embed, and the rest becomes `![alt|300](source)`. Nil if
+  /// it can't hold one (a wiki embed with a caption).
+  static func line(_ content: String, sizedTo width: Int?) -> String? {
+    let leading = String(content.prefix { $0 == " " || $0 == "\t" })
+    let text = content.trimmingCharacters(in: .whitespaces)
+    let ns = text as NSString
+    let full = NSRange(location: 0, length: ns.length)
+    let size = width.map { "|\($0)" } ?? ""
+    if text.hasPrefix("![[") {
+      guard let m = sizedWikiLine.firstMatch(in: text, range: full) else { return nil }
+      return leading + "![[\(ns.substring(with: m.range(at: 1)))\(size)]]"
+    }
+    if let m = sizedImageLine.firstMatch(in: text, range: full) {
+      let alt = splitWidth(ns.substring(with: m.range(at: 1))).0
+      return leading + "![\(alt)\(size)](\(ns.substring(with: m.range(at: 2))))"
+    }
+    // A link on its own line (or one written as a link to a video).
+    if let m = videoLinkLine.firstMatch(in: text, range: full) {
+      return leading + "![\(splitWidth(ns.substring(with: m.range(at: 1))).0)\(size)](\(ns.substring(with: m.range(at: 2))))"
+    }
+    if urlLine.firstMatch(in: text, range: full) != nil { return leading + "![\(size)](\(text))" }
     return nil
   }
 
@@ -285,8 +329,9 @@ final class MediaDescriptor: NSObject {
   @MainActor
   private static func wikiEmbed(_ written: String, option: String?, indent: CGFloat, occurrence: Int) -> MediaDescriptor? {
     let target = WikiTarget(written)
-    // The whole line: the same file at another size is another block.
-    let key = "![[\(written)\(option.map { "|" + $0 } ?? "")]]#\(occurrence)"
+    // Without its size or caption: resizing keeps the block (it takes the
+    // new description, see MediaBlockView.adopt).
+    let key = "![[\(written)]]#\(occurrence)"
     let ext = (target.name as NSString).pathExtension.lowercased()
     guard !ext.isEmpty, ext != "md" else {
       guard !target.name.isEmpty || target.anchor != nil else { return nil }
@@ -302,7 +347,7 @@ final class MediaDescriptor: NSObject {
     if isPlayable(url) {
       return MediaDescriptor(key: key, kind: .video(url), title: caption, indent: indent, preferredWidth: width)
     }
-    if ext == "pdf" {
+    if isPDF(url) {
       return MediaDescriptor(key: key, kind: .document(url), title: caption, indent: indent, preferredWidth: width)
     }
     guard imageExtensions.contains(ext) else { return nil }
@@ -609,7 +654,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   static let gutterWidth: CGFloat = 110
   private static let loadingSize = NSSize(width: 224, height: 56)
 
-  let descriptor: MediaDescriptor
+  private(set) var descriptor: MediaDescriptor
   let noteID: String
   /// The notes it's in, outermost first (see MarkdownEditorView.embedChain).
   let embedChain: [String]
@@ -617,6 +662,10 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   /// at once.
   var onHeightChange: ((_ animatedFrom: CGFloat?) -> Void)?
   var onOpenURL: ((URL) -> Void)?
+  /// Dragged to a new width (nil: as wide as it goes), to write in its line.
+  var onResize: ((Int?) -> Void)?
+  /// Whether its line can hold a width (see `MediaDescriptor.line(_:sizedTo:)`).
+  var canResize = false { didSet { updateHandle(animated: false) } }
 
   /// The height the text reserves for this block (animated).
   private(set) var blockHeight: CGFloat = rowHeight
@@ -645,6 +694,13 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   private let placeholder = PassthroughImageView()
   private var content: NSView?
   private let toggle = MediaToggleButton()
+  /// Right of the media, halfway down: drags its width (images, videos, PDFs).
+  private let handle = MediaResizeHandle()
+  /// Its handle is being dragged: the text below follows at once.
+  var isResizing: Bool { handle.isDragging }
+  /// The width while dragging, and until its line says the same.
+  private var draggedWidth: CGFloat?
+  private var dragStartWidth: CGFloat = 0
   /// Over the media while its line is in the note's selection.
   private let selectionTint = PassthroughView()
   private var tracking: NSTrackingArea?
@@ -716,6 +772,24 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     toggle.collapsed = collapsed
     toggle.alphaValue = 0
     addSubview(toggle)
+
+    handle.onDragBegan = { [weak self] in
+      guard let self else { return }
+      self.dragStartWidth = self.wrapperFrame.width
+    }
+    handle.onDrag = { [weak self] dx in
+      guard let self else { return }
+      self.draggedWidth = min(max(MediaBlockView.minimumWidth, self.dragStartWidth + dx), self.maximumWidth)
+      // Follows the pointer at once, like the text below it.
+      self.relayout(animated: false)
+    }
+    handle.onDragEnded = { [weak self] in
+      guard let self, let width = self.draggedWidth else { return }
+      let rounded = Int(width.rounded())
+      self.onResize?(CGFloat(rounded) >= self.maximumWidth - 0.5 ? nil : rounded)
+      self.updateHandle(animated: true)
+    }
+    addSubview(handle)
 
     configureIcon()
     updateTitle()
@@ -798,9 +872,35 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     }
   }
 
+  /// Whether the window is looking for a scroll event's view.
+  static var hitTestingScroll: Bool { NSApp.currentEvent?.type == .scrollWheel || debugScrollHitTest }
+  /// For automated checks: hit tests as if for a scroll.
+  static var debugScrollHitTest = false
+
+  /// A PDF scrolls its pages once clicked, until a click anywhere else;
+  /// before that, and always with the pointer outside it, the wheel
+  /// scrolls the note.
+  private var scrollsItself = false
+  private var clickMonitor: Any?
+
+  private func watchClicks() {
+    if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+    clickMonitor = nil
+    guard window != nil, case .document = descriptor.kind else { return }
+    clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+      MainActor.assumeIsolated {
+        guard let self else { return }
+        self.scrollsItself = event.window === self.window && self.loaded && !self.collapsed
+          && self.wrapperFrame.contains(self.convert(event.locationInWindow, from: nil))
+      }
+      return event
+    }
+  }
+
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     guardFocus()
+    watchClicks()
     // The toggle's label fits or not as the window resizes.
     if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
     resizeObserver = window.map {
@@ -1113,8 +1213,16 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
         }
       }
     case .document(let url):
-      startLoading()
-      showBrowser(url.absoluteString, script: nil)
+      if url.isFileURL {
+        if let document = PDFDocument(url: url) { showPDF(document, immediately: true) } else { showFailure() }
+      } else {
+        startLoading()
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+          DispatchQueue.main.async {
+            if let document = data.flatMap(PDFDocument.init(data:)) { self?.showPDF(document, immediately: false) } else { self?.showFailure() }
+          }
+        }.resume()
+      }
     case .note(let target):
       let view = NoteEmbedView(target: target, host: NoteRef(id: noteID), chain: embedChain)
       view.onOpenLink = { [weak self] url in self?.onOpenURL?(url) }
@@ -1176,6 +1284,20 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     finishLoading(immediately: immediately)
   }
 
+  private func showPDF(_ document: PDFDocument, immediately: Bool) {
+    let view = PDFEmbedView(document: document)
+    view.onPassScroll = { [weak self] event in self?.enclosingScrollView?.scrollWheel(with: event) }
+    view.frame = NSRect(origin: .zero, size: targetMediaSize())
+    install(view)
+    finishLoading(immediately: immediately)
+  }
+
+  private func showFailure() {
+    placeholder.layer?.removeAnimation(forKey: "pulse")
+    placeholder.image = Theme.symbol("exclamationmark.triangle", size: 22, weight: .regular)
+    MediaLoadQueue.shared.finished(self)
+  }
+
   private func showBrowser(_ url: String, served html: String? = nil, script: String?) {
     let view = GleaBrowserView(url: url, contentScript: script)
     view.audioMuted = soundMuted
@@ -1231,6 +1353,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     MediaLoadQueue.shared.finished(self)
     placeholder.layer?.removeAnimation(forKey: "pulse")
     loaded = true
+    updateHandle(animated: false)
     placeholder.alphaValue = 0
     placeholder.isHidden = true
     updateTitle()
@@ -1311,6 +1434,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     collapsed = value
     MediaState.set(value, note: noteID, key: descriptor.key)
     toggle.collapsed = value
+    updateHandle(animated: true)
     if value {
       // Collapsing only hides the media: embeds stay loaded (and keep
       // playing), like the demo.
@@ -1325,8 +1449,52 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   // MARK: Layout
 
+  /// Its line was rewritten: a new size or caption shows in place.
+  func adopt(_ newDescriptor: MediaDescriptor) {
+    let resized = newDescriptor.preferredWidth != descriptor.preferredWidth
+    descriptor = newDescriptor
+    if titleText != newDescriptor.title {
+      titleText = newDescriptor.title
+      updateTitle()
+    }
+    // Written after a drag: it's already that size.
+    if let dragged = draggedWidth, !handle.isDragging {
+      draggedWidth = nil
+      if abs(dragged - (newDescriptor.preferredWidth.map { min($0, maximumWidth) } ?? maximumWidth)) > 0.5 { relayout(animated: true) }
+    } else if resized {
+      relayout(animated: true)
+    }
+  }
+
+  static let minimumWidth: CGFloat = 48
+
+  /// As wide as it can show: the column, or for an image or a video its own
+  /// size (and no taller than the limit).
+  private var maximumWidth: CGFloat {
+    max(MediaBlockView.minimumWidth, mediaSize(maxWidth: availableWidth).width)
+  }
+
+  /// Images, videos and PDFs, once shown and open.
+  private var resizable: Bool {
+    guard canResize, loaded, !collapsed else { return false }
+    switch descriptor.kind {
+    case .image, .document: return true
+    case .video: return !descriptor.isAudio
+    case .embed, .note: return false
+    }
+  }
+
+  private func updateHandle(animated: Bool) {
+    let shown = resizable && (hovering || handle.isDragging)
+    handle.isHidden = !resizable
+    handle.setShown(shown, animated: animated)
+  }
+
   private func targetMediaSize() -> NSSize {
-    let maxWidth = min(availableWidth, descriptor.preferredWidth ?? availableWidth)
+    mediaSize(maxWidth: min(availableWidth, draggedWidth ?? descriptor.preferredWidth ?? availableWidth))
+  }
+
+  private func mediaSize(maxWidth: CGFloat) -> NSSize {
     switch descriptor.kind {
     case .document:
       return NSSize(width: maxWidth, height: round(min(760, maxWidth * 1.3)))
@@ -1403,6 +1571,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       let iconSize: CGFloat = 26
       placeholder.frame = NSRect(x: (rect.width - iconSize) / 2, y: (rect.height - iconSize) / 2, width: iconSize, height: iconSize)
       wrapper.alphaValue = collapsed ? min(1, rect.height / 40) : 1
+      // No taller than the media (its round ends included); still easy to grab.
+      handle.barLength = max(0, min(MediaResizeHandle.height, rect.height - 4))
+      let handleHeight = max(24, handle.barLength)
+      handle.frame = NSRect(x: rect.maxX + 5 - MediaResizeHandle.width / 2, y: rect.midY - handleHeight / 2,
+                            width: MediaResizeHandle.width, height: handleHeight)
       // The collapsed row shows as the media leaves.
       row.alphaValue = collapsed ? 1 : 0
     }
@@ -1521,6 +1694,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       guard hovering != oldValue else { return }
       let shown: CGFloat = hovering ? 1 : 0
       Motion.animate(0.2, timing: Motion.easeInOut) { toggle.animator().alphaValue = shown }
+      updateHandle(animated: true)
       // The tracking area follows (see updateTrackingAreas).
       updateTrackingAreas()
     }
@@ -1542,20 +1716,226 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   /// The note scrolls when the wheel is over an embed (embeds are sized to
-  /// their content, so they have nothing to scroll themselves).
+  /// their content, so they have nothing to scroll themselves; a PDF does,
+  /// once clicked: see `scrollsItself`).
   override func scrollWheel(with event: NSEvent) {
     enclosingScrollView?.scrollWheel(with: event)
   }
 
   override func hitTest(_ point: NSPoint) -> NSView? {
     let local = convert(point, from: superview)
-    if NSApp.currentEvent?.type == .scrollWheel {
-      return bounds.contains(local) ? self : nil
+    if MediaBlockView.hitTestingScroll {
+      guard bounds.contains(local) else { return nil }
+      if scrollsItself, !collapsed, wrapperFrame.contains(local) { return super.hitTest(point) ?? self }
+      return self
     }
     // Only the visible parts take clicks; the rest belongs to the text.
+    if !handle.isHidden, handle.frame.contains(local) { return handle }
     if toggle.alphaValue > 0.1, toggle.frame.contains(local) { return toggle.hitTest(convert(local, to: toggle.superview)) ?? toggle }
     if collapsed { return NSRect(x: 0, y: 0, width: 26 + rowTitle.frame.width, height: MediaBlockView.rowHeight).contains(local) ? super.hitTest(point) : nil }
     return wrapperFrame.contains(local) ? super.hitTest(point) : nil
+  }
+}
+
+/// A media block's resize handle (as in Beam): a short rounded bar right of
+/// the media, shown while the block is hovered, thicker and darker while the
+/// pointer is on it. Dragging it sideways changes the media's width.
+final class MediaResizeHandle: NSView {
+  static let width: CGFloat = 12
+  static let height: CGFloat = 44
+
+  var onDragBegan: (() -> Void)?
+  /// How far the pointer moved sideways since the press.
+  var onDrag: ((CGFloat) -> Void)?
+  var onDragEnded: (() -> Void)?
+  private(set) var isDragging = false
+
+  /// How long the bar is drawn, centered in the handle.
+  var barLength: CGFloat = height { didSet { if barLength != oldValue { needsLayout = true } } }
+  private let bar = CAShapeLayer()
+  private var pointerOn = false { didSet { updateBar() } }
+  private var pressX: CGFloat = 0
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    bar.lineCap = .round
+    bar.fillColor = nil
+    bar.opacity = 0
+    layer?.addSublayer(bar)
+    HoverView.track(self) { [weak self] on in
+      guard let self else { return }
+      self.pointerOn = on
+      self.updateCursor()
+    }
+    updateBar()
+  }
+
+  /// Cursor rects only follow the pointer moving: scrolled away from under a
+  /// still pointer (or onto it), the cursor would keep its old shape.
+  private func updateCursor() {
+    guard !isDragging, let window else { return }
+    if pointerOn { return NSCursor.resizeLeftRight.set() }
+    let hit = window.contentView?.hitTest(window.mouseLocationOutsideOfEventStream)
+    (hit is NSTextView ? NSCursor.iBeam : NSCursor.arrow).set()
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func layout() {
+    super.layout()
+    let path = CGMutablePath()
+    let length = min(barLength, bounds.height)
+    path.move(to: CGPoint(x: bounds.midX, y: (bounds.height - length) / 2))
+    path.addLine(to: CGPoint(x: bounds.midX, y: (bounds.height + length) / 2))
+    Motion.withoutAnimation {
+      bar.frame = bounds
+      bar.path = path
+    }
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    Motion.withoutAnimation { updateBar() }
+  }
+
+  /// Fades in or out (the layer's own short fade).
+  func setShown(_ shown: Bool, animated: Bool) {
+    let opacity: Float = shown ? 1 : 0
+    guard bar.opacity != opacity else { return }
+    if animated { bar.opacity = opacity } else { Motion.withoutAnimation { bar.opacity = opacity } }
+  }
+
+  /// Thicker and darker while the pointer is on it or it's dragged; the
+  /// change eases (the layer's implicit animation).
+  private func updateBar() {
+    let active = pointerOn || isDragging
+    bar.lineWidth = active ? 4 : 2
+    bar.strokeColor = resolvedCGColor(active ? Theme.resizeHandleHover : Theme.resizeHandle)
+  }
+
+  override func resetCursorRects() {
+    addCursorRect(bounds, cursor: .resizeLeftRight)
+  }
+
+  override func mouseDown(with event: NSEvent) {
+    pressX = event.locationInWindow.x
+    isDragging = true
+    updateBar()
+    onDragBegan?()
+  }
+
+  override func mouseDragged(with event: NSEvent) {
+    NSCursor.resizeLeftRight.set()
+    onDrag?(event.locationInWindow.x - pressX)
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    guard isDragging else { return }
+    isDragging = false
+    updateBar()
+    onDragEnded?()
+  }
+}
+
+/// A PDF's pages, scrolling in place once its block is clicked (see
+/// `MediaBlockView.scrollsItself`). A scroll that starts at the top or the
+/// bottom and pushes past it goes to the note instead; one that reaches an
+/// end mid-way stops there.
+final class PDFEmbedView: NSView {
+  /// Hands a scroll to the note.
+  var onPassScroll: ((NSEvent) -> Void)?
+  private let pdfView = PDFView()
+  /// Where the current gesture's events go, once its direction is known.
+  private var passesGesture: Bool?
+
+  init(document: PDFDocument) {
+    super.init(frame: .zero)
+    pdfView.document = document
+    pdfView.displayMode = .singlePageContinuous
+    pdfView.displaysPageBreaks = true
+    pdfView.autoresizingMask = [.width, .height]
+    addSubview(pdfView)
+    updateBackground()
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func layout() {
+    super.layout()
+    pdfView.frame = bounds
+    if bounds.size != fittedSize { fitPage() }
+  }
+
+  private var fittedSize = NSSize.zero
+
+  /// A whole page in view: as wide as fits, unless that's too tall.
+  private func fitPage() {
+    guard let page = pdfView.document?.page(at: 0), bounds.width > 0, bounds.height > 0 else { return }
+    fittedSize = bounds.size
+    var size = page.bounds(for: pdfView.displayBox).size
+    if page.rotation % 180 != 0 { size = NSSize(width: size.height, height: size.width) }
+    let margins = pdfView.pageBreakMargins
+    let width = bounds.width - margins.left - margins.right
+    let height = bounds.height - margins.top - margins.bottom
+    guard size.width > 0, size.height > 0, width > 0, height > 0 else { return }
+    pdfView.scaleFactor = min(width / size.width, height / size.height)
+  }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    updateBackground()
+  }
+
+  private func updateBackground() {
+    pdfView.backgroundColor = Theme.codeBackground
+  }
+
+  private var pagesScrollView: NSScrollView? {
+    func find(_ view: NSView) -> NSScrollView? {
+      if let scroll = view as? NSScrollView { return scroll }
+      for sub in view.subviews { if let found = find(sub) { return found } }
+      return nil
+    }
+    return find(pdfView)
+  }
+
+  /// Scroll events stop here, to be sent on to the pages or the note.
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let hit = super.hitTest(point)
+    return hit != nil && MediaBlockView.hitTestingScroll ? self : hit
+  }
+
+  override func scrollWheel(with event: NSEvent) {
+    guard let scroll = pagesScrollView else { return onPassScroll?(event) ?? () }
+    // Its ends bounce no further: what's past them is the note's.
+    scroll.verticalScrollElasticity = .none
+    let gesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+    // A wheel's clicks are each their own gesture.
+    if !gesture || event.phase.contains(.began) || event.phase.contains(.mayBegin) { passesGesture = nil }
+    if passesGesture == nil, event.scrollingDeltaY != 0 {
+      let (top, bottom) = ends(of: scroll)
+      // (A positive delta moves toward the top.)
+      passesGesture = event.scrollingDeltaY > 0 ? top : bottom
+    }
+    if passesGesture == true { onPassScroll?(event) } else { scroll.scrollWheel(with: event) }
+  }
+
+  /// For automated checks: the pages' visible rect and ends.
+  var debugScrollState: String {
+    guard let scroll = pagesScrollView else { return "no scroll view" }
+    let (top, bottom) = ends(of: scroll)
+    return "\(NSStringFromRect(scroll.documentVisibleRect)) top=\(top) bottom=\(bottom)"
+  }
+
+  /// Whether its pages are scrolled all the way to the top, to the bottom.
+  private func ends(of scroll: NSScrollView) -> (Bool, Bool) {
+    guard let document = scroll.documentView else { return (true, true) }
+    let visible = scroll.documentVisibleRect
+    let full = document.bounds
+    let atMin = visible.minY <= full.minY + 0.5
+    let atMax = visible.maxY >= full.maxY - 0.5
+    return document.isFlipped ? (atMin, atMax) : (atMax, atMin)
   }
 }
 

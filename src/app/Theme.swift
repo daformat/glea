@@ -45,6 +45,13 @@ enum Theme {
   static let pressedTabStroke = dynamic(
     light: NSColor(white: 0, alpha: 0.1),
     dark: NSColor(white: 1, alpha: 0.45))
+  /// A media block's resize handle, and while the pointer is on it.
+  static let resizeHandle = dynamic(
+    light: NSColor(srgbRed: 0xC6 / 255.0, green: 0xC8 / 255.0, blue: 0xCC / 255.0, alpha: 1),
+    dark: NSColor(white: 0x4D / 255.0, alpha: 1))
+  static let resizeHandleHover = dynamic(
+    light: NSColor(srgbRed: 0xA6 / 255.0, green: 0xA8 / 255.0, blue: 0xAB / 255.0, alpha: 1),
+    dark: NSColor(white: 0x73 / 255.0, alpha: 1))
   static let codeBackground = dynamic(
     light: NSColor(white: 0, alpha: 0.04),
     dark: NSColor(white: 1, alpha: 0.06))

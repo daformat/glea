@@ -43,7 +43,7 @@ struct SlashItem {
     SlashItem(title: "Inline Math", keywords: ["equation", "latex", "formula", "tex"], symbol: "x.squareroot", hint: "$ $",
               apply: { $0.insertInlineMath() }),
     SlashItem(title: "Table", keywords: ["grid"], symbol: "tablecells", hint: "| |", apply: { $0.insertTable() }),
-    SlashItem(title: "Image, Video or Sound", keywords: ["picture", "photo", "file", "movie", "audio", "media", "attachment"],
+    SlashItem(title: "Image, Video, Sound or PDF", keywords: ["picture", "photo", "file", "movie", "audio", "media", "attachment", "pdf", "document"],
               symbol: "photo", hint: "![]( )", apply: { $0.chooseMedia() }),
     SlashItem(title: "Web Embed", keywords: ["youtube", "vimeo", "video", "url", "embed"], symbol: "play.rectangle", hint: "URL",
               apply: { $0.insertWebEmbed() }),
@@ -336,7 +336,7 @@ extension MarkdownTextView {
     replace(NSRange(location: location, length: 0), with: "$x$", select: NSRange(location: location + 1, length: 1))
   }
 
-  /// Images, videos or sounds chosen from disk, copied into assets/ like
+  /// Images, videos, sounds or PDFs chosen from disk, copied into assets/ like
   /// dropped ones, each on its own line.
   func chooseMedia() {
     guard let window else { return }
@@ -344,7 +344,7 @@ extension MarkdownTextView {
     let panel = NSOpenPanel()
     panel.allowsMultipleSelection = true
     panel.canChooseDirectories = false
-    panel.allowedContentTypes = [.image, .movie, .audio]
+    panel.allowedContentTypes = [.image, .movie, .audio, .pdf]
     panel.beginSheetModal(for: window) { [weak self] response in
       guard let self, response == .OK, !panel.urls.isEmpty else { return }
       let board = NSPasteboard(name: NSPasteboard.Name("app.glea.media-" + UUID().uuidString))

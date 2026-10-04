@@ -305,6 +305,131 @@ final class LinkLabel: NSTextField {
   }
 }
 
+/// Content that folds and unfolds like a note section: the height eases,
+/// the content fades, and turning back mid-way starts from where it is.
+final class FoldView: NSView {
+  let body = NSStackView()
+  private(set) var unfolded = false
+  /// How far unfolded, 0 to 1, as it moves.
+  var onShownChange: ((CGFloat) -> Void)?
+  private var shown: CGFloat = 0
+  private var height: NSLayoutConstraint!
+  private var followsBody: NSLayoutConstraint!
+  private var fold: (from: CGFloat, began: CFTimeInterval, duration: CFTimeInterval, timer: Timer)?
+
+  init() {
+    super.init(frame: .zero)
+    translatesAutoresizingMaskIntoConstraints = false
+    wantsLayer = true
+    layer?.masksToBounds = true
+    body.orientation = .vertical
+    body.alignment = .leading
+    body.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(body)
+    height = heightAnchor.constraint(equalToConstant: 0)
+    followsBody = bottomAnchor.constraint(equalTo: body.bottomAnchor)
+    NSLayoutConstraint.activate([
+      body.topAnchor.constraint(equalTo: topAnchor),
+      body.leadingAnchor.constraint(equalTo: leadingAnchor),
+      body.trailingAnchor.constraint(equalTo: trailingAnchor),
+    ])
+    apply(0)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  func set(unfolded: Bool, animated: Bool) {
+    self.unfolded = unfolded
+    fold?.timer.invalidate()
+    fold = nil
+    let target: CGFloat = unfolded ? 1 : 0
+    guard animated, !Motion.reduceMotion else { return apply(target) }
+    let duration = Motion.foldDuration * Double(abs(target - shown))
+    let timer = Timer(timeInterval: 1 / 120, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated { self?.step() }
+    }
+    fold = (shown, CACurrentMediaTime(), duration, timer)
+    RunLoop.main.add(timer, forMode: .common)
+    step()
+  }
+
+  private func step() {
+    guard let fold else { return }
+    let t = fold.duration > 0 ? min(1, (CACurrentMediaTime() - fold.began) / fold.duration) : 1
+    let eased = CGFloat(1 - pow(1 - t, 3))
+    let target: CGFloat = unfolded ? 1 : 0
+    if t >= 1 {
+      fold.timer.invalidate()
+      self.fold = nil
+    }
+    apply(fold.from + (target - fold.from) * eased)
+  }
+
+  private func apply(_ value: CGFloat) {
+    shown = value
+    alphaValue = value
+    isHidden = value == 0
+    if value == 1 && fold == nil {
+      height.isActive = false
+      followsBody.isActive = true
+    } else {
+      followsBody.isActive = false
+      layoutSubtreeIfNeeded()
+      height.constant = (body.frame.height * value).rounded()
+      height.isActive = true
+    }
+    onShownChange?(value)
+  }
+}
+
+/// A rendered line of a note (linked and unlinked references): wraps,
+/// can be selected and copied, and its links open.
+final class SnippetView: NSTextView, NSTextViewDelegate {
+  var onOpenLink: ((URL) -> Void)?
+
+  init(_ text: NSAttributedString) {
+    let storage = NSTextStorage(attributedString: text)
+    let layout = NSLayoutManager()
+    storage.addLayoutManager(layout)
+    let container = NSTextContainer(size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude))
+    container.widthTracksTextView = true
+    container.lineFragmentPadding = 0
+    layout.addTextContainer(container)
+    super.init(frame: .zero, textContainer: container)
+    isEditable = false
+    isSelectable = true
+    drawsBackground = false
+    textContainerInset = .zero
+    isVerticallyResizable = false
+    isHorizontallyResizable = false
+    // Links keep their rendered look (no underline), with a hand.
+    linkTextAttributes = [.foregroundColor: Theme.accent, .cursor: NSCursor.pointingHand]
+    delegate = self
+    translatesAutoresizingMaskIntoConstraints = false
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override var intrinsicContentSize: NSSize {
+    guard let layoutManager, let textContainer else { return super.intrinsicContentSize }
+    layoutManager.ensureLayout(for: textContainer)
+    return NSSize(width: NSView.noIntrinsicMetric, height: ceil(layoutManager.usedRect(for: textContainer).height))
+  }
+
+  override func setFrameSize(_ newSize: NSSize) {
+    let rewraps = newSize.width != frame.width
+    super.setFrameSize(newSize)
+    if rewraps { invalidateIntrinsicContentSize() }
+  }
+
+  func textView(_ textView: NSTextView, clickedOnLink link: Any, at charIndex: Int) -> Bool {
+    guard let url = link as? URL ?? (link as? String).flatMap(URL.init(string:)) else { return false }
+    // Once the click is over: opening a note may remove this view.
+    DispatchQueue.main.async { [onOpenLink] in onOpenLink?(url) }
+    return true
+  }
+}
+
 /// A view that says when the pointer is over it, also when the page
 /// scrolls under a still pointer.
 final class HoverView: NSView {
@@ -684,6 +809,8 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
   private var unlinkedClipFollowsBody: NSLayoutConstraint!
   /// Unlinked references start folded, and stay as last set.
   private var showsUnlinked = false
+  /// Notes whose mentions past the first few are unfolded, for this note.
+  private var unfoldedSources: Set<String> = []
   /// How much of them shows, from 0 to 1, and the fold under way.
   private var unlinkedShown: CGFloat = 0
   private var unlinkedFold: (from: CGFloat, began: CFTimeInterval, duration: CFTimeInterval, timer: Timer)?
@@ -738,6 +865,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
   func show(_ ref: NoteRef) {
     if ref == self.ref, editor != nil { return }
     editor?.flush()
+    if ref != self.ref { unfoldedSources = [] }
     self.ref = ref
     clearColumn()
 
@@ -828,8 +956,12 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     let words = NoteStore.shared.content(of: ref).split { $0.isWhitespace || $0.isNewline }.count
     var parts = ["\(words) word\(words == 1 ? "" : "s")"]
     if let modified = NoteStore.shared.modified(ref) {
-      let formatter = RelativeDateTimeFormatter()
-      parts.append("edited " + formatter.localizedString(for: modified, relativeTo: Date()))
+      // Under a minute (or a hair ahead of the clock, just saved): "now".
+      if Date().timeIntervalSince(modified) < 60 {
+        parts.append("edited now")
+      } else {
+        parts.append("edited " + RelativeDateTimeFormatter().localizedString(for: modified, relativeTo: Date()))
+      }
     }
     metaLabel.stringValue = parts.joined(separator: " · ")
   }
@@ -844,19 +976,23 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     backlinks.addArrangedSubview(header)
     backlinks.setCustomSpacing(14, after: header)
     for link in links {
+      let block = NSStackView()
+      block.orientation = .vertical
+      block.alignment = .leading
+      block.spacing = 4
+      block.translatesAutoresizingMaskIntoConstraints = false
       let source = LinkLabel(link.ref.displayTitle, size: 14, weight: .semibold, color: Theme.accent)
       source.onClick = { [weak self] in self?.navigator?.openNote(link.ref) }
-      backlinks.addArrangedSubview(source)
-      backlinks.setCustomSpacing(4, after: source)
-      for line in link.lines.prefix(4) {
-        let text = NSTextField(wrappingLabelWithString: "")
-        text.attributedStringValue = MarkdownPreview.render(line)
-        text.translatesAutoresizingMaskIntoConstraints = false
-        backlinks.addArrangedSubview(text)
-        text.widthAnchor.constraint(equalTo: backlinks.widthAnchor).isActive = true
-        backlinks.setCustomSpacing(4, after: text)
+      block.addArrangedSubview(source)
+      let lines = link.lines.map { line -> NSView in
+        let text = SnippetView(MarkdownPreview.render(line))
+        text.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
+        return text
       }
-      if let last = backlinks.arrangedSubviews.last { backlinks.setCustomSpacing(18, after: last) }
+      addRows(lines, visible: 4, to: block, key: "linked \(link.ref.kind.rawValue)/\(link.ref.name)")
+      backlinks.addArrangedSubview(block)
+      block.widthAnchor.constraint(equalTo: backlinks.widthAnchor).isActive = true
+      backlinks.setCustomSpacing(18, after: block)
     }
     column.setCustomSpacing(backlinks.arrangedSubviews.isEmpty ? 0 : 22, after: backlinks)
   }
@@ -981,8 +1117,6 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     }
   }
 
-  /// The mention's line (around it, when long), the name in bold, and a
-  /// Link button on the right while it's hovered.
   /// One note's unlinked mentions under its title, with a button on the
   /// title line that links them all, shown while the pointer is over the block.
   private func unlinkedSource(_ source: (ref: NoteRef, mentions: [NoteStore.Mention])) -> NSView {
@@ -1017,20 +1151,49 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     block.addArrangedSubview(titleRow)
     titleRow.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
 
-    let shown = source.mentions.prefix(5)
-    for mention in shown {
-      let row = mentionRow(mention)
-      block.addArrangedSubview(row)
-      row.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
-    }
-    if source.mentions.count > shown.count {
-      let more = NSTextField.label("\(source.mentions.count - shown.count) more", size: 12, color: Theme.tertiaryText)
-      block.addArrangedSubview(more)
-    }
+    addRows(source.mentions.map(mentionRow), visible: 5, to: block, key: "unlinked \(source.ref.kind.rawValue)/\(source.ref.name)")
     HoverView.track(block) { [weak button] hovering in button?.fade(in: hovering) }
     return block
   }
 
+  /// Adds `rows` to `block`: the first `visible`, then the rest folded under
+  /// an "N more" label that unfolds them like a note section. `key` keeps
+  /// them unfolded while this note is open.
+  private func addRows(_ rows: [NSView], visible: Int, to block: NSStackView, key: String) {
+    for row in rows.prefix(visible) {
+      block.addArrangedSubview(row)
+      row.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
+    }
+    guard rows.count > visible else { return }
+    let rest = FoldView()
+    rest.body.spacing = block.spacing
+    for row in rows.dropFirst(visible) {
+      rest.body.addArrangedSubview(row)
+      row.widthAnchor.constraint(equalTo: rest.body.widthAnchor).isActive = true
+    }
+    block.addArrangedSubview(rest)
+    rest.widthAnchor.constraint(equalTo: block.widthAnchor).isActive = true
+    let count = rows.count - visible
+    let more = LinkLabel("", size: 12, weight: .regular, color: Theme.tertiaryText)
+    let unfolded = unfoldedSources.contains(key)
+    more.stringValue = unfolded ? "Show less" : "\(count) more"
+    // Its gap to the label grows with it, so nothing jumps as it starts.
+    rest.onShownChange = { [weak block, weak rest] shown in
+      guard let block, let rest else { return }
+      block.setCustomSpacing(block.spacing * shown, after: rest)
+    }
+    rest.set(unfolded: unfolded, animated: false)
+    more.onClick = { [weak self, weak rest, weak more] in
+      guard let self, let rest, let more else { return }
+      let unfold = !rest.unfolded
+      if unfold { self.unfoldedSources.insert(key) } else { self.unfoldedSources.remove(key) }
+      more.stringValue = unfold ? "Show less" : "\(count) more"
+      rest.set(unfolded: unfold, animated: true)
+    }
+    block.addArrangedSubview(more)
+  }
+
+  /// The mention's line (around it, when long), the name in bold.
   private func mentionRow(_ mention: NoteStore.Mention) -> NSView {
     var line = mention.line as NSString
     var match = mention.rangeInLine
@@ -1048,10 +1211,8 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     let text = MarkdownPreview.render(line as String, highlight: match, highlightAttributes: [
       .font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: Theme.text,
     ])
-    let label = NSTextField(wrappingLabelWithString: "")
-    label.attributedStringValue = text
-    label.translatesAutoresizingMaskIntoConstraints = false
-    label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    let label = SnippetView(text)
+    label.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
     let row = NSView()
     row.translatesAutoresizingMaskIntoConstraints = false
     row.addSubview(label)
@@ -1059,7 +1220,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
       label.leadingAnchor.constraint(equalTo: row.leadingAnchor),
       label.topAnchor.constraint(equalTo: row.topAnchor, constant: 3),
       label.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -3),
-      label.trailingAnchor.constraint(lessThanOrEqualTo: row.trailingAnchor),
+      label.trailingAnchor.constraint(equalTo: row.trailingAnchor),
     ])
     return row
   }

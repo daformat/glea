@@ -446,6 +446,37 @@ enum TestHooks {
           NSLog("Glea embed %d: url=%@ title=%@", i, browser.url, browser.title)
         }
       }
+    case "pdf-scroll":
+      // pdf-scroll:<delta>,<phase>: a trackpad scroll over the first PDF (+
+      // goes down the page), then logs the PDF's and the note's positions.
+      let parts = argument.split(separator: ",").map(String.init)
+      guard parts.count == 2, let delta = Int32(parts[0]), let window = controller.window,
+            let pdf = allSubviews(window.contentView!).first(where: { $0 is PDFEmbedView }) as? PDFEmbedView,
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: -delta, wheel2: 0, wheel3: 0)
+      else { break }
+      let point = window.convertPoint(toScreen: pdf.convert(NSPoint(x: pdf.bounds.midX, y: pdf.bounds.midY), to: nil))
+      event.location = CGPoint(x: point.x, y: NSScreen.screens[0].frame.maxY - point.y)
+      event.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+      event.setIntegerValueField(.scrollWheelEventPointDeltaAxis1, value: Int64(-delta))
+      event.setDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1, value: Double(-delta))
+      let phases: [String: (scroll: Int64, momentum: Int64)] = [
+        "began": (1, 0), "changed": (2, 0), "ended": (4, 0), "momentum": (0, 2), "momentum-ended": (0, 3), "wheel": (0, 0),
+      ]
+      guard let phase = phases[parts[1]] else { break }
+      event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.scroll)
+      event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase.momentum)
+      // Routed as the window would (posted events don't reach a window
+      // that isn't in front).
+      if let ns = NSEvent(cgEvent: event), let content = window.contentView {
+        MediaBlockView.debugScrollHitTest = true
+        let target = content.hitTest(window.convertPoint(fromScreen: point))
+        MediaBlockView.debugScrollHitTest = false
+        target?.scrollWheel(with: ns)
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        let page = allSubviews(window.contentView!).compactMap { $0 as? ColumnPageView }.first { !$0.isHiddenOrHasHiddenAncestor }
+        NSLog("Glea pdf-scroll %@ pdf=%@ note=%.0f", argument, pdf.debugScrollState, page?.scrollView.contentView.bounds.minY ?? -1)
+      }
     case "trackpad-scroll":
       // trackpad-scroll:<delta>,<began|changed|ended|momentum|momentum-ended>
       // scrolls the tab bar like a trackpad gesture (pixels, + goes right).
@@ -468,6 +499,55 @@ enum TestHooks {
       event.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase.scroll)
       event.setIntegerValueField(.scrollWheelEventMomentumPhase, value: phase.momentum)
       if let ns = NSEvent(cgEvent: event) { window.sendEvent(ns) }
+    case "media-resize":
+      // media-resize:<dx>[,<n>]: drags the nth (first) media resize handle
+      // sideways, then logs the note's media lines and the blocks' frames.
+      let values = argument.split(separator: ",").compactMap { Double($0) }
+      let handles = controller.window.map { allSubviews($0.contentView!).compactMap { $0 as? MediaResizeHandle }.filter { !$0.isHidden } } ?? []
+      let index = values.count > 1 ? Int(values[1]) : 0
+      guard let window = controller.window, let dx = values.first, index < handles.count else {
+        NSLog("Glea media-resize: no handle"); break
+      }
+      let handle = handles[index]
+      let start = handle.convert(NSPoint(x: handle.bounds.midX, y: handle.bounds.midY), to: nil)
+      func mouse(_ type: NSEvent.EventType, _ x: CGFloat) -> NSEvent {
+        NSEvent.mouseEvent(with: type, location: NSPoint(x: start.x + x, y: start.y), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+      }
+      handle.mouseDown(with: mouse(.leftMouseDown, 0))
+      // The gap from the block to the next one, after each step (in the
+      // same turn: what a frame would show).
+      let blocks = allSubviews(window.contentView!).compactMap { $0 as? MediaBlockView }.sorted { $0.frame.minY < $1.frame.minY }
+      let block = blocks.first { allSubviews($0).contains(handle) }
+      let next = block.flatMap { b in blocks.first { $0.frame.minY > b.frame.minY } }
+      var gaps: [String] = []
+      for step in 1...10 {
+        handle.mouseDragged(with: mouse(.leftMouseDragged, CGFloat(dx) * CGFloat(step) / 10))
+        if let block, let next { gaps.append(String(format: "%.0f", next.frame.minY - (block.frame.minY + block.blockHeight))) }
+      }
+      NSLog("Glea media-resize gaps: %@", gaps.joined(separator: " "))
+      handle.mouseUp(with: mouse(.leftMouseUp, CGFloat(dx)))
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        let editor = allSubviews(window.contentView!).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
+        let lines = (editor?.textView.string ?? "").split(separator: "\n").filter { $0.contains("![") }
+        let blocks = allSubviews(window.contentView!).compactMap { $0 as? MediaBlockView }
+          .map { "\($0.descriptor.key) w=\($0.descriptor.preferredWidth.map { "\($0)" } ?? "-") h=\($0.blockHeight)" }
+        NSLog("Glea media-resize %@: lines=%@ blocks=%@", argument, lines.joined(separator: " | "), blocks.joined(separator: " | "))
+      }
+    case "pdf-click":
+      // pdf-click / pdf-click:outside: clicks the first PDF's middle, or the
+      // note just above it, through the app (its event monitors see it).
+      guard let window = controller.window,
+            let pdf = allSubviews(window.contentView!).first(where: { $0 is PDFEmbedView }) else { break }
+      let inWindow = pdf.convert(NSPoint(x: pdf.bounds.midX, y: argument == "outside" ? pdf.bounds.maxY + 40 : pdf.bounds.midY), to: nil)
+      // (Flipped views: maxY is the bottom; "above" is the other way then.)
+      let point = argument == "outside" && pdf.isFlipped ? pdf.convert(NSPoint(x: pdf.bounds.midX, y: -40), to: nil) : inWindow
+      func mouse(_ type: NSEvent.EventType) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+      }
+      if let up = mouse(.leftMouseUp) { NSApp.postEvent(up, atStart: false) }
+      if let down = mouse(.leftMouseDown) { NSApp.sendEvent(down) }
     case "click":
       // click:<x>,<y> clicks at a point of the window (points, from the top left).
       let parts = argument.split(separator: ",").compactMap { Double($0) }
