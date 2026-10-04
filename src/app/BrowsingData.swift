@@ -39,10 +39,21 @@ enum SearchEngine: String, CaseIterable {
     }
   }
 
-  /// Fetches query suggestions (Google's endpoint works for every engine).
+  /// The engine's own suggestion service (OpenSearch's JSON: the query, then
+  /// the suggestions), so what's typed only goes to the engine chosen.
+  func suggestionsURL(_ query: String) -> String {
+    let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&+=?#"))) ?? query
+    switch self {
+    case .google: return "https://suggestqueries.google.com/complete/search?client=firefox&q=\(q)"
+    case .duckDuckGo: return "https://duckduckgo.com/ac/?type=list&q=\(q)"
+    case .kagi: return "https://kagi.com/api/autosuggest?q=\(q)"
+    case .bing: return "https://api.bing.com/osjson.aspx?query=\(q)"
+    }
+  }
+
+  /// Fetches query suggestions from the current engine.
   static func suggestions(for query: String, completion: @escaping ([String]) -> Void) {
-    guard let q = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-          let url = URL(string: "https://suggestqueries.google.com/complete/search?client=firefox&q=\(q)") else {
+    guard let url = URL(string: current.suggestionsURL(query)) else {
       completion([])
       return
     }
