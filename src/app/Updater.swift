@@ -23,7 +23,7 @@ extension Notification.Name {
 /// one of the window's states. (Not SPUStandardUpdaterController: it wraps
 /// Sparkle's own windows, the thing being replaced.)
 ///
-/// The feed is the latest release's appcast on github.com/daformat/glea-releases,
+/// The feed is the latest release's appcast on github.com/daformat/glea,
 /// proxied by glea.app (SUFeedURL), and published by scripts/release.sh.
 @MainActor
 final class Updater: NSObject, SPUUpdaterDelegate, SPUUserDriver {

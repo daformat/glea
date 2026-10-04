@@ -138,7 +138,7 @@ Timings follow Beam's: short ease-in-outs for state changes and firm springs for
 - Glea checks for updates every six hours and downloads them in the background ([Sparkle](https://sparkle-project.org)). When one is ready, a **Relaunch to Update** pill shows in the top bar, on the web and in the notes; otherwise it installs when Glea quits.
 - *Glea ▸ Check for Updates…* checks now, in Glea's own update window (from Subtitles).
 - Only Developer ID builds update; local builds don't.
-- `scripts/release.sh` publishes each release on [daformat/glea-releases](https://github.com/daformat/glea-releases): the DMG, the zip Sparkle installs and the signed appcast, which `glea.app/appcast.xml` serves. The notes are the "Glea x.y.z" commit's. The appcast is signed with the EdDSA key in the release Mac's keychain (account `glea`); back it up with `third_party/sparkle/bin/generate_keys --account glea -x <file>`, since losing it strands every installed copy.
+- `scripts/release.sh` publishes each release on [GitHub releases](https://github.com/daformat/glea/releases): the DMG, the zip Sparkle installs and the signed appcast, which `glea.app/appcast.xml` serves. The notes are the "Glea x.y.z" commit's. The appcast is signed with the EdDSA key in the release Mac's keychain (account `glea`); back it up with `third_party/sparkle/bin/generate_keys --account glea -x <file>`, since losing it strands every installed copy.
 
 ### Browser
 - Tabs with favicons (hover a tab to see its URL), session restore, back and forward, find in page (⌘F), zoom, and downloads to `~/Downloads`.

@@ -20,7 +20,7 @@
   <key>NSPrincipalClass</key><string>GleaApplication</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <!-- Updates (Sparkle). The feed is the latest release's appcast on
-       github.com/daformat/glea-releases, proxied by glea.app. Checks are on
+       github.com/daformat/glea, proxied by glea.app. Checks are on
        from the start, and updates download in the background: the top bar
        then offers to relaunch, or they install on quit. Only Developer ID
        builds update (see Updater.swift). The private half of the key is in

@@ -2,7 +2,7 @@
 # Builds Glea and produces a Developer ID signed release in dist/:
 # Glea.app (hardened runtime, timestamped), Glea-<version>.zip and .dmg, then
 # publishes it as an update: the DMG, the zip and the appcast on a GitHub
-# release of daformat/glea-releases, whose latest appcast glea.app/appcast.xml
+# release of daformat/glea, whose latest appcast glea.app/appcast.xml
 # serves (Updater.swift). GLEA_PUBLISH=0 stops before publishing.
 #
 # Release notes are the body of the "Glea <version>" commit (its "- " items).
@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 NOTARY_PROFILE=${GLEA_NOTARY_PROFILE-subtitles-notary}
 PUBLISH=${GLEA_PUBLISH:-1}
-REPO=daformat/glea-releases
+REPO=daformat/glea
 FEED_URL=https://glea.app/appcast.xml
 SPARKLE_BIN=$ROOT/third_party/sparkle/bin
 
@@ -212,16 +212,20 @@ grep -q "sparkle:version>$VERSION<" "$FEED/appcast.xml" || { echo "The appcast h
 # DMG also goes up as Glea.dmg, for a download link that never changes.
 STABLE_DMG=$DIST/Glea.dmg
 cp "$DMG" "$STABLE_DMG"
+# The tag first, on the release commit and pushed with it: the appcast points
+# at a URL with the tag's name in it.
+git push origin "$NOTES_COMMIT:refs/heads/main" 2>/dev/null || git push origin HEAD:main
+git tag -a "$TAG" -m "Glea $VERSION" "$NOTES_COMMIT" 2>/dev/null || echo "Tag $TAG already exists."
+git push origin "$TAG"
 NOTES_MD=$DIST/notes.md
 git log -1 --format=%b "$NOTES_COMMIT" | sed '/^Co-Authored-By:/,$d' > "$NOTES_MD"
-gh release create "$TAG" -R "$REPO" --draft --title "Glea $VERSION" --notes-file "$NOTES_MD" \
+gh release create "$TAG" -R "$REPO" --draft --verify-tag --title "Glea $VERSION" --notes-file "$NOTES_MD" \
   "$STABLE_DMG" "$DMG" "$ZIP" "$FEED/appcast.xml"
 ASSETS=$(gh release view "$TAG" -R "$REPO" --json assets -q '.assets[].name')
 for want in Glea.dmg "Glea-$VERSION.dmg" "Glea-$VERSION.zip" appcast.xml; do
   grep -qx "$want" <<<"$ASSETS" || { echo "Missing from the draft: $want" >&2; exit 1; }
 done
 gh release edit "$TAG" -R "$REPO" --draft=false --latest
-git tag -a "$TAG" -m "Glea $VERSION" "$NOTES_COMMIT" 2>/dev/null || echo "Tag $TAG already exists here."
 
 # What every installed copy sees (GitHub takes a moment to move "latest").
 for attempt in $(seq 1 12); do
