@@ -173,7 +173,9 @@ class ColumnPageView: NSView {
     var active = 0
     for (index, target) in tocTargets.enumerated() {
       guard let rect = target.locate() else { continue }
-      if rect.minY <= threshold { active = index }
+      // In page order: past the first one below, the rest are too.
+      guard rect.minY <= threshold else { break }
+      active = index
     }
     toc.setActiveIndex(active)
   }

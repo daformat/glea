@@ -1021,7 +1021,7 @@ struct MarkdownStyler {
     var rows: [(index: Int, cells: [NSRange])] = []
     for (i, entry) in lines.enumerated() where i != 1 {
       let line = string.substring(with: entry.line)
-      styleInline(storage, line: line, lineRange: entry.line, imageIndent: 0)
+      styleInline(storage, line: line, lineRange: entry.line, imageIndent: 0, drawsImages: false)
       if i == 0 { storage.addAttribute(.font, value: NSFont.systemFont(ofSize: Theme.bodySize, weight: .semibold), range: entry.line) }
       let cells = MarkdownStyler.tableCells(in: line as NSString).map {
         NSRange(location: $0.location + entry.line.location, length: $0.length)
@@ -1241,7 +1241,10 @@ struct MarkdownStyler {
   /// Styles links, emphasis, code and images inside one line. Returns the
   /// height of an image displayed below the line (0 if none).
   @discardableResult
-  private func styleInline(_ storage: NSTextStorage, line: String, lineRange: NSRange, imageIndent: CGFloat) -> CGFloat {
+  /// `drawsImages`: false in a table, whose rows can't make room for a
+  /// picture below them (it would cover what follows): its source shows.
+  private func styleInline(_ storage: NSTextStorage, line: String, lineRange: NSRange, imageIndent: CGFloat,
+                           drawsImages: Bool = true) -> CGFloat {
     let ns = line as NSString
     let local = NSRange(location: 0, length: ns.length)
     var taken: [NSRange] = []
@@ -1329,7 +1332,7 @@ struct MarkdownStyler {
     for m in MarkdownStyler.image.matches(in: line, range: local) where free(m.range) {
       taken.append(m.range)
       let source = ns.substring(with: m.range(at: 2))
-      guard imageHeight == 0, let url = resolveImageURL(source), let image = ImageCache.shared.image(for: url) else {
+      guard drawsImages, imageHeight == 0, let url = resolveImageURL(source), let image = ImageCache.shared.image(for: url) else {
         storage.addAttributes(faded, range: abs(m.range))
         continue
       }
@@ -3021,13 +3024,198 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   override func layout() {
     super.layout()
-    if abs(styledWidth - bounds.width) > 1 {
-      textView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: contentHeight)
-      restyle()
+    guard abs(styledWidth - bounds.width) > 1 else { return }
+    let first = styledWidth == 0
+    // Out of sight (the journal behind a note): restyled once it shows again.
+    guard first || !isHiddenOrHasHiddenAncestor else { return }
+    let long = storage.length > Self.firstPartLength * 2
+    guard first || !long || progressiveNext != nil else {
+      deferRestyleForWidth()
+      return
+    }
+    textView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: contentHeight)
+    if first, embedded == nil, long { restyleProgressively() } else { restyle() }
+  }
+
+  /// A live resize over: restyled at once (the text view reflows now, and
+  /// the blocks would stay fitted to the text as it was until the restyle).
+  override func viewDidEndLiveResize() {
+    super.viewDidEndLiveResize()
+    guard let pending = pendingWidthRestyle else { return }
+    pending.cancel()
+    pendingWidthRestyle = nil
+    restyle()
+  }
+
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    if abs(styledWidth - bounds.width) > 1 { needsLayout = true }
+  }
+
+  /// A long note's width changes come in bursts (a live resize, zooming the
+  /// window), each a restyle and layout of the whole note: the text reflows
+  /// on its own meanwhile, and the note restyles once they stop.
+  private var pendingWidthRestyle: DispatchWorkItem?
+
+  private func deferRestyleForWidth() {
+    pendingWidthRestyle?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
+      self.pendingWidthRestyle = nil
+      // Even back at the width it was styled at: blocks and their room were
+      // fitted along the way.
+      self.restyle()
+    }
+    pendingWidthRestyle = work
+    // (Pending first: the text view's frame change waits for the restyle too.)
+    if textView.frame.width != bounds.width {
+      textView.frame = NSRect(x: 0, y: 0, width: bounds.width, height: textView.frame.height)
+    }
+    // During a live resize the text view leaves its container's width as it
+    // was until the end (the text would show cut off, and the blocks fitted
+    // to text that isn't drawn): it reflows now.
+    if let container = textView.textContainer {
+      let width = max(1, bounds.width - textView.textContainerInset.width * 2)
+      if abs(container.size.width - width) > 0.5 {
+        container.size = NSSize(width: width, height: container.size.height)
+      }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: work)
+    followLinesWhileResizing()
+  }
+
+  /// Meanwhile, blocks on or near the screen fit the new width and follow
+  /// their lines as the text reflows, their lines reserving their new height
+  /// (what's drawn is laid out anyway; the others wait for the restyle).
+  private func followLinesWhileResizing() {
+    guard embedded == nil, let host = mediaHost, let container = textView.textContainer,
+          let clip = enclosingScrollView?.contentView, storage.length > 0 else { return }
+    // Blocks out of reach move with the editor, as when it only moves (and
+    // that starts from here: placed twice, those near would jump).
+    let frame = convert(bounds, to: host)
+    if let placed = placedFrame, slide == nil {
+      let dx = frame.minX - placed.minX, dy = frame.minY - placed.minY
+      if dx != 0 || dy != 0 {
+        for view in mediaViews.values where view.frame.minX > -50_000 {
+          view.frame = view.frame.offsetBy(dx: dx, dy: dy)
+        }
+        tableToggle.frame = tableToggle.frame.offsetBy(dx: dx, dy: dy)
+      }
+    }
+    placedFrame = frame
+    let shown = textView.convert(clip.bounds, from: clip).insetBy(dx: 0, dy: -clip.bounds.height / 2)
+    // Laid out from the top down to what shows: laid out on its own, the
+    // visible part is placed by an estimate of what's above it, and blocks and
+    // chevrons would land away from the lines AppKit then draws.
+    var glyphs = layoutManager.glyphRange(forBoundingRect: shown, in: container)
+    guard glyphs.length > 0 else { return }
+    let end = NSMaxRange(layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil))
+    layoutManager.ensureLayout(forCharacterRange: NSRange(location: 0, length: end))
+    glyphs = layoutManager.glyphRange(forBoundingRect: shown, in: container)
+    guard glyphs.length > 0 else { return }
+    let near = layoutManager.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
+    // Top to bottom: each block's new height moves the text, and the blocks,
+    // below it.
+    // (Also those still showing where their line was: the text moved away
+    // from under them. Their line is below what's laid out, which goes on
+    // down to it.)
+    let shownBlocks = mediaViews.compactMap { key, view -> (NSRange, MediaBlockView)? in
+      guard let range = mediaLines[key], NSMaxRange(range) <= storage.length,
+            NSIntersectionRange(range, near).length > 0 || NSLocationInRange(range.location, near)
+              || textView.convert(view.frame, from: host).intersects(shown),
+            storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil,
+            blockDrag?.media[key] == nil else { return nil }
+      return (range, view)
+    }.sorted { $0.0.location < $1.0.location }
+    for (range, view) in shownBlocks {
+      var rect = mediaFrame(view.descriptor, line: range, in: screenLayout)
+      view.availableWidth = rect.width - MediaBlockView.gutterWidth
+      reserveRoom(for: view, line: range)
+      rect.size.height = max(view.blockHeight, MediaBlockView.rowHeight)
+      view.frame = textView.convert(rect, to: host)
+    }
+    // The gutter's chevrons and handles too.
+    if gutter.superview === host {
+      let frame = convert(bounds, to: host)
+      gutter.frame = NSRect(x: frame.minX - NoteGutterView.width, y: frame.minY,
+                            width: frame.width + NoteGutterView.width, height: frame.height)
+      gutter.items = gutterItems(within: near)
+      layoutBlockHandles(near: near)
+    }
+  }
+
+  // MARK: Long notes, a part at a time
+
+  /// While a long note is styled a part at a time: where what's left starts.
+  private var progressiveNext: Int?
+  private var progressiveGeneration = 0
+  /// What a note's first layout styles at once (a window's worth and more),
+  /// then how much each run loop turn after it does.
+  private static let firstPartLength = 8_000
+  private static let partLength = 12_000
+
+  /// A long note's first layout: its start is styled and laid out at once,
+  /// the rest a part per run loop turn, top to bottom. Meanwhile the editor
+  /// ends where the styled text does (nothing shows unstyled), and anything
+  /// that needs the whole note styles what's left first.
+  private func restyleProgressively() {
+    // AppKit would lay the unstyled rest out in idle time, for nothing.
+    layoutManager.backgroundLayoutEnabled = false
+    progressiveGeneration += 1
+    progressiveNext = 0
+    // (It stands for the full restyle viewDidMoveToWindow asks for.)
+    if window != nil { fullRestylesInWindow += 1 }
+    styleNextPart(length: Self.firstPartLength)
+  }
+
+  private func styleNextPart(length: Int) {
+    guard let start = progressiveNext else { return }
+    let text = storage.string as NSString
+    // Whole lines.
+    let part = text.paragraphRange(for: NSRange(location: start, length: min(length, text.length - start)))
+    let end = max(NSMaxRange(part), min(text.length, start + 1))
+    if end < text.length {
+      progressiveNext = end
+    } else {
+      progressiveNext = nil
+      layoutManager.backgroundLayoutEnabled = true
+    }
+    restyle(limits: [NSRange(location: start, length: end - start)])
+    guard progressiveNext != nil else { return }
+    let generation = progressiveGeneration
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.progressiveGeneration == generation else { return }
+      self.styleNextPart(length: Self.partLength)
+    }
+  }
+
+  /// Styles what's left of a note styled a part at a time, now.
+  func finishStyling() {
+    guard progressiveNext != nil else { return }
+    restyle()
+  }
+
+  private func stopStylingParts() {
+    guard progressiveNext != nil else { return }
+    progressiveNext = nil
+    progressiveGeneration += 1
+    layoutManager.backgroundLayoutEnabled = true
+  }
+
+  /// Lays the text out: all of it, or what's styled so far (see
+  /// `restyleProgressively`).
+  private func ensureStyledLayout() {
+    guard let container = textView.textContainer else { return }
+    if let next = progressiveNext {
+      layoutManager.ensureLayout(forCharacterRange: NSRange(location: 0, length: next))
+    } else {
+      layoutManager.ensureLayout(for: container)
     }
   }
 
   @objc private func textFrameChanged() {
+    // (Resizing: the restyle after it sizes it.)
+    guard pendingWidthRestyle == nil else { return }
     updateHeight()
   }
 
@@ -3035,13 +3223,20 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// below the last paragraph.
   private func updateHeight() {
     guard let container = textView.textContainer else { return }
-    layoutManager.ensureLayout(for: container)
-    var height = layoutManager.usedRect(for: container).height
-    let glyphCount = layoutManager.numberOfGlyphs
-    if glyphCount > 0 {
-      // usedRect leaves out the paragraph spacing reserved for a trailing image.
-      let last = layoutManager.lineFragmentRect(forGlyphAt: glyphCount - 1, effectiveRange: nil)
-      height = max(height, last.maxY)
+    ensureStyledLayout()
+    var height: CGFloat = 0
+    if let next = progressiveNext {
+      // Down to the end of the styled part (the rest isn't laid out yet).
+      let glyph = layoutManager.glyphIndexForCharacter(at: max(0, next - 1))
+      height = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).maxY
+    } else {
+      height = layoutManager.usedRect(for: container).height
+      let glyphCount = layoutManager.numberOfGlyphs
+      if glyphCount > 0 {
+        // usedRect leaves out the paragraph spacing reserved for a trailing image.
+        let last = layoutManager.lineFragmentRect(forGlyphAt: glyphCount - 1, effectiveRange: nil)
+        height = max(height, last.maxY)
+      }
     }
     // Media blocks hang below their line; the last paragraph's spacing
     // doesn't count in text layout, so make room for them explicitly.
@@ -3077,6 +3272,18 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// text is laid out and the page's blocks placed once for all of them.
   private func restyle(limits: [NSRange]?) {
     guard !textView.hasMarkedText() else { return }
+    if limits == nil, let pending = pendingWidthRestyle {
+      pending.cancel()
+      pendingWidthRestyle = nil
+    }
+    var limits = limits
+    // Styling a part at a time: only lines already styled restyle as asked;
+    // anything else styles the whole note now.
+    if let next = progressiveNext, !(limits?.allSatisfy({ NSMaxRange($0) <= next }) ?? false) {
+      stopStylingParts()
+      limits = nil
+    }
+    let partial = progressiveNext != nil
     let focused = window?.firstResponder === textView
     let selection = focused ? textView.selectedRange() : nil
     styledSelection = selection
@@ -3136,11 +3343,28 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       updateHeight()
       _ = layoutMediaViews()
     }
-    layoutFoldGutter()
+    // (Headings' chevrons and block handles come once it's all styled.)
+    if !partial { layoutFoldGutter() }
     textView.needsDisplay = true
     layoutTableEditing()
     placedFrame = mediaHost.map { convert(bounds, to: $0) }
     updateMediaSelection()
+  }
+
+  /// Makes the block's line reserve its current height, as the styler would
+  /// (resizing: the text below follows the block without a restyle).
+  private func reserveRoom(for view: MediaBlockView, line range: NSRange) {
+    let paragraph = (storage.string as NSString).paragraphRange(for: range)
+    guard paragraph.length > 0,
+          let style = storage.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil) as? NSParagraphStyle
+    else { return }
+    let below = storage.attribute(.gleaMediaBelow, at: range.location, effectiveRange: nil) != nil
+    let spacing = below ? view.blockHeight + 14 : max(0, view.blockHeight - MediaBlockView.rowHeight) + 10
+    guard abs(style.paragraphSpacing - spacing) > 0.5 else { return }
+    let updated = style.mutableCopy() as! NSMutableParagraphStyle
+    updated.paragraphSpacing = spacing
+    storage.addAttribute(.paragraphStyle, value: updated, range: paragraph)
+    reservedMediaHeights[view.descriptor.key] = view.blockHeight
   }
 
   /// The height last reserved for each block in the text.
@@ -3276,6 +3500,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// Expands the collapsed sections containing the character at `index`.
   func reveal(_ index: Int) {
+    finishStyling()
     unfold(around: NSRange(location: index, length: 0))
   }
 
@@ -3388,9 +3613,15 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// The visible lines of a block, in this view's coordinates (the text
   /// view's).
-  private func blockRect(_ block: MarkdownBlock) -> NSRect? {
+  /// `within`: only its part there (resizing: a long list isn't laid out
+  /// down to its end at every step).
+  private func blockRect(_ block: MarkdownBlock, within: NSRange? = nil) -> NSRect? {
     let first = lineRanges[block.lines.lowerBound], last = lineRanges[block.lines.upperBound - 1]
-    let chars = NSRange(location: first.location, length: NSMaxRange(last) - first.location)
+    var chars = NSRange(location: first.location, length: NSMaxRange(last) - first.location)
+    if let within {
+      let part = NSIntersectionRange(chars, within)
+      if part.length > 0 { chars = part }
+    }
     guard storage.length > 0 else { return nil }
     let glyphs = layoutManager.glyphRange(forCharacterRange: chars, actualCharacterRange: nil)
     var rect = NSRect.null
@@ -3406,17 +3637,23 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     return rect.offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)
   }
 
-  private func layoutBlockHandles() {
+  /// `near`: only the blocks starting there (resizing: the text hasn't
+  /// changed, its blocks are the same).
+  private func layoutBlockHandles(near: NSRange? = nil) {
     guard blockDrag == nil else { return }
-    lineRanges = computeLineRanges()
-    blocks = MarkdownStyler.blocks(in: storage.string)
+    if near == nil {
+      lineRanges = computeLineRanges()
+      blocks = MarkdownStyler.blocks(in: storage.string)
+    }
     guard storage.length > 0 else {
       gutter.handles = []
       return
     }
     gutter.handles = blocks.indices.compactMap { index in
       let block = blocks[index]
-      guard !isHidden(line: block.lines.lowerBound), let rect = blockRect(block) else { return nil }
+      guard lineRanges.indices.contains(block.lines.lowerBound),
+            near.map({ NSLocationInRange(lineRanges[block.lines.lowerBound].location, $0) }) ?? true,
+            !isHidden(line: block.lines.lowerBound), let rect = blockRect(block, within: near) else { return nil }
       let line = lineRanges[block.lines.lowerBound]
       let glyph = layoutManager.glyphIndexForCharacter(at: line.location)
       let fragment = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
@@ -3756,8 +3993,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// views were created (their height isn't reserved yet).
   @discardableResult
   private func layoutMediaViews() -> Bool {
-    guard let container = textView.textContainer else { return false }
-    layoutManager.ensureLayout(for: container)
+    guard textView.textContainer != nil else { return false }
+    ensureStyledLayout()
     var seen = Set<String>()
     var created = false
     var lines: [String: NSRange] = [:]
@@ -3893,6 +4130,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       placedFrame = frame
       return
     }
+    // (Resizing: blocks near the screen follow their lines, and the restyle
+    // after it places them all.)
+    guard pendingWidthRestyle == nil else {
+      followLinesWhileResizing()
+      return
+    }
     _ = layoutMediaViews()
     layoutFoldGutter()
     layoutTableEditing()
@@ -3903,6 +4146,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// once, and what follows slides there (see `slidePage`). Otherwise
   /// (loaded, measured): its line reflows, once per run loop turn.
   private func mediaHeightChanged(_ key: String, from old: CGFloat?) {
+    // Resizing: blocks fit the width as it goes, the restyle after it makes
+    // their room.
+    guard pendingWidthRestyle == nil else { return }
     if old != nil, let host = mediaHost, let view = mediaViews[key], view.superview === host,
        let range = mediaLines[key], range.location < storage.length,
        storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil {
@@ -4284,9 +4530,14 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// The line containing `index`, in this view's coordinates.
   func lineRect(forCharacterAt index: Int) -> NSRect? {
-    guard let container = textView.textContainer, storage.length > 0 else { return nil }
-    layoutManager.ensureLayout(for: container)
-    let glyph = layoutManager.glyphIndexForCharacter(at: min(max(0, index), storage.length - 1))
+    guard textView.textContainer != nil, storage.length > 0 else { return nil }
+    // Not placed yet: the note is still being styled down to it.
+    if let next = progressiveNext, index >= next { return nil }
+    // Laid out down to it, not further (the table of contents asks on every
+    // layout and scroll).
+    let character = min(max(0, index), storage.length - 1)
+    layoutManager.ensureLayout(forCharacterRange: NSRange(location: 0, length: character + 1))
+    let glyph = layoutManager.glyphIndexForCharacter(at: character)
     var rect = layoutManager.lineFragmentUsedRect(forGlyphAt: glyph, effectiveRange: nil)
     rect.origin.x += textView.textContainerOrigin.x
     rect.origin.y += textView.textContainerOrigin.y
