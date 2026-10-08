@@ -576,6 +576,8 @@ struct CubicBezier {
 
   /// hello-mat's --custom-ease.
   static let media = CubicBezier(x1: 0.42, y1: 0, x2: 0.25, y2: 1)
+  /// Motion.easeOut.
+  static let easeOut = CubicBezier(x1: 0.16, y1: 1, x2: 0.3, y2: 1)
   /// The cubic ease-out sections fold with.
   static let fold = CubicBezier(x1: 0.33, y1: 1, x2: 0.68, y2: 1)
 
@@ -1728,6 +1730,14 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     blockHeight = height
     needsLayout = true
     if abs(height - old) > 0.25 { onHeightChange?(animated ? old : nil) }
+  }
+
+  /// Shows its new size at once: it changed out of sight, and the page
+  /// scrolls to keep what's in view in place instead.
+  func skipResizeAnimation() {
+    for layer in [wrapper.layer, content?.layer, row.layer, placeholder.layer] {
+      for key in ["position", "bounds", "opacity", "transform"] { layer?.removeAnimation(forKey: "glea.block.\(key)") }
+    }
   }
 
   override func layout() {

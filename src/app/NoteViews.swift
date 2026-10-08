@@ -183,39 +183,72 @@ class ColumnPageView: NSView {
   private func scrollToTocEntry(_ index: Int) {
     guard tocTargets.indices.contains(index) else { return }
     tocTargets[index].reveal?()
-    guard let rect = tocTargets[index].locate() else { return }
-    scroll(to: rect) { [weak self] in
+    scroll(to: tocTargets[index].locate) { [weak self] in
       guard let self else { return }
       self.pinnedEntry = (index, self.scrollView.contentView.bounds.minY)
       self.toc.setActiveIndex(index)
     }
   }
 
-  /// Scrolls a place in the page (a heading jumped to) near the top.
-  func scroll(to rect: NSRect, completion: (() -> Void)? = nil) {
+  /// Scrolls a place in the page (a heading jumped to) near the top. It's
+  /// found again as the page scrolls: blocks loading above it push it down,
+  /// and the scroll and its highlight go along.
+  func scroll(to locate: @escaping () -> NSRect?, completion: (() -> Void)? = nil) {
+    guard let rect = locate() else { return }
     let clip = scrollView.contentView
-    let maxY = max(0, document.bounds.height - clip.bounds.height)
-    let y = min(max(0, rect.minY - 40), maxY)
     // The heading lights up at once and rides in with the page (the scroll
     // looks settled well before its end), fading once it has arrived.
-    flash(rect, fadingAfter: 0.5)
-    Motion.animate(0.5, timing: Motion.easeOut, {
-      clip.animator().setBoundsOrigin(NSPoint(x: 0, y: y))
-    }, completion: { [weak self] in
-      guard let self else { return }
+    flash(rect, locate: locate, fadingAfter: 0.5)
+    scrollTimer?.invalidate()
+    scrollTimer = nil
+    let duration: CFTimeInterval = Motion.reduceMotion ? 0 : 0.5
+    let start = CACurrentMediaTime()
+    var progress: CGFloat = 0
+    // Each frame covers its share of what's left, from wherever the page is
+    // (it may have scrolled to keep what's in view in place).
+    let step = { [weak self] () -> Bool in
+      guard let self, let rect = locate() else { return true }
+      let y = min(max(0, rect.minY - 40), max(0, self.document.bounds.height - clip.bounds.height))
+      let t = duration > 0 ? min(1, (CACurrentMediaTime() - start) / duration) : 1
+      let next = CGFloat(CubicBezier.easeOut(t))
+      let current = clip.bounds.minY
+      let to = next >= 1 ? y : current + (y - current) * (next - progress) / (1 - progress)
+      progress = next
+      clip.scroll(to: NSPoint(x: clip.bounds.minX, y: to))
       self.scrollView.reflectScrolledClipView(clip)
+      return next >= 1
+    }
+    if step() {
       completion?()
-    })
+      return
+    }
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard step() else { return }
+        timer.invalidate()
+        if self?.scrollTimer === timer { self?.scrollTimer = nil }
+        completion?()
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    scrollTimer = timer
   }
 
+  private var scrollTimer: Timer?
+
+  /// The heading last jumped to, highlighted, and how to find it.
+  private var flashed: (view: NSView, locate: () -> NSRect?)?
+
   /// Briefly highlights a heading that was jumped to.
-  private func flash(_ rect: NSRect, fadingAfter delay: CFTimeInterval) {
+  private func flash(_ rect: NSRect, locate: @escaping () -> NSRect?, fadingAfter delay: CFTimeInterval) {
+    flashed?.view.removeFromSuperview()
     let highlight = NSView(frame: rect.insetBy(dx: -8, dy: -2))
     highlight.wantsLayer = true
     highlight.layer?.cornerRadius = 8
     highlight.layer?.cornerCurve = .continuous
     highlight.layer?.backgroundColor = resolvedCGColor(Theme.accentWash)
     document.addSubview(highlight, positioned: .below, relativeTo: column)
+    flashed = (highlight, locate)
     let fade = Motion.basic("opacity", duration: 1.1, timing: Motion.easeInOut)
     fade.fromValue = 1
     fade.toValue = 0
@@ -223,9 +256,19 @@ class ColumnPageView: NSView {
     fade.fillMode = .both
     fade.isRemovedOnCompletion = false
     CATransaction.begin()
-    CATransaction.setCompletionBlock { highlight.removeFromSuperview() }
+    CATransaction.setCompletionBlock { [weak self] in
+      highlight.removeFromSuperview()
+      if self?.flashed?.view === highlight { self?.flashed = nil }
+    }
     highlight.layer?.add(fade, forKey: "flash")
     CATransaction.commit()
+  }
+
+  /// The page was laid out again: the highlight moves with its heading
+  /// (before what follows a resizing block slides, so it slides along).
+  func followFlash() {
+    guard let flashed, let rect = flashed.locate() else { return }
+    flashed.view.frame = rect.insetBy(dx: -8, dy: -2)
   }
 }
 
@@ -674,6 +717,7 @@ final class JournalView: ColumnPageView {
     }
     for editor in editors.values {
       editor.onTextChange = { [weak self] in self?.refreshToc() }
+      editor.onLayout = { [weak self] in self?.followFlash() }
     }
     refreshToc()
     revealContent()
@@ -880,6 +924,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     editor.onOpenLink = { [weak self] url in self?.navigator?.openLink(url) }
     editor.onSearch = { [weak self] url in self?.navigator?.openSearch(url) }
     editor.onTextChange = { [weak self] in self?.refreshToc() }
+    editor.onLayout = { [weak self] in self?.followFlash() }
     self.editor = editor
     addToColumn(editor, spacingAfter: 56)
     addToColumn(backlinks)
@@ -916,8 +961,11 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     guard let offset else { return false }
     editor.reveal(offset)
     layoutSubtreeIfNeeded()
-    guard let rect = editor.lineRect(forCharacterAt: offset) else { return false }
-    scroll(to: editor.convert(rect, to: document))
+    guard editor.lineRect(forCharacterAt: offset) != nil else { return false }
+    scroll(to: { [weak self, weak editor] in
+      guard let self, let editor, let rect = editor.lineRect(forCharacterAt: offset) else { return nil }
+      return editor.convert(rect, to: self.document)
+    })
     return true
   }
 

@@ -1356,7 +1356,7 @@ struct MarkdownStyler {
         : "glea-note:" + (written.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? written)
       let visible = m.range(at: 1)
       if let link, let url = MarkdownStyler.linkValue(link) { storage.addAttribute(.link, value: url, range: abs(visible)) }
-      storage.addAttribute(.font, value: NSFont.systemFont(ofSize: Theme.bodySize, weight: .medium), range: abs(visible))
+      addWeight(.medium, to: storage, range: abs(visible))
       syntax(NSRange(location: m.range.location, length: visible.location - m.range.location))
       syntax(NSRange(location: visible.upperBound, length: m.range.upperBound - visible.upperBound))
     }
@@ -1375,7 +1375,7 @@ struct MarkdownStyler {
       if let url = MarkdownStyler.linkValue("glea-note:" + (name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name)) {
         storage.addAttribute(.link, value: url, range: abs(visible))
       }
-      storage.addAttribute(.font, value: NSFont.systemFont(ofSize: Theme.bodySize, weight: .medium), range: abs(visible))
+      addWeight(.medium, to: storage, range: abs(visible))
       syntax(NSRange(location: m.range.location, length: visible.location - m.range.location))
       syntax(NSRange(location: visible.upperBound, length: m.range.upperBound - visible.upperBound))
     }
@@ -1435,6 +1435,18 @@ struct MarkdownStyler {
       syntax(NSRange(location: m.range.upperBound - 2, length: 2))
     }
     return imageHeight
+  }
+
+  /// At least `weight`, at the size already there: a link in a heading
+  /// stays heading-sized (and semibold).
+  private func addWeight(_ weight: NSFont.Weight, to storage: NSTextStorage, range: NSRange) {
+    storage.enumerateAttribute(.font, in: range) { value, subrange, _ in
+      let font = value as? NSFont ?? Theme.bodyFont
+      guard font.pointSize > 1 else { return }
+      let traits = font.fontDescriptor.object(forKey: .traits) as? [NSFontDescriptor.TraitKey: Any]
+      let current = traits?[.weight] as? CGFloat ?? NSFont.Weight.regular.rawValue
+      storage.addAttribute(.font, value: NSFont.systemFont(ofSize: font.pointSize, weight: NSFont.Weight(max(current, weight.rawValue))), range: subrange)
+    }
   }
 
   private func addTrait(_ trait: NSFontTraitMask, to storage: NSTextStorage, range: NSRange) {
@@ -2812,6 +2824,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   var onSearch: ((URL) -> Void)?
   /// Called after the text changes (typing or an external edit).
   var onTextChange: (() -> Void)?
+  /// Its text was laid out again (blocks resizing, say): what points into
+  /// it follows.
+  var onLayout: (() -> Void)?
 
   private let layoutManager = MarkdownLayoutManager()
   private let foldingDelegate = FoldingLayoutDelegate()
@@ -2950,7 +2965,12 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       hoverAreaHost = host
     }
     if window == nil {
-      for view in mediaViews.values { view.removeFromSuperview() }
+      // Gone from the page in the same frame as the rest of the note (another
+      // replacing it): an embed leaving the window goes blank at once, before
+      // the window shows what's there instead.
+      let leaving = Array(mediaViews.values)
+      for view in leaving { view.alphaValue = 0 }
+      DispatchQueue.main.async { leaving.forEach { $0.removeFromSuperview() } }
       mediaViews = [:]
       gutter.removeFromSuperview()
     } else {
@@ -3349,6 +3369,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     layoutTableEditing()
     placedFrame = mediaHost.map { convert(bounds, to: $0) }
     updateMediaSelection()
+    onLayout?()
   }
 
   /// Makes the block's line reserve its current height, as the styler would
@@ -3696,20 +3717,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     // following the pointer, and its place stays blank until it is dropped.
     // With its gutter: the grip and chevron lift with it.
     let rect = withGutter(textRect)
-    let lines = textView.snapshot(of: textRect)
-    let snapshot = NSImage(size: rect.size, flipped: true) { [gutter] bounds in
-      NSGraphicsContext.saveGraphicsState()
-      let shift = NSAffineTransform()
-      shift.translateX(by: 0, yBy: -textRect.minY)
-      shift.concat()
-      gutter.effectiveAppearance.performAsCurrentDrawingAppearance {
-        gutter.drawLifted(NSRect(x: 0, y: textRect.minY, width: NoteGutterView.width, height: textRect.height))
-      }
-      NSGraphicsContext.restoreGraphicsState()
-      lines.draw(in: NSRect(x: NoteGutterView.width, y: 0, width: textRect.width, height: bounds.height),
-                 from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
-      return true
-    }
+    let snapshot = liftedSnapshot(of: textRect)
     // Its media blocks stay above the blank and the copy.
     let chars = NSRange(location: lineRanges[block.lines.lowerBound].location,
                         length: NSMaxRange(lineRanges[block.lines.upperBound - 1]) - lineRanges[block.lines.lowerBound].location)
@@ -3809,6 +3817,25 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   private var liftedLayer: CALayer?
 
+  /// A block's text (a rect of the text view) with its gutter, as the copy
+  /// that's dragged shows it.
+  private func liftedSnapshot(of textRect: NSRect) -> NSImage {
+    let lines = textView.snapshot(of: textRect)
+    return NSImage(size: withGutter(textRect).size, flipped: true) { [gutter] bounds in
+      NSGraphicsContext.saveGraphicsState()
+      let shift = NSAffineTransform()
+      shift.translateX(by: 0, yBy: -textRect.minY)
+      shift.concat()
+      gutter.effectiveAppearance.performAsCurrentDrawingAppearance {
+        gutter.drawLifted(NSRect(x: 0, y: textRect.minY, width: NoteGutterView.width, height: textRect.height))
+      }
+      NSGraphicsContext.restoreGraphicsState()
+      lines.draw(in: NSRect(x: NoteGutterView.width, y: 0, width: textRect.width, height: bounds.height),
+                 from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+      return true
+    }
+  }
+
   /// A rect of the text widened to include the gutter on its left.
   private func withGutter(_ rect: NSRect) -> NSRect {
     NSRect(x: rect.minX - NoteGutterView.width, y: rect.minY, width: rect.width + NoteGutterView.width, height: rect.height)
@@ -3828,11 +3855,17 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     if drop, drag.target != nil { window?.makeFirstResponder(textView) }
     if drop, let target = drag.target, let line = moveBlock(drag.block, before: target.line) {
       layoutBlockHandles()
+      // Its media blocks in their new place first: the block's place spans
+      // them (where they were dragged, it would be off by as much).
+      _ = layoutMediaViews()
       // The block's new place stays blank until the copy gets there.
       if let moved = blocks.first(where: { $0.lines.lowerBound == line }), let rect = blockRect(moved) {
         destination = textView.convert(withGutter(rect), to: host)
         drag.blank.frame = destination
         gutter.liftedBand = rect.minY...rect.maxY
+        // It may not look the same there (the cursor in it shows an image's
+        // source, say): the copy turns into how it will look as it lands.
+        if let lifted { crossfade(lifted, to: liftedSnapshot(of: rect), duration: BlockDragDebug.liftDuration * 1.25) }
       }
     } else {
       layoutBlockHandles()
@@ -3881,6 +3914,30 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       lifted.opacity = 1
       lifted.add(shrink, forKey: "grow")
       lifted.add(fadeIn, forKey: "fade")
+    }
+  }
+
+  /// Fades the lifted copy's content into `image`, top-aligned (it may be
+  /// taller or shorter).
+  private func crossfade(_ lifted: CALayer, to image: NSImage, duration: CFTimeInterval) {
+    guard let old = lifted.sublayers?.last else { return }
+    let fresh = CALayer()
+    fresh.contents = image
+    fresh.contentsScale = window?.backingScaleFactor ?? 2
+    lifted.masksToBounds = false
+    Motion.withoutAnimation {
+      // (The copy's layer has y going up.)
+      fresh.frame = CGRect(x: 0, y: lifted.bounds.height - image.size.height, width: image.size.width, height: image.size.height)
+      old.opacity = 0
+    }
+    lifted.addSublayer(fresh)
+    for (layer, from, to) in [(old, 1, 0), (fresh, 0, 1)] as [(CALayer, Float, Float)] {
+      let fade = CABasicAnimation(keyPath: "opacity")
+      fade.fromValue = from
+      fade.toValue = to
+      fade.duration = duration
+      fade.timingFunction = Motion.standard
+      layer.add(fade, forKey: "crossfade")
     }
   }
 
@@ -4156,6 +4213,16 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
        storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil {
       pendingMediaRestyle.remove(key)
       let before = view.frame
+      // Starting above the top of the page's view: what's in view stays put
+      // (it doesn't animate, nothing slides).
+      if let clip = enclosingScrollView?.contentView, before.minY < host.convert(clip.bounds, from: clip).minY - 0.5 {
+        view.skipResizeAnimation()
+        keepingPageInView {
+          restyle(limit: range)
+          host.layoutSubtreeIfNeeded()
+        }
+        return
+      }
       restyle(limit: range)
       host.layoutSubtreeIfNeeded()
       let after = view.frame
@@ -4185,8 +4252,56 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
               self.storage.attribute(.gleaFolded, at: range.location, effectiveRange: nil) == nil else { return nil }
         return range
       }
-      if !ranges.isEmpty { self.restyle(limits: ranges) }
+      if !ranges.isEmpty { self.keepingPageInView { self.restyle(limits: ranges) } }
     }
+  }
+
+  // MARK: Scroll anchoring
+
+  /// What's at the top of the page's view, to keep there: the first line of
+  /// this note starting in view (a character), or nil for this editor's end
+  /// (it's above the view). Nil when the editor starts in view or lower:
+  /// nothing in it moves what's above.
+  private func pageAnchor() -> (character: Int?, y: CGFloat)? {
+    guard embedded == nil, let scroll = enclosingScrollView, let page = scroll.documentView,
+          let container = textView.textContainer else { return nil }
+    let top = textView.convert(NSPoint(x: 0, y: scroll.contentView.bounds.minY), from: page).y - textView.textContainerOrigin.y
+    guard top > 0 else { return nil }
+    ensureStyledLayout()
+    var character: Int?
+    let glyphs = layoutManager.numberOfGlyphs
+    if glyphs > 0 {
+      var glyph = layoutManager.glyphIndex(for: NSPoint(x: 0, y: top), in: container)
+      var line = NSRange()
+      let rect = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &line)
+      // Begun above (a block hanging into view, say): what follows it.
+      if rect.minY < top - 0.5 { glyph = NSMaxRange(line) }
+      if glyph < glyphs { character = layoutManager.characterIndexForGlyph(at: glyph) }
+    }
+    return (character, pageY(of: character, in: page))
+  }
+
+  private func pageY(of character: Int?, in page: NSView) -> CGFloat {
+    guard let character, character < storage.length else { return convert(bounds, to: page).maxY }
+    let line = layoutManager.lineFragmentRect(forGlyphAt: layoutManager.glyphIndexForCharacter(at: character), effectiveRange: nil)
+    return textView.convert(NSPoint(x: 0, y: line.minY + textView.textContainerOrigin.y), to: page).y
+  }
+
+  /// Makes `changes` (blocks resizing) without moving what's in view: if
+  /// they push it down or pull it up, the page scrolls as much.
+  private func keepingPageInView(_ changes: () -> Void) {
+    guard let anchor = pageAnchor(), let start = enclosingScrollView?.contentView.bounds.origin else { return changes() }
+    changes()
+    guard let scroll = enclosingScrollView, let page = scroll.documentView else { return }
+    // The page takes its new height first (the scroll can't go past it).
+    scroll.superview?.layoutSubtreeIfNeeded()
+    let delta = pageY(of: anchor.character, in: page) - anchor.y
+    guard abs(delta) > 0.25 else { return }
+    let clip = scroll.contentView
+    // From where it was: the text view may have moved it meanwhile (keeping
+    // its selection in view as it resized).
+    clip.scroll(to: NSPoint(x: start.x, y: start.y + delta))
+    scroll.reflectScrolledClipView(clip)
   }
 
   // MARK: Sliding
