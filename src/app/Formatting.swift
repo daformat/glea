@@ -151,7 +151,7 @@ extension MarkdownTextView {
     let lineRange = s.lineRange(for: NSRange(location: selectedRange().location, length: 0))
     var line = s.substring(with: lineRange)
     if line.hasSuffix("\n") { line.removeLast() }
-    guard line.trimmingCharacters(in: .whitespaces).hasPrefix("|") else { return nil }
+    guard MarkdownStyler.isTableRow(line) else { return nil }
     let cells = MarkdownStyler.tableCells(in: line as NSString).map {
       NSRange(location: $0.location + lineRange.location, length: $0.length)
     }
@@ -159,11 +159,8 @@ extension MarkdownTextView {
     return (NSRange(location: lineRange.location, length: (line as NSString).length), cells)
   }
 
-  private static let separatorRow = try! NSRegularExpression(pattern: "^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)*\\|?\\s*$")
-
   private func isSeparator(_ line: NSRange) -> Bool {
-    let text = (string as NSString).substring(with: line).trimmingCharacters(in: .newlines)
-    return MarkdownTextView.separatorRow.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) != nil
+    MarkdownStyler.isTableSeparator((string as NSString).substring(with: line).trimmingCharacters(in: .newlines))
   }
 
   /// Tab / Shift-Tab move between cells; Tab in the last cell adds a row.
@@ -179,8 +176,8 @@ extension MarkdownTextView {
       // it and go back to text (like Enter on an empty row).
       let s = string as NSString
       let nextLineStart = NSMaxRange(row.line) + 1
-      let isLastRow = nextLineStart >= s.length || !s.substring(with: s.lineRange(for: NSRange(location: nextLineStart, length: 0)))
-        .trimmingCharacters(in: .whitespaces).hasPrefix("|")
+      let isLastRow = nextLineStart >= s.length
+        || !MarkdownStyler.isTableRow(s.substring(with: s.lineRange(for: NSRange(location: nextLineStart, length: 0))))
       if isLastRow && isEmptyTableRow(row) && !isHeaderRow(row) {
         leaveTable(removing: row)
         return true
@@ -239,42 +236,45 @@ extension MarkdownTextView {
   }
 
   /// Enter on an empty row: remove it and continue as normal text below the
-  /// table.
+  /// table (in its quote, if it's in one).
   func leaveTable(removing row: (line: NSRange, cells: [NSRange])) {
-    replace(row.line, with: "", select: NSRange(location: row.line.location, length: 0))
+    let quote = MarkdownStyler.quotePrefix((string as NSString).substring(with: row.line))
+    replace(row.line, with: quote, select: NSRange(location: row.line.location + (quote as NSString).length, length: 0))
   }
 
   /// Enter in a table adds an empty row below with the cursor in its first cell.
   func addTableRow(after row: (line: NSRange, cells: [NSRange])) {
     let columns = max(1, row.cells.count)
-    let newRow = "\n|" + String(repeating: "  |", count: columns)
+    let quote = MarkdownStyler.quotePrefix((string as NSString).substring(with: row.line))
+    let newRow = "\n" + quote + "|" + String(repeating: "  |", count: columns)
     let insertAt = NSMaxRange(row.line)
     replace(NSRange(location: insertAt, length: 0), with: newRow,
-            select: NSRange(location: insertAt + 3, length: 0))
+            select: NSRange(location: insertAt + (quote as NSString).length + 3, length: 0))
   }
 
   /// Typing a header row ("| a | b |") and pressing Enter turns it into a table.
   func completeTableHeader() -> Bool {
     guard let row = tableRowAtCursor(), row.cells.count >= 2 else { return false }
     let s = string as NSString
-    let text = s.substring(with: row.line).trimmingCharacters(in: .whitespaces)
-    guard text.hasSuffix("|") else { return false }
+    let line = s.substring(with: row.line)
+    guard line.trimmingCharacters(in: .whitespaces).hasSuffix("|") else { return false }
+    let quote = MarkdownStyler.quotePrefix(line)
     // Only when this isn't already part of a table.
     let nextStart = NSMaxRange(row.line) + 1
     if nextStart < s.length {
       let nextLine = s.lineRange(for: NSRange(location: nextStart, length: 0))
-      if s.substring(with: nextLine).trimmingCharacters(in: .whitespaces).hasPrefix("|") { return false }
+      if MarkdownStyler.isTableRow(s.substring(with: nextLine)) { return false }
     }
     if row.line.location > 0 {
       let previousLine = s.lineRange(for: NSRange(location: row.line.location - 1, length: 0))
-      if s.substring(with: previousLine).trimmingCharacters(in: .whitespaces).hasPrefix("|") { return false }
+      if MarkdownStyler.isTableRow(s.substring(with: previousLine)) { return false }
     }
     let columns = row.cells.count
-    let separator = "\n|" + String(repeating: " --- |", count: columns)
-    let empty = "\n|" + String(repeating: "  |", count: columns)
+    let separator = "\n" + quote + "|" + String(repeating: " --- |", count: columns)
+    let empty = "\n" + quote + "|" + String(repeating: "  |", count: columns)
     let insertAt = NSMaxRange(row.line)
     replace(NSRange(location: insertAt, length: 0), with: separator + empty,
-            select: NSRange(location: insertAt + (separator as NSString).length + 3, length: 0))
+            select: NSRange(location: insertAt + (separator as NSString).length + (quote as NSString).length + 3, length: 0))
     return true
   }
 

@@ -78,6 +78,19 @@ final class MarkdownTableRow: NSObject {
   /// (inset by `padding`), since the row's own text shrinks to nothing.
   var cells: [NSAttributedString]?
   var padding = NSSize(width: 12, height: 7)
+  /// A table wider than the text: the width it shows, from its left edge
+  /// (the rest scrolls sideways). Nil when it fits.
+  var viewport: CGFloat?
+  /// Its table (the first row's location), by which the layout manager
+  /// keeps how far it's scrolled.
+  var table = 0
+
+  /// From its left edge to its right one, scrolled out of sight or not.
+  var contentWidth: CGFloat { (columnX.last ?? 0) - (columnX.first ?? 0) }
+  /// How far it scrolls.
+  var maxScroll: CGFloat { viewport.map { max(0, contentWidth - $0) } ?? 0 }
+  /// The right edge of what shows.
+  var visibleRight: CGFloat { (columnX.first ?? 0) + (viewport ?? contentWidth) }
 
   init(columnX: [CGFloat], isHeader: Bool, isFirst: Bool, isLast: Bool) {
     self.columnX = columnX
@@ -348,7 +361,9 @@ struct MarkdownStyler {
       if !inFence, let block = tableAt[index] {
         let blockLines = Array(lines[block])
         if blockLines.contains(where: { inTarget($0.enclosing) }) {
-          styleTable(storage, string: string, lines: blockLines, indent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent)
+          let quote: Any? = MarkdownStyler.quotePrefix(line).isEmpty ? nil : (callouts[index]?.color ?? true)
+          styleTable(storage, string: string, lines: blockLines, indent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent,
+                     quote: quote)
         }
         index = block.upperBound
         continue
@@ -946,7 +961,7 @@ struct MarkdownStyler {
     var inFence = false
     var i = 0
     func text(_ i: Int) -> String { string.substring(with: lines[i].line) }
-    func isRow(_ i: Int) -> Bool { text(i).trimmingCharacters(in: .whitespaces).hasPrefix("|") }
+    func isRow(_ i: Int) -> Bool { MarkdownStyler.isTableRow(text(i)) }
     while i < lines.count {
       let t = text(i)
       if MarkdownStyler.fence.firstMatch(in: t, range: NSRange(location: 0, length: (t as NSString).length)) != nil {
@@ -954,10 +969,12 @@ struct MarkdownStyler {
         i += 1
         continue
       }
-      if !inFence, i + 1 < lines.count, isRow(i), isRow(i + 1),
-         MarkdownStyler.tableSeparator.firstMatch(in: text(i + 1), range: NSRange(location: 0, length: (text(i + 1) as NSString).length)) != nil {
+      // (In a quote, all its rows in the same one.)
+      let prefix = MarkdownStyler.quotePrefix(t)
+      func continues(_ j: Int) -> Bool { isRow(j) && MarkdownStyler.quotePrefix(text(j)) == prefix }
+      if !inFence, i + 1 < lines.count, isRow(i), continues(i + 1), MarkdownStyler.isTableSeparator(text(i + 1)) {
         var end = i + 2
-        while end < lines.count && isRow(end) { end += 1 }
+        while end < lines.count && continues(end) { end += 1 }
         blocks.append(i..<end)
         i = end
         continue
@@ -997,16 +1014,50 @@ struct MarkdownStyler {
     return cells
   }
 
+  /// A line's quote markers ("> ", "> > "): a table in a quote starts its
+  /// rows with them.
+  static func quotePrefix(_ line: String) -> String {
+    let ns = line as NSString
+    guard let m = quote.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { return "" }
+    return ns.substring(with: m.range)
+  }
+
+  /// Whether a line is a table row: it starts with "|", after any quote
+  /// markers.
+  static func isTableRow(_ line: String) -> Bool {
+    line.dropFirst(quotePrefix(line).count).trimmingCharacters(in: .whitespaces).hasPrefix("|")
+  }
+
+  /// Whether a line is a table's separator row (`| --- | :-: |`), after any
+  /// quote markers.
+  static func isTableSeparator(_ line: String) -> Bool {
+    let row = String(line.dropFirst(quotePrefix(line).count))
+    return tableSeparator.firstMatch(in: row, range: NSRange(location: 0, length: (row as NSString).length)) != nil
+  }
+
+  /// `quote`: in a quote, its bar's value (a callout's color, or true): the
+  /// table sits inside it, past its bar.
   private func styleTable(_ storage: NSTextStorage, string: NSString, lines: [(line: NSRange, enclosing: NSRange)],
-                          indent: CGFloat) {
+                          indent sectionIndent: CGFloat, quote: Any? = nil) {
+    let indent = sectionIndent + (quote == nil ? 0 : quote is NSColor ? 20 : 16)
+    for entry in lines {
+      storage.addAttribute(.gleaSectionIndent, value: sectionIndent, range: entry.enclosing)
+      if let quote { storage.addAttribute(.gleaQuote, value: quote, range: entry.enclosing) }
+    }
+    func asMarkdown() {
+      let paragraph = (MarkdownStyler.baseAttributes[.paragraphStyle] as! NSParagraphStyle).mutableCopy() as! NSMutableParagraphStyle
+      paragraph.firstLineHeadIndent = indent
+      paragraph.headIndent = indent
+      for entry in lines {
+        storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line)
+        storage.addAttribute(.paragraphStyle, value: paragraph, range: entry.enclosing)
+      }
+    }
     // Switched to Markdown while the cursor is in it.
     let editing = selection.map { sel in
       lines.contains { NSLocationInRange(sel.location, $0.enclosing) || NSIntersectionRange(sel, $0.enclosing).length > 0 }
     } ?? false
-    if editing && tableAsMarkdown {
-      for entry in lines { storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line) }
-      return
-    }
+    if editing && tableAsMarkdown { return asMarkdown() }
     let pad: CGFloat = 12
     let separatorLine = string.substring(with: lines[1].line) as NSString
     let alignments: [NSTextAlignment] = MarkdownStyler.tableCells(in: separatorLine).map { r in
@@ -1035,13 +1086,14 @@ struct MarkdownStyler {
       }
     }
     // Too wide for one line per row: cells wrap in narrower columns (and
-    // are edited one at a time, over the cell). With too little room even
-    // for that, it stays Markdown.
+    // are edited one at a time, over the cell), and past that the table
+    // scrolls sideways. With too little room even for that, it stays
+    // Markdown.
     let total = widths.reduce(0, +)
     let available = width - indent
     guard total <= available else {
-      if available < CGFloat(columnCount) * 56 {
-        for entry in lines { storage.addAttributes([.font: Theme.monoFont, .foregroundColor: Theme.secondaryText], range: entry.line) }
+      if available < 120 {
+        asMarkdown()
       } else {
         styleWrappedTable(storage, lines: lines, rows: rows, natural: widths, available: available,
                           alignments: alignments, indent: indent, pad: pad)
@@ -1067,7 +1119,6 @@ struct MarkdownStyler {
     for (n, row) in rows.enumerated() {
       let entry = lines[row.index]
       storage.addAttribute(.paragraphStyle, value: rowStyle, range: entry.enclosing)
-      storage.addAttribute(.gleaSectionIndent, value: indent, range: entry.enclosing)
       let info = MarkdownTableRow(columnX: columnX, isHeader: row.index == 0,
                                   isFirst: n == 0, isLast: n == rows.count - 1)
       storage.addAttribute(.gleaTableRow, value: info, range: entry.line)
@@ -1122,8 +1173,15 @@ struct MarkdownStyler {
         }
       }
     }
-    let minimums = longestWord.map { min(max($0, 56), available / 2) }
-    let widths = MarkdownStyler.fitColumns(natural, into: available, minimums: minimums)
+    // Each column at least as wide as its longest word, and as its text
+    // (up to a readable width): narrower, a few words to a line, the table
+    // scrolls sideways instead, its columns a little wider.
+    let words = longestWord.map { min(max($0, 56), available * 0.8) }
+    let readable = natural.indices.map { max(words[$0], min(natural[$0], 120)) }
+    let scrolls = readable.reduce(0, +) > available
+    let widths = scrolls
+      ? natural.indices.map { max(words[$0], min(natural[$0], 240)) }
+      : MarkdownStyler.fitColumns(natural, into: available, minimums: readable)
     var columnX: [CGFloat] = [indent]
     for w in widths { columnX.append(columnX.last! + w) }
     let vertical: CGFloat = 7
@@ -1160,7 +1218,6 @@ struct MarkdownStyler {
       style.firstLineHeadIndent = indent
       style.headIndent = indent
       storage.addAttribute(.paragraphStyle, value: style, range: entry.enclosing)
-      storage.addAttribute(.gleaSectionIndent, value: indent, range: entry.enclosing)
       // The row's own text shrinks to nothing (it stays on its line, which
       // keeps the row's height; null glyphs would lose their line).
       storage.addAttributes([.gleaTableWrapped: true, .foregroundColor: NSColor.clear,
@@ -1170,6 +1227,8 @@ struct MarkdownStyler {
       let info = MarkdownTableRow(columnX: columnX, isHeader: row.index == 0, isFirst: n == 0, isLast: n == rows.count - 1)
       info.cells = texts
       info.padding = NSSize(width: pad, height: vertical)
+      info.viewport = scrolls ? available : nil
+      info.table = lines[0].line.location
       storage.addAttribute(.gleaTableRow, value: info, range: entry.line)
     }
   }
@@ -1471,6 +1530,26 @@ final class MarkdownLayoutManager: NSLayoutManager {
   /// The wrapped table cell being edited (its editor shows it instead), by
   /// its row's location and its column.
   var hiddenCell: (row: Int, column: Int)?
+  /// How far each table wider than the text is scrolled sideways, by its
+  /// first row's location (kept there as the text before it changes).
+  var tableScroll: [Int: CGFloat] = [:]
+
+  /// How far a row's table is scrolled, within its bounds.
+  func scrollX(of row: MarkdownTableRow) -> CGFloat {
+    min(max(0, tableScroll[row.table] ?? 0), row.maxScroll)
+  }
+
+  override func processEditing(for textStorage: NSTextStorage, edited editMask: NSTextStorageEditActions, range newCharRange: NSRange,
+                               changeInLength delta: Int, invalidatedRange invalidatedCharRange: NSRange) {
+    super.processEditing(for: textStorage, edited: editMask, range: newCharRange, changeInLength: delta,
+                         invalidatedRange: invalidatedCharRange)
+    guard editMask.contains(.editedCharacters), delta != 0, !tableScroll.isEmpty else { return }
+    // Tables after the change move with it.
+    let oldEnd = NSMaxRange(newCharRange) - delta
+    var moved: [Int: CGFloat] = [:]
+    for (table, x) in tableScroll { moved[table >= oldEnd ? table + delta : table] = x }
+    tableScroll = moved
+  }
 
   override func drawBackground(forGlyphRange glyphsToShow: NSRange, at origin: NSPoint) {
     super.drawBackground(forGlyphRange: glyphsToShow, at: origin)
@@ -1593,8 +1672,10 @@ final class MarkdownLayoutManager: NSLayoutManager {
       var rect = NSRect.null
       enumerateLineFragments(forGlyphRange: glyphs) { lineRect, _, _, _, _ in rect = rect.union(lineRect) }
       guard !rect.isNull else { return }
-      rect = NSRect(x: origin.x + left, y: origin.y + rect.minY, width: right - left, height: rect.height)
-      let cells = rect
+      // Scrolled sideways: the outline is what shows, the columns move in it.
+      let scroll = scrollX(of: row)
+      let cells = NSRect(x: origin.x + left - scroll, y: origin.y + rect.minY, width: right - left, height: rect.height)
+      rect = NSRect(x: origin.x + left, y: origin.y + rect.minY, width: row.visibleRight - left, height: rect.height)
       // The outline's stroke is centered on its path: inset the table's outer
       // edges by half of it, or the text view clips that half (the left and
       // right borders, flush with the column, looked cropped).
@@ -1623,9 +1704,10 @@ final class MarkdownLayoutManager: NSLayoutManager {
       Theme.separator.setStroke()
       outline.lineWidth = 1
       outline.stroke()
+      if row.viewport != nil { outline.addClip() }
       Theme.separator.setFill()
       for x in row.columnX.dropFirst().dropLast() {
-        NSRect(x: origin.x + x - 0.5, y: rect.minY, width: 1, height: rect.height).fill()
+        NSRect(x: origin.x + x - scroll - 0.5, y: rect.minY, width: 1, height: rect.height).fill()
       }
       // A wrapped table's cells (the row's own text takes no room).
       for (column, text) in (row.cells ?? []).enumerated() where column + 1 < row.columnX.count {
@@ -2167,6 +2249,8 @@ final class MarkdownTextView: NSTextView {
   /// A click in a wrapped table's cell (its row's location, its column):
   /// the cell's own field takes it.
   var onEditCell: ((_ row: Int, _ column: Int, _ event: NSEvent) -> Void)?
+  /// A table scrolled sideways.
+  var onTableScroll: (() -> Void)?
   var onSearch: ((URL) -> Void)?
 
   /// Kept between the cursor and the page's top or bottom edge as it moves.
@@ -2323,7 +2407,10 @@ final class MarkdownTextView: NSTextView {
     guard charIndex < storage.length,
           let row = storage.attribute(.gleaTableRow, at: charIndex, longestEffectiveRange: &rowRange,
                                       in: NSRange(location: 0, length: storage.length)) as? MarkdownTableRow,
-          let column = row.columnX.indices.dropLast().last(where: { row.columnX[$0] <= p.x }) else { return false }
+          row.viewport == nil || p.x <= row.visibleRight else { return false }
+    // (Scrolled sideways: the columns have moved.)
+    let scroll = (layoutManager as? MarkdownLayoutManager)?.scrollX(of: row) ?? 0
+    guard let column = row.columnX.indices.dropLast().last(where: { row.columnX[$0] <= p.x + scroll }) else { return false }
     let s = string as NSString
     let line = s.lineRange(for: NSRange(location: rowRange.location, length: 0))
     var text = s.substring(with: line)
@@ -2332,7 +2419,7 @@ final class MarkdownTextView: NSTextView {
     guard column < cells.count else { return false }
     // A link in a wrapped cell opens; elsewhere the click edits the table.
     if row.cells != nil {
-      let rowRect = NSRect(x: row.columnX[0], y: lineRect.minY, width: (row.columnX.last ?? 0) - row.columnX[0], height: lineRect.height)
+      let rowRect = NSRect(x: row.columnX[0] - scroll, y: lineRect.minY, width: row.contentWidth, height: lineRect.height)
       let cellRect = row.cellRect(column, in: rowRect)
       let local = NSPoint(x: p.x - cellRect.minX, y: p.y - cellRect.minY)
       if let link = row.link(inCell: column, at: local, width: cellRect.width) {
@@ -2379,6 +2466,69 @@ final class MarkdownTextView: NSTextView {
   override func cursorUpdate(with event: NSEvent) {
     if isCovered(event) { return }
     super.cursorUpdate(with: event)
+  }
+
+  // MARK: Tables wider than the text
+
+  /// The table a sideways scroll gesture is moving (its first row's
+  /// location), from its start to the end of its momentum.
+  private var scrollingTable: Int?
+  /// The gesture under way moves the page, not a table.
+  private var scrollingPage = false
+
+  /// The row of a table wider than the text under a point in this view.
+  private func scrollableRow(at point: NSPoint) -> MarkdownTableRow? {
+    guard let layoutManager, let textContainer, let storage = textStorage, storage.length > 0 else { return nil }
+    let p = NSPoint(x: point.x - textContainerOrigin.x, y: point.y - textContainerOrigin.y)
+    let glyph = layoutManager.glyphIndex(for: p, in: textContainer)
+    guard layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).contains(p) else { return nil }
+    let line = (string as NSString).lineRange(for: NSRange(location: layoutManager.characterIndexForGlyph(at: glyph), length: 0))
+    guard line.location < storage.length,
+          let row = storage.attribute(.gleaTableRow, at: line.location, effectiveRange: nil) as? MarkdownTableRow,
+          row.viewport != nil, p.x >= row.columnX[0], p.x <= row.visibleRight else { return nil }
+    return row
+  }
+
+  /// Sideways over a table wider than the text, it scrolls the table (a
+  /// whole gesture, momentum included, goes to what it began on).
+  override func scrollWheel(with event: NSEvent) {
+    guard let layout = layoutManager as? MarkdownLayoutManager else { return super.scrollWheel(with: event) }
+    let gesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+    let begins = event.phase.contains(.began) || event.phase.contains(.mayBegin) || !gesture
+    if begins {
+      scrollingTable = nil
+      scrollingPage = false
+      let sideways = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
+      if sideways, let row = scrollableRow(at: convert(event.locationInWindow, from: nil)) {
+        scrollingTable = row.table
+      } else if gesture, event.scrollingDeltaX != 0 || event.scrollingDeltaY != 0 {
+        scrollingPage = true
+      }
+    } else if scrollingTable == nil, !scrollingPage, event.phase.contains(.changed),
+              abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY),
+              let row = scrollableRow(at: convert(event.locationInWindow, from: nil)) {
+      // (A gesture's first move, after it began still.)
+      scrollingTable = row.table
+    }
+    guard let table = scrollingTable, let row = tableRow(table) else {
+      if event.momentumPhase.contains(.ended) || event.phase.contains(.cancelled) { scrollingPage = false }
+      return super.scrollWheel(with: event)
+    }
+    let dx = event.hasPreciseScrollingDeltas ? event.scrollingDeltaX : event.scrollingDeltaX * 12
+    let x = min(max(0, layout.scrollX(of: row) - dx), row.maxScroll)
+    if x != layout.tableScroll[table] {
+      layout.tableScroll[table] = x
+      setNeedsDisplay(visibleRect)
+      onTableScroll?()
+    }
+    // (A gesture's momentum, after it ends, stays with the table.)
+    if event.momentumPhase.contains(.ended) || event.phase.contains(.cancelled) || !gesture { scrollingTable = nil }
+  }
+
+  /// The first row of the table at `location`, as it's laid out.
+  func tableRow(_ location: Int) -> MarkdownTableRow? {
+    guard let storage = textStorage, location < storage.length else { return nil }
+    return storage.attribute(.gleaTableRow, at: location, effectiveRange: nil) as? MarkdownTableRow
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -2894,6 +3044,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     textView.delegate = self
     textView.onEditCell = { [weak self] row, column, event in self?.editCell(row: row, column: column, clicked: event) }
     textView.onSearch = { [weak self] url in self?.onSearch?(url) }
+    textView.onTableScroll = { [weak self] in self?.layoutTableEditing() }
     // (Not this note: a link to itself goes nowhere.)
     textView.noteNames = { [weak self] in NoteStore.shared.noteNames.filter { $0 != self?.ref.name } }
     textView.onFocusChange = { [weak self] focused in
@@ -2906,6 +3057,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         guard let self else { return }
         let current = self.textView.selectedRange()
         self.restyle(limit: self.styledSelection.map { NSUnionRange($0, current) } ?? current)
+        // (Out of a table: its "+" buttons go.)
+        self.layoutTableEditing()
       }
       if !focused { self?.formatBar.hide() }
     }
@@ -2973,6 +3126,10 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       DispatchQueue.main.async { leaving.forEach { $0.removeFromSuperview() } }
       mediaViews = [:]
       gutter.removeFromSuperview()
+      for button in [addRowButton, addColumnButton] {
+        button.show(false)
+        button.removeFromSuperview()
+      }
     } else {
       // Blocks live in the page, so follow this view and every ancestor up
       // to the page (the column recenters when the window resizes).
@@ -3685,6 +3842,14 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       var center = textView.textContainerOrigin.y + baseline - font.capHeight / 2
       // A typeset formula block: level with the middle of the formula.
       if line.length > 0, storage.attribute(.gleaMathBlock, at: line.location, effectiveRange: nil) != nil { center = rect.midY }
+      // A wrapped table: level with its header's first line, drawn at the
+      // top of its row (the row's own text, shrunk to nothing, sits at the
+      // bottom).
+      if line.length > 0, let row = storage.attribute(.gleaTableRow, at: line.location, effectiveRange: nil) as? MarkdownTableRow,
+         row.cells != nil {
+        let header = NSFont.systemFont(ofSize: Theme.bodySize, weight: .semibold)
+        center = textView.textContainerOrigin.y + fragment.minY + row.padding.height + header.ascender - header.capHeight / 2
+      }
       return NoteGutterView.Handle(block: index, band: rect.minY...rect.maxY, centerY: center)
     }
   }
@@ -4186,6 +4351,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       }
       gutter.frame = gutter.frame.offsetBy(dx: dx, dy: dy)
       tableToggle.frame = tableToggle.frame.offsetBy(dx: dx, dy: dy)
+      for button in [addRowButton, addColumnButton] { button.frame = button.frame.offsetBy(dx: dx, dy: dy) }
       placedFrame = frame
       return
     }
@@ -4602,6 +4768,9 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   // in its field, and the table / Markdown toggle.
   private var cellField: TableCellField?
   private var cellEditing: (row: Int, column: Int)?
+  /// The cell being edited scrolls into view at its next layout (its table
+  /// wider than the text).
+  private var revealsEditedCell = false
   private var cellGeneration = 0
   private var tableAsMarkdown = false
   /// The table under the pointer (its first row's location): its toggle
@@ -4610,6 +4779,16 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   /// The cell's text when its editing began (its change becomes one undo
   /// step in the note once it's left).
   private var cellOriginal: String?
+  private lazy var addRowButton: TableAddButton = {
+    let button = TableAddButton(tooltip: "Add a row")
+    button.onClick = { [weak self] in DispatchQueue.main.async { self?.addRowToActiveTable() } }
+    return button
+  }()
+  private lazy var addColumnButton: TableAddButton = {
+    let button = TableAddButton(tooltip: "Add a column")
+    button.onClick = { [weak self] in DispatchQueue.main.async { self?.addColumnToActiveTable() } }
+    return button
+  }()
   private lazy var tableToggle: MediaToggleButton = {
     let toggle = MediaToggleButton()
     toggle.looks = (collapsed: .init(symbol: "tablecells", label: "table", tooltip: "Edit as a table"),
@@ -4721,6 +4900,89 @@ extension MarkdownStyler {
 
 // MARK: - Table editing
 
+/// A small round "+" on a table's edge, while the cursor is in it: a row
+/// at the bottom, a column at the right.
+final class TableAddButton: NSView {
+  var onClick: (() -> Void)?
+  static let size: CGFloat = 18
+
+  private var hovering = false { didSet { needsDisplay = true } }
+  private var tracking: NSTrackingArea?
+  private var showing = false
+
+  init(tooltip: String) {
+    super.init(frame: NSRect(x: 0, y: 0, width: TableAddButton.size, height: TableAddButton.size))
+    toolTip = tooltip
+    alphaValue = 0
+    isHidden = true
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func draw(_ dirtyRect: NSRect) {
+    let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 0.5, dy: 0.5))
+    Theme.background.setFill()
+    circle.fill()
+    (hovering ? Theme.tertiaryText : Theme.separator).setStroke()
+    circle.lineWidth = 1
+    circle.stroke()
+    let plus = NSBezierPath()
+    let mid = NSPoint(x: bounds.midX, y: bounds.midY), arm: CGFloat = 4
+    plus.move(to: NSPoint(x: mid.x - arm, y: mid.y))
+    plus.line(to: NSPoint(x: mid.x + arm, y: mid.y))
+    plus.move(to: NSPoint(x: mid.x, y: mid.y - arm))
+    plus.line(to: NSPoint(x: mid.x, y: mid.y + arm))
+    plus.lineWidth = 1.5
+    plus.lineCapStyle = .round
+    (hovering ? Theme.text : Theme.secondaryText).setStroke()
+    plus.stroke()
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+    addTrackingArea(area)
+    tracking = area
+    updateHover()
+  }
+
+  /// Hovered while the pointer is over it. It moves away from a still
+  /// pointer (the table it adds to grows), which sends no exit: checked
+  /// again whenever it moves or hides.
+  private func updateHover() {
+    guard let window, !isHidden, showing else { return hovering = false }
+    hovering = bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+  }
+
+  override func setFrameOrigin(_ newOrigin: NSPoint) {
+    super.setFrameOrigin(newOrigin)
+    updateHover()
+  }
+
+  override func mouseEntered(with event: NSEvent) { hovering = true }
+  override func mouseExited(with event: NSEvent) { hovering = false }
+  override func mouseDown(with event: NSEvent) {}
+  override func mouseUp(with event: NSEvent) {
+    if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    // (Its click moves it: the table grew.)
+    DispatchQueue.main.async { [weak self] in self?.updateHover() }
+  }
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+  /// Fades in or out, unless it's already showing (or going) that way.
+  func show(_ shows: Bool) {
+    guard shows != showing else { return }
+    showing = shows
+    if shows { isHidden = false }
+    updateHover()
+    Motion.animate(0.15, timing: Motion.easeInOut, { animator().alphaValue = shows ? 1 : 0 }, completion: { [weak self] in
+      guard let self, !self.showing else { return }
+      self.isHidden = true
+    })
+  }
+}
+
 /// Edits one cell of a wrapped table, over the cell: its raw Markdown,
 /// wrapping at the cell's width. What it holds goes straight into the note.
 final class TableCellField: NSTextView {
@@ -4766,8 +5028,6 @@ final class TableCellField: NSTextView {
 }
 
 extension MarkdownEditorView {
-  private static let tableSeparator = try! NSRegularExpression(pattern: "^\\s*\\|?\\s*:?-{3,}:?\\s*(\\|\\s*:?-{3,}:?\\s*)*\\|?\\s*$")
-
   /// The line at `location` without its line break.
   private func line(at location: Int) -> NSRange {
     let s = storage.string as NSString
@@ -4786,7 +5046,7 @@ extension MarkdownEditorView {
   /// to bottom.
   private func tableRows(around location: Int) -> [NSRange] {
     let s = storage.string as NSString
-    func isRow(_ line: NSRange) -> Bool { s.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("|") }
+    func isRow(_ line: NSRange) -> Bool { MarkdownStyler.isTableRow(s.substring(with: line)) }
     var start = line(at: location)
     guard isRow(start) else { return [] }
     while start.location > 0 {
@@ -4797,10 +5057,7 @@ extension MarkdownEditorView {
     var rows: [NSRange] = []
     var current = start
     while isRow(current) {
-      let text = s.substring(with: current)
-      if MarkdownEditorView.tableSeparator.firstMatch(in: text, range: NSRange(location: 0, length: (text as NSString).length)) == nil {
-        rows.append(current)
-      }
+      if !MarkdownStyler.isTableSeparator(s.substring(with: current)) { rows.append(current) }
       let next = NSMaxRange(current) + 1
       guard next < s.length else { break }
       current = line(at: next)
@@ -4869,6 +5126,7 @@ extension MarkdownEditorView {
     field.textStorage?.setAttributedString(NSAttributedString(string: cellOriginal ?? "", attributes: attributes))
     field.typingAttributes = attributes
     field.isHidden = false
+    revealsEditedCell = true
     restyle(limit: tableRange(around: row))
     let start = max(range.location, min(selection.location, NSMaxRange(range)))
     let end = max(start, min(NSMaxRange(selection), NSMaxRange(range)))
@@ -4912,10 +5170,34 @@ extension MarkdownEditorView {
     layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, _, _ in lineRect = lineRect.union(rect) }
     guard !lineRect.isNull else { return }
     let origin = textView.textContainerOrigin
-    let rowRect = NSRect(x: origin.x + row.columnX[0], y: origin.y + lineRect.minY,
-                         width: (row.columnX.last ?? 0) - row.columnX[0], height: lineRect.height)
+    // A table wider than the text: the cell scrolls into view when its
+    // editing begins and as it's typed in. Scrolled out of view, the field
+    // gives way to the cell's drawn text, which the table clips.
+    var shown = true
+    if let viewport = row.viewport {
+      let left = row.columnX[editing.column] - row.columnX[0], right = row.columnX[editing.column + 1] - row.columnX[0]
+      var x = layoutManager.scrollX(of: row)
+      if revealsEditedCell {
+        if right > x + viewport { x = right - viewport }
+        if left < x { x = left }
+        if x != layoutManager.tableScroll[row.table] {
+          layoutManager.tableScroll[row.table] = x
+          textView.setNeedsDisplay(textView.visibleRect)
+        }
+      }
+      shown = left >= x - 0.5 && right <= x + viewport + 0.5
+    }
+    revealsEditedCell = false
+    let rowRect = NSRect(x: origin.x + row.columnX[0] - layoutManager.scrollX(of: row), y: origin.y + lineRect.minY,
+                         width: row.contentWidth, height: lineRect.height)
     let cell = row.cellRect(editing.column, in: rowRect)
     field.frame = NSRect(x: cell.minX, y: cell.minY, width: cell.width, height: max(cell.height, 18))
+    field.isHidden = !shown
+    let hidden = shown ? editing : nil
+    if layoutManager.hiddenCell.map({ $0.row != hidden?.row || $0.column != hidden?.column }) ?? (hidden != nil) {
+      layoutManager.hiddenCell = hidden
+      textView.setNeedsDisplay(textView.visibleRect)
+    }
     // A cell's range leaves out its padding spaces: the field's leading or
     // trailing space (typed between words) isn't a difference.
     let raw = (storage.string as NSString).substring(with: range)
@@ -4947,7 +5229,7 @@ extension MarkdownEditorView {
   /// rest of a long note doesn't change).
   private func tableRange(around location: Int) -> NSRange? {
     let s = storage.string as NSString
-    func isRow(_ line: NSRange) -> Bool { s.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("|") }
+    func isRow(_ line: NSRange) -> Bool { MarkdownStyler.isTableRow(s.substring(with: line)) }
     var first = line(at: location)
     guard isRow(first) else { return nil }
     while first.location > 0 {
@@ -4981,6 +5263,7 @@ extension MarkdownEditorView {
     guard (storage.string as NSString).substring(with: range) != text else { return }
     // Straight into the note: the cell's whole change becomes one undo step
     // when it's left (commitCellSession).
+    revealsEditedCell = true
     storage.replaceCharacters(in: range, with: text)
     textView.didChangeText()
     textView.setSelectedRange(NSRange(location: range.location + max(0, caret), length: 0))
@@ -5214,6 +5497,7 @@ extension MarkdownEditorView {
   /// pointer.
   func layoutTableEditing() {
     layoutCellField()
+    layoutTableAddButtons()
     guard let anchor = hoveredTable, anchor < storage.length, let host = mediaHost, let container = textView.textContainer,
           let top = tableRows(around: anchor).first else {
       if !tableToggle.isHidden { tableToggle.fade(in: false) }
@@ -5240,5 +5524,96 @@ extension MarkdownEditorView {
     let size = tableToggle.fittingSize
     tableToggle.frame = NSRect(x: x, y: rowInHost.midY - size.height / 2, width: size.width, height: size.height)
     if tableToggle.isHidden || tableToggle.alphaValue < 1 { tableToggle.fade(in: true) }
+  }
+
+  // MARK: Adding rows and columns
+
+  /// The table the cursor (or the cell being edited) is in, shown as a
+  /// table: its first row's location.
+  private var activeTable: Int? {
+    guard embedded == nil, !tableAsMarkdown else { return nil }
+    let location: Int
+    if let editing = cellEditing {
+      location = editing.row
+    } else if window?.firstResponder === textView, textView.tableRowAtCursor() != nil {
+      location = textView.selectedRange().location
+    } else {
+      return nil
+    }
+    guard let first = tableRows(around: location).first, textView.tableRow(first.location) != nil else { return nil }
+    return first.location
+  }
+
+  /// The "+" buttons on the edges of the table the cursor is in, centered on
+  /// its bottom and right borders.
+  private func layoutTableAddButtons() {
+    let buttons = [addRowButton, addColumnButton]
+    guard let table = activeTable, let host = mediaHost, let row = textView.tableRow(table),
+          let range = tableRange(around: table), let container = textView.textContainer else {
+      for button in buttons { button.show(false) }
+      return
+    }
+    layoutManager.ensureLayout(for: container)
+    var lines = NSRect.null
+    layoutManager.enumerateLineFragments(forGlyphRange: layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)) {
+      rect, _, _, _, _ in lines = lines.union(rect)
+    }
+    guard !lines.isNull else { return }
+    let origin = textView.textContainerOrigin
+    let rect = textView.convert(NSRect(x: origin.x + row.columnX[0], y: origin.y + lines.minY,
+                                       width: row.visibleRight - row.columnX[0], height: lines.height), to: host)
+    let size = TableAddButton.size
+    let bottom = host.isFlipped ? rect.maxY : rect.minY
+    addRowButton.frame = NSRect(x: rect.midX - size / 2, y: bottom - size / 2, width: size, height: size)
+    addColumnButton.frame = NSRect(x: rect.maxX - size / 2, y: rect.midY - size / 2, width: size, height: size)
+    for button in buttons {
+      if button.superview !== host { host.addSubview(button, positioned: .above, relativeTo: nil) }
+      button.show(true)
+    }
+  }
+
+  /// A row at the bottom of the table the cursor is in, the cursor in its
+  /// first cell.
+  private func addRowToActiveTable() {
+    guard let table = activeTable, let last = tableRows(around: table).last else { return }
+    let header = cells(ofRow: line(at: table))
+    endCellEditing(focusText: true)
+    window?.makeFirstResponder(textView)
+    textView.addTableRow(after: (line: last, cells: header))
+    followTextSelection()
+  }
+
+  /// A column at the right of the table the cursor is in, the cursor in its
+  /// header.
+  private func addColumnToActiveTable() {
+    guard let table = activeTable, let range = tableRange(around: table) else { return }
+    endCellEditing(focusText: true)
+    window?.makeFirstResponder(textView)
+    let s = storage.string as NSString
+    var rows: [String] = []
+    var caret = range.location
+    var location = range.location
+    for (index, original) in s.substring(with: range).components(separatedBy: "\n").enumerated() {
+      var text = original
+      while text.hasSuffix(" ") { text.removeLast() }
+      if !text.hasSuffix("|") || text.hasSuffix("\\|") { text += " |" }
+      // The new cell's place: just after its first padding space.
+      if index == 0 { caret = location + (text as NSString).length + 1 }
+      text += MarkdownStyler.isTableSeparator(original) ? " --- |" : "  |"
+      rows.append(text)
+      location += (text as NSString).length + 1
+    }
+    textView.replace(range, with: rows.joined(separator: "\n"), select: NSRange(location: caret, length: 0))
+    followTextSelection()
+  }
+
+  /// For automated checks: the "+" for a row or a column of the table the
+  /// cursor is in.
+  func debugAddToTable(column: Bool) {
+    if column { addColumnToActiveTable() } else { addRowToActiveTable() }
+  }
+
+  var debugTableAddButtons: String {
+    "row=\(addRowButton.isHidden ? "hidden" : NSStringFromRect(addRowButton.frame)) column=\(addColumnButton.isHidden ? "hidden" : NSStringFromRect(addColumnButton.frame))"
   }
 }

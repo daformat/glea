@@ -162,6 +162,11 @@ enum TestHooks {
       // table-hover:<n>: the pointer over the visible note's nth table (-1: away).
       let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
       if let n = Int(argument) { editor?.debugHoverTable(n) } else { editor?.debugClickTableToggle() }
+    case "table-add":
+      // table-add:row|column: the "+" on the edge of the table the cursor is
+      // in; table-add:log logs where those buttons are.
+      let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
+      if argument == "log" { NSLog("Glea test table-add: %@", editor?.debugTableAddButtons ?? "no editor") } else { editor?.debugAddToTable(column: argument == "column") }
     case "media-duration":
       if let seconds = Double(argument) { MediaBlockView.resizeDuration = seconds }
     case "fold":
@@ -315,7 +320,8 @@ enum TestHooks {
       let (range, info) = rows[Int(n[0])]
       let column = Int(n[1])
       let lineRect = lm.lineFragmentRect(forGlyphAt: lm.glyphIndexForCharacter(at: range.location), effectiveRange: nil)
-      let x = info.columnX[column] + (info.columnX[column + 1] - info.columnX[column]) * n[2] + text.textContainerOrigin.x
+      let scroll = (lm as? MarkdownLayoutManager)?.scrollX(of: info) ?? 0
+      let x = info.columnX[column] + (info.columnX[column + 1] - info.columnX[column]) * n[2] + text.textContainerOrigin.x - scroll
       let point = text.convert(NSPoint(x: x, y: lineRect.midY + text.textContainerOrigin.y), to: nil)
       func mouse(_ type: NSEvent.EventType) -> NSEvent? {
         NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
