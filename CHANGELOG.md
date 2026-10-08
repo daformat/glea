@@ -2,6 +2,17 @@
 
 What changed in each release of Glea.
 
+## 0.15.5 Beta — 2026-10-08
+
+- Tables too wide for the page scroll sideways (swipe, or Shift and the
+  wheel) instead of running off it, the cell you're editing scrolling into
+  view.
+- While you're in a table, a + on its bottom edge adds a row and one on its
+  right edge adds a column.
+- Tables in quotes and callouts show as tables, and Enter and Tab keep new
+  rows in the quote.
+- A table's grip lines up with its header, like other blocks'.
+
 ## 0.15.4 Beta — 2026-10-08
 
 - Notes stay put as images and embeds load above what you're reading,
