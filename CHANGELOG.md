@@ -2,6 +2,12 @@
 
 What changed in each release of Glea.
 
+## 0.15.6 Beta — 2026-10-09
+
+- Point and shoot's spotlight glides from block to block, and a selection
+  lights up as one rounded shape.
+- Text selected inside a page's web components can be collected too.
+
 ## 0.15.5 Beta — 2026-10-08
 
 - Tables too wide for the page scroll sideways (swipe, or Shift and the
