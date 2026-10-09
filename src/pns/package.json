@@ -1,0 +1,15 @@
+{
+  "name": "glea-pns",
+  "private": true,
+  "description": "Glea's point-and-shoot page script, built into src/resources/content-script.js.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@daformat/point-and-shoot": "^1.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^6.0.2"
+  }
+}
