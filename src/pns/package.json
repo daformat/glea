@@ -8,7 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@daformat/point-and-shoot": "^1.0.0",
+    "@daformat/point-and-shoot": "^1.0.1",
     "esbuild": "^0.28.2",
     "typescript": "^6.0.2"
   }

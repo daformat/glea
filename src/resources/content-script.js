@@ -1,7 +1,7 @@
 // Generated from src/pns/glea-pns.ts by `pnpm build` there: edit that, not this.
 "use strict";
 (() => {
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/announcer.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/announcer.js
   var HIDDEN = "position: fixed !important; width: 1px !important; height: 1px !important; margin: -1px !important; padding: 0 !important; border: 0 !important; overflow: hidden !important; clip-path: inset(50%) !important; white-space: nowrap !important;";
   function createAnnouncer() {
     let region = null;
@@ -34,7 +34,7 @@
     };
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/dom.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/dom.js
   var HOST_TAG = "point-and-shoot";
   var SKIP_TAGS = /* @__PURE__ */ new Set([
     "SCRIPT",
@@ -144,7 +144,7 @@
     return stack.filter((node) => node !== doc.body && node !== doc.documentElement && node.localName !== HOST_TAG && within(root, node));
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/geometry.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/geometry.js
   function plain(r) {
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   }
@@ -209,7 +209,7 @@
     };
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/heuristics.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/heuristics.js
   var MEDIA_TAGS = [
     "VIDEO",
     "IFRAME",
@@ -322,7 +322,7 @@
     return { meaningful, image, media, whole, mediaTag, block: block2 };
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/bounds.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/bounds.js
   var BOUNDS_BUDGET = 600;
   var BOUNDS_DEPTH = 24;
   var defaults = createHeuristics();
@@ -486,7 +486,7 @@
     }
     return null;
   }
-  function gatherLines(range, maxNodes, maxRects) {
+  function gatherLines(range, maxNodes, maxRects, maxTime) {
     const doc = range.startContainer.ownerDocument ?? document;
     const bounds = () => {
       const r = range.getBoundingClientRect();
@@ -556,8 +556,9 @@
       return n;
     };
     let budget = maxNodes;
+    const deadline = performance.now() + maxTime;
     while (node) {
-      if (--budget < 0 || rects.length > maxRects) {
+      if (--budget < 0 || rects.length > maxRects || (budget & 63) === 0 && performance.now() > deadline) {
         return bounds();
       }
       if (!range.intersectsNode(node)) {
@@ -613,7 +614,7 @@
       }
       return c.lines;
     }
-    const lines = gatherLines(range, options.maxNodes ?? 4e3, options.maxRects ?? 2e3);
+    const lines = gatherLines(range, options.maxNodes ?? 4e3, options.maxRects ?? 2e3, options.maxTime ?? 24);
     lineCache = {
       key,
       start: range.startContainer,
@@ -628,7 +629,7 @@
     lineCache = null;
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/targets.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/targets.js
   var SELECTION = /* @__PURE__ */ Symbol("point-and-shoot.selection");
   function shadowRootsIn(nodes, budget = 2e3) {
     const roots = [];
@@ -766,7 +767,7 @@
     elements()
   ]);
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/emitter.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/emitter.js
   function createEmitter() {
     const listeners = /* @__PURE__ */ new Map();
     return {
@@ -802,7 +803,7 @@
     };
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/outline.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/outline.js
   var snap = (v) => Math.round(v * 2) / 2;
   function sortedUnique(values) {
     values.sort((a, b) => a - b);
@@ -970,7 +971,7 @@
     return roundedLoop([r.x, r.x + r.width, r.x + r.width, r.x], [r.y, r.y, r.y + r.height, r.y + r.height], rad);
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/spotlight.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/spotlight.js
   var SVG = "http://www.w3.org/2000/svg";
   var px = (n) => `${n}px`;
   var ms = (n) => `${n}ms`;
@@ -982,6 +983,7 @@
     ["padding", "--pns-padding", px],
     ["radius", "--pns-radius", px],
     ["dotSize", "--pns-dot-size", px],
+    ["dotRadius", "--pns-dot-radius", px],
     ["pressScale", "--pns-press-scale", String],
     ["lean", "--pns-lean", px],
     ["duration", "--pns-duration", ms],
@@ -997,7 +999,8 @@
     --pns-border: none;
     --pns-padding: 5px;
     --pns-radius: 8px;
-    --pns-dot-size: 4px;
+    --pns-dot-size: 14px;
+    --pns-dot-radius: 6px;
     --pns-press-scale: 0.95;
     --pns-lean: 4px;
     --pns-duration: 110ms;
@@ -1057,7 +1060,7 @@
   /* With nothing targeted, the dot sits under the pointer: no easing. */
   .root.blank .area {
     --pad: calc(var(--pns-dot-size) / 2);
-    border-radius: calc(var(--pns-dot-size) / 2);
+    border-radius: var(--pns-dot-radius);
     background: var(--pns-dot-color);
     transition: opacity 160ms ease-out;
   }
@@ -1318,7 +1321,7 @@
     };
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/controller.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/controller.js
   var ACTIVE = /* @__PURE__ */ Symbol.for("@daformat/point-and-shoot.active");
   var HIDE_SELECTION = "*::selection { background: transparent !important; text-shadow: none !important; }";
   var FADE = 260;
@@ -2156,7 +2159,7 @@
     return api;
   }
 
-  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.0/node_modules/@daformat/point-and-shoot/dist/markdown.js
+  // node_modules/.pnpm/@daformat+point-and-shoot@1.0.1/node_modules/@daformat/point-and-shoot/dist/markdown.js
   var SKIP = /* @__PURE__ */ new Set([
     "script",
     "style",
