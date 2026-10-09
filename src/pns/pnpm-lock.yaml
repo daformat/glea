@@ -9,8 +9,8 @@ importers:
   .:
     devDependencies:
       '@daformat/point-and-shoot':
-        specifier: ^1.0.1
-        version: 1.0.1
+        specifier: ^1.0.2
+        version: 1.0.2
       esbuild:
         specifier: ^0.28.2
         version: 0.28.2
@@ -20,8 +20,8 @@ importers:
 
 packages:
 
-  '@daformat/point-and-shoot@1.0.1':
-    resolution: {integrity: sha512-yY8+tg1uTaF+bNsbUH1DZ79xPBQ1agQFuNgOuNFsN8J9P/33DKapxzNErE0WTIcGdYGneO2ZX0U4z+iczEOGuQ==}
+  '@daformat/point-and-shoot@1.0.2':
+    resolution: {integrity: sha512-ENcEvRmesDGr77ecSeJ0vWhz5dFy9pCXJ3NYrBr8oJ9z4EHOhsBwLWpYI/1QiokTAHgiScs4pcV+gJ8OH8X5vA==}
 
   '@esbuild/aix-ppc64@0.28.2':
     resolution: {integrity: sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ==}
@@ -191,7 +191,7 @@ packages:
 
 snapshots:
 
-  '@daformat/point-and-shoot@1.0.1': {}
+  '@daformat/point-and-shoot@1.0.2': {}
 
   '@esbuild/aix-ppc64@0.28.2':
     optional: true
