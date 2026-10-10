@@ -2,6 +2,13 @@
 
 What changed in each release of Glea.
 
+## 0.15.9 Beta — 2026-10-10
+
+- Folding opens and closes with its height everywhere, where some only
+  faded: All Notes' last group, a note's last section, long sections,
+  groups and references taller than the window.
+- The chevrons on All Notes' groups are the same grey as a note's.
+
 ## 0.15.8 Beta — 2026-10-10
 
 - Glea Clipper for Safari keeps the popup's Into and Open Glea afterwards
