@@ -2760,11 +2760,22 @@ private final class ChevronView: NSView {
   override func hitTest(_ point: NSPoint) -> NSView? { nil }
   override var wantsUpdateLayer: Bool { true }
 
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    needsDisplay = true
+  }
+
   override func updateLayer() {
     guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold) else { return }
+    // Resolved in this view's appearance now: the image draws later, when
+    // the current appearance may be another one.
+    var color = NSColor.gray
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      color = NSColor(cgColor: Theme.secondaryText.cgColor) ?? .gray
+    }
     let tinted = NSImage(size: symbol.size, flipped: false) { rect in
       symbol.draw(in: rect)
-      Theme.tertiaryText.set()
+      color.set()
       rect.fill(using: .sourceAtop)
       return true
     }
