@@ -2,6 +2,14 @@
 
 What changed in each release of Glea.
 
+## 0.15.7 Beta — 2026-10-10
+
+- Glea Clipper for Safari no longer says "Collected to Today" after point
+  and shoot: it can't know where the capture went.
+- Images linked by their bare name are found in your assets folder, like
+  Obsidian's.
+- The chevrons on All Notes' groups show in the dark theme.
+
 ## 0.15.6 Beta — 2026-10-09
 
 - Point and shoot's spotlight glides from block to block, and a selection
