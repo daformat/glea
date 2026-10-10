@@ -5,7 +5,9 @@
 // - Holding ⌥ alone for a moment turns it on (⌘ joining it collects posts
 //   and videos as text), like Glea's modifierFlagsChanged.
 // - __gleaNative.post() hands captures to the background script, which sends
-//   them to Glea and answers; the page then confirms or shakes.
+//   them to Glea and answers; the page then lets go of the shot or shakes. No
+//   badge: handing a URL to Glea doesn't say it was collected (Glea may not
+//   be open, and its picker may send it elsewhere than Today).
 (() => {
   if (globalThis.__gleaNative) return;
   const api = globalThis.browser ?? globalThis.chrome;
@@ -23,7 +25,7 @@
     }
     if (name === 'captureArea' && reply?.shot) pns()?.shotTaken();
     if (reply?.ok) {
-      pns()?.done(reply.message || 'Sent to Glea');
+      pns()?.done();
     } else {
       if (reply?.error) console.warn('Glea:', reply.error);
       pns()?.cancel();

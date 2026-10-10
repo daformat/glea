@@ -1,0 +1,72 @@
+/* Glea's colors (glea/src/app/Theme.swift), as in popup.css. */
+:root {
+  --accent: rgb(84 89 242);
+  --background: #fff;
+  --text: rgb(0 0 0 / 0.85);
+  --secondary: rgb(0 0 0 / 0.5);
+  --separator: rgb(0 0 0 / 0.07);
+  --fill: rgb(0 0 0 / 0.04);
+  --button: rgb(84 89 242);
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: rgb(140 148 255);
+    --background: rgb(28 28 31);
+    --text: rgb(255 255 255 / 0.88);
+    --secondary: rgb(255 255 255 / 0.5);
+    --separator: rgb(255 255 255 / 0.08);
+    --fill: rgb(0 0 0 / 0.18);
+    --button: rgb(94 99 245);
+  }
+}
+
+body {
+  margin: 0;
+  padding: 64px 16px;
+  background: var(--background);
+  color: var(--text);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+main { max-width: 520px; margin: 0 auto; }
+
+img { border-radius: 14px; }
+
+h1 { margin: 20px 0 8px; font-size: 26px; line-height: 1.2; }
+
+h2 {
+  margin: 40px 0 8px;
+  padding-top: 24px;
+  border-top: 1px solid var(--separator);
+  font-size: 15px;
+}
+
+p { margin: 0 0 16px; }
+
+ul { margin: 0 0 16px; padding-left: 20px; }
+li { margin-bottom: 6px; }
+
+.secondary { color: var(--secondary); font-size: 14px; }
+
+.primary {
+  display: inline-block;
+  margin-bottom: 12px;
+  padding: 9px 18px;
+  border-radius: 8px;
+  background: var(--button);
+  color: #fff;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.primary:hover { filter: brightness(1.06); }
+
+kbd {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--separator);
+  font: inherit;
+}

@@ -77,7 +77,15 @@ async function collect() {
   });
   if (reply?.ok) {
     status('Sent to Glea');
-    setTimeout(() => window.close(), 600);
+    // Glea opening (or the browser asking first) takes focus, which closes
+    // this popup. Still here a moment later: nothing took the glea:// URL.
+    // (Safari's comes inside Glea, so there it's always there.)
+    if (api.runtime.getURL('').startsWith('safari-web-extension:')) return setTimeout(() => window.close(), 600);
+    setTimeout(() => {
+      if (!document.hasFocus()) return;
+      status('');
+      $('#missing').hidden = false;
+    }, 1500);
   } else {
     $('#collect').disabled = false;
     status(reply?.error || 'Couldn’t reach Glea.', true);
@@ -93,6 +101,11 @@ $('#to').addEventListener('click', (e) => {
   if (button) setTo(button.dataset.to);
 });
 $('#collect').addEventListener('click', collect);
+$('#download').addEventListener('click', (e) => {
+  e.preventDefault();
+  api.tabs.create({ url: e.currentTarget.href });
+  window.close();
+});
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !$('#collect').disabled) collect();
 });

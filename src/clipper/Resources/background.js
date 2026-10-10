@@ -155,7 +155,7 @@ async function pointAndShoot(tab, name, payload) {
     return { ok: false };
   }
   await send(tab, capture, prefs.to, prefs.open);
-  return { ok: true, shot, message: prefs.to === 'ask' ? 'Sent to Glea' : 'Collected to Today' };
+  return { ok: true, shot };
 }
 
 // ------------------------------------------------------------------ popup
@@ -187,7 +187,11 @@ const MENU = [
 
 const CONTENT_SCRIPTS = ['pns-driver.js', 'vendor/glea-content-script.js'];
 
-api.runtime.onInstalled.addListener(async () => {
+// Safari's comes inside Glea; elsewhere Glea may not be on this Mac yet.
+const BUNDLED_WITH_GLEA = api.runtime.getURL('').startsWith('safari-web-extension:');
+
+api.runtime.onInstalled.addListener(async ({ reason }) => {
+  if (reason === 'install' && !BUNDLED_WITH_GLEA) api.tabs.create({ url: 'welcome.html' });
   await api.contextMenus.removeAll();
   for (const item of MENU) {
     api.contextMenus.create({ ...item, documentUrlPatterns: ['http://*/*', 'https://*/*'] });
