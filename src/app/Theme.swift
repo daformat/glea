@@ -119,6 +119,18 @@ enum Theme {
     NSImage(systemSymbolName: name, accessibilityDescription: nil)?
       .withSymbolConfiguration(.init(pointSize: size, weight: weight))
   }
+
+  /// A symbol in `color`, as `appearance` shows it, drawn like a note's
+  /// chevrons (so other chevrons are the same grey).
+  static func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight, color: NSColor, in appearance: NSAppearance) -> NSImage? {
+    var image: NSImage?
+    appearance.performAsCurrentDrawingAppearance {
+      let config = NSImage.SymbolConfiguration(pointSize: size, weight: weight)
+        .applying(.init(paletteColors: [color.usingColorSpace(.sRGB) ?? .gray]))
+      image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(config)
+    }
+    return image
+  }
 }
 
 /// A plain flipped view, handy as a scroll view document.

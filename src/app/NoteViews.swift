@@ -2808,20 +2808,10 @@ private final class ChevronView: NSView {
   }
 
   override func updateLayer() {
-    guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold) else { return }
-    // Resolved in this view's appearance now: the image draws later, when
-    // the current appearance may be another one.
-    var color = NSColor.gray
-    effectiveAppearance.performAsCurrentDrawingAppearance {
-      color = NSColor(cgColor: Theme.secondaryText.cgColor) ?? .gray
-    }
-    let tinted = NSImage(size: symbol.size, flipped: false) { rect in
-      symbol.draw(in: rect)
-      color.set()
-      rect.fill(using: .sourceAtop)
-      return true
-    }
-    glyph.contents = tinted.layerContents(forContentsScale: window?.backingScaleFactor ?? 2)
+    // Drawn like a note's chevrons, so it's the same grey.
+    guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold, color: Theme.secondaryText,
+                                    in: effectiveAppearance) else { return }
+    glyph.contents = symbol.layerContents(forContentsScale: window?.backingScaleFactor ?? 2)
     glyph.contentsGravity = .center
     glyph.contentsScale = window?.backingScaleFactor ?? 2
   }
