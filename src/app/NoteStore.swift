@@ -89,6 +89,18 @@ final class NoteStore {
   var journalDirectory: URL { root.appendingPathComponent("journal", isDirectory: true) }
   var assetsDirectory: URL { root.appendingPathComponent("assets", isDirectory: true) }
 
+  /// Where a note's link to a file points: a URL as is, a path from the
+  /// note's folder, or (missing there, like Obsidian's bare names) the file
+  /// of that name in assets/.
+  func resolveLink(_ source: String, from base: URL) -> URL? {
+    if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("file://") { return URL(string: source) }
+    let path = source.removingPercentEncoding ?? source
+    let url = base.appendingPathComponent(path).standardizedFileURL
+    if FileManager.default.fileExists(atPath: url.path) { return url }
+    let asset = assetsDirectory.appendingPathComponent(url.lastPathComponent)
+    return FileManager.default.fileExists(atPath: asset.path) ? asset : url
+  }
+
   private init() {
     root = NoteStore.configuredRoot()
     load()

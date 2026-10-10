@@ -244,11 +244,7 @@ final class MediaDescriptor: NSObject {
                        option: m.range(at: 2).location != NSNotFound ? ns.substring(with: m.range(at: 2)) : nil,
                        indent: indent, occurrence: occurrence)
     }
-    func resolve(_ source: String) -> URL? {
-      if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("file://") { return URL(string: source) }
-      let path = source.removingPercentEncoding ?? source
-      return baseDirectory.appendingPathComponent(path).standardizedFileURL
-    }
+    func resolve(_ source: String) -> URL? { NoteStore.shared.resolveLink(source, from: baseDirectory) }
     if let m = imageLine.firstMatch(in: text, range: full) {
       let source = ns.substring(with: m.range(at: 2))
       guard let url = resolve(source) else { return nil }

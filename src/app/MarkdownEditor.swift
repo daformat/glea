@@ -1516,11 +1516,7 @@ struct MarkdownStyler {
   }
 
   private func resolveImageURL(_ source: String) -> URL? {
-    if source.hasPrefix("http://") || source.hasPrefix("https://") || source.hasPrefix("file://") {
-      return URL(string: source)
-    }
-    let path = source.removingPercentEncoding ?? source
-    return baseDirectory.appendingPathComponent(path).standardizedFileURL
+    NoteStore.shared.resolveLink(source, from: baseDirectory)
   }
 }
 
