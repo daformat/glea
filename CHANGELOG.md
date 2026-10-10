@@ -2,6 +2,12 @@
 
 What changed in each release of Glea.
 
+## 0.15.8 Beta — 2026-10-10
+
+- Glea Clipper for Safari keeps the popup's Into and Open Glea afterwards
+  as you set them, and point and shoot follows them: a new note is named
+  after the page.
+
 ## 0.15.7 Beta — 2026-10-10
 
 - Glea Clipper for Safari no longer says "Collected to Today" after point
