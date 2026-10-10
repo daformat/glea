@@ -106,6 +106,11 @@ target_compile_options(GleaClipper PRIVATE "$<$<COMPILE_LANGUAGE:Swift>:-O>" "$<
 target_link_options(GleaClipper PRIVATE "SHELL:-Xlinker -e -Xlinker _NSExtensionMain"
   "SHELL:-application-extension" "SHELL:-framework SafariServices")
 file(GLOB_RECURSE CLIPPER_RESOURCES CONFIGURE_DEPENDS src/clipper/Resources/*)
+# Its files changing relinks it, or the copies below (only made after a link)
+# would keep the old ones. Glea relinks too, to copy the new .appex in.
+set(CLIPPER_INPUTS ${CLIPPER_RESOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/src/resources/content-script.js"
+    "${CMAKE_CURRENT_BINARY_DIR}/Clipper-Info.plist")
+set_property(TARGET GleaClipper APPEND PROPERTY LINK_DEPENDS ${CLIPPER_INPUTS})
 add_custom_command(TARGET GleaClipper POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E rm -rf "${CLIPPER_APPEX}"
   COMMAND ${CMAKE_COMMAND} -E make_directory "${CLIPPER_APPEX}/Contents/MacOS"
@@ -141,6 +146,7 @@ target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CE
 target_link_options(Glea PRIVATE "SHELL:-F ${SPARKLE_DIR}" "SHELL:-framework Sparkle"
   "SHELL:-Xlinker -rpath -Xlinker @executable_path/../Frameworks")
 add_dependencies(Glea ${GLEA_HELPERS} GleaClipper)
+set_property(TARGET Glea APPEND PROPERTY LINK_DEPENDS ${CLIPPER_INPUTS})
 
 # Copy the CEF framework fresh each build. (CEF's COPY_MAC_FRAMEWORK macro uses
 # `ln -sf`, which on rebuilds follows the existing directory symlinks and
