@@ -15,6 +15,12 @@ function setWhat(what) {
   select('what', 'what', what);
 }
 
+// Into and Open Glea afterwards are kept as you choose them, for the popup
+// and for point and shoot, the context menu and the shortcut.
+function save() {
+  api.storage.local.set({ to: state.to, open: $('#open').checked });
+}
+
 function setTo(to) {
   state.to = to;
   select('to', 'to', to);
@@ -68,8 +74,6 @@ async function collect() {
     if (!name) return $('#note-name').focus();
     to = { note: name };
   }
-  // A new note isn't a default: next time starts from the journal again.
-  await api.storage.local.set({ to: state.to === 'note' ? 'journal' : state.to, open: $('#open').checked });
   $('#collect').disabled = true;
   status('Sending to Glea…');
   const reply = await api.runtime.sendMessage({
@@ -98,8 +102,11 @@ $('#what').addEventListener('click', (e) => {
 });
 $('#to').addEventListener('click', (e) => {
   const button = e.target.closest('button');
-  if (button) setTo(button.dataset.to);
+  if (!button) return;
+  setTo(button.dataset.to);
+  save();
 });
+$('#open').addEventListener('change', save);
 $('#collect').addEventListener('click', collect);
 $('#download').addEventListener('click', (e) => {
   e.preventDefault();

@@ -71,8 +71,10 @@ async function extract(tab, what) {
   return { ...page, ...capture, title: capture.title || page.title };
 }
 
-// Sends a capture to Glea. `to`: 'journal', 'ask', or { note: name }.
+// Sends a capture to Glea. `to`: 'journal', 'ask', { note: name }, or
+// 'note' for a note named after the page (the popup's New note, as a default).
 async function send(tab, capture, to, open) {
+  if (to === 'note') to = { note: capture.title || capture.url };
   const params = new URLSearchParams();
   params.set('kind', capture.kind);
   params.set('url', capture.url);
