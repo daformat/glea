@@ -420,10 +420,24 @@ final class FoldView: NSView {
     } else {
       followsBody.isActive = false
       layoutSubtreeIfNeeded()
-      height.constant = (body.frame.height * value).rounded()
+      height.constant = Self.height(body.frame.height, shown: value, of: self)
       height.isActive = true
     }
     onShownChange?(value)
+  }
+
+  /// How tall a fold of `full` points is when `shown` (0 to 1). Taller
+  /// than what's left of the screen below its top, it eases over that only
+  /// (the rest out of sight): going all the way, its edge would leave the
+  /// screen in a frame or two and it would seem to open or close at once.
+  static func height(_ full: CGFloat, shown: CGFloat, of view: NSView) -> CGFloat {
+    var shownHeight = full
+    if let clip = view.enclosingScrollView?.contentView {
+      let frame = clip.convert(view.bounds, from: view)
+      let room = clip.isFlipped ? clip.bounds.maxY - frame.minY : frame.maxY - clip.bounds.minY
+      shownHeight = min(full, max(0, room) + 60)
+    }
+    return (shownHeight * shown).rounded()
   }
 }
 
@@ -1162,7 +1176,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
     } else {
       unlinkedClipFollowsBody.isActive = false
       unlinkedClip.layoutSubtreeIfNeeded()
-      unlinkedClipHeight.constant = (unlinkedBody.frame.height * shown).rounded()
+      unlinkedClipHeight.constant = FoldView.height(unlinkedBody.frame.height, shown: shown, of: unlinkedClip)
       unlinkedClipHeight.isActive = true
     }
   }
@@ -2190,6 +2204,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       pictures.append((renamed[items[row]] ?? items[row], rowView.frame, rowView.picture()))
     }
     let turning = self.turning
+    let oldEnd = tableView.rect(ofRow: items.count - 1).maxY - oldOrigin
     items = fresh
     tableView.reloadData()
     tableView.layoutSubtreeIfNeeded()
@@ -2218,6 +2233,23 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         fadeLayer(layer, in: true)
       }
     }
+    // Nothing follows the list's end to slide over rows coming or going, so
+    // the background below it slides from where it was, like a row would.
+    let end = items.isEmpty ? 0 : tableView.rect(ofRow: items.count - 1).maxY
+    let endOffset = oldEnd - (end - newOrigin)
+    if abs(endOffset) > 0.5 {
+      let tail = SlideOverlayView(frame: NSRect(x: 0, y: end, width: tableView.bounds.width,
+                                                height: clip.bounds.height + abs(endOffset)))
+      tail.wantsLayer = true
+      if let layer = tail.layer {
+        layer.zPosition = 1
+        layer.backgroundColor = background
+        // (Where it ends shows, or else where it starts.)
+        slideLayer(layer, by: endOffset, fromShown: !tableView.visibleRect.insetBy(dx: 0, dy: -1).contains(NSPoint(x: 0, y: end)))
+      }
+      tableView.addSubview(tail)
+      slideOverlays.append(tail)
+    }
     for picture in pictures where !shown.contains(picture.item) {
       let overlay = SlideOverlayView(frame: picture.frame.offsetBy(dx: 0, dy: newOrigin - oldOrigin))
       overlay.wantsLayer = true
@@ -2234,7 +2266,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         overlay.frame.origin.y = target.minY
         layer.zPosition = 1
         layer.backgroundColor = background
-        slideLayer(layer, by: (picture.frame.minY - oldOrigin) - (target.minY - newOrigin))
+        slideLayer(layer, by: (picture.frame.minY - oldOrigin) - (target.minY - newOrigin), fromShown: true)
       } else {
         overlay.alphaValue = 0
         fadeLayer(layer, in: false)
@@ -2264,11 +2296,21 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     slideMoved = []
   }
 
-  private func slideLayer(_ layer: CALayer, by offset: CGFloat) {
+  /// Slides `layer` from `offset` points away into place. Far, it goes a
+  /// window's height at most, from (or to) out of sight, on the side where
+  /// it isn't shown (`fromShown`: it shows where it starts): going all the
+  /// way, it would cross the screen in a frame or two, and a group would seem
+  /// to open or close at once.
+  private func slideLayer(_ layer: CALayer, by offset: CGFloat, fromShown: Bool = false) {
+    let room = scroll.contentView.bounds.height + 60
+    var from = offset, to: CGFloat = 0
+    if abs(offset) > room {
+      if fromShown { to = offset - (offset > 0 ? room : -room) } else { from = offset > 0 ? room : -room }
+    }
     let animation = CABasicAnimation(keyPath: "position")
     animation.isAdditive = true
-    animation.fromValue = NSValue(point: NSPoint(x: 0, y: offset))
-    animation.toValue = NSValue(point: .zero)
+    animation.fromValue = NSValue(point: NSPoint(x: 0, y: from))
+    animation.toValue = NSValue(point: NSPoint(x: 0, y: to))
     animation.duration = Motion.foldDuration
     animation.timingFunction = CubicBezier.fold.timingFunction
     layer.add(animation, forKey: "glea.list.slide")

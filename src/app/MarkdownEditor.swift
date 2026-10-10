@@ -4556,19 +4556,24 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     // What can show while it slides: what's on screen, and what slides
     // into it (from above when it moves down, from below when it moves up).
     let screen = host.visibleRect
-    let above = max(0, offsets.max() ?? 0), below = max(0, -(offsets.min() ?? 0))
-    let visible = NSRect(x: screen.minX, y: screen.minY - above - 40, width: screen.width, height: screen.height + above + below + 80)
     // Opening a long section, what follows ends far below: going all the way,
     // it would leave the screen in a frame or two and the section would seem
     // to open at once. It slides a window's height at most over the whole
-    // slide instead, then on to its place out of sight.
+    // slide instead, then on to its place out of sight. Closing one, it
+    // starts a window's height below its place (from out of sight) the same
+    // way.
     let edgeTop = textView.convert(NSPoint(x: 0, y: top), to: host).y
     let travelled = -shift(at: edgeTop)
     let endShift = fadingIn && travelled > screen.height ? screen.height - travelled : 0
+    let startShift = !fadingIn && !overlays.isEmpty && -travelled > screen.height ? -travelled - screen.height : 0
+    var above = max(0, offsets.max() ?? 0)
+    if startShift != 0 { above = min(above, screen.height) }
+    let below = max(0, -(offsets.min() ?? 0))
+    let visible = NSRect(x: screen.minX, y: screen.minY - above - 40, width: screen.width, height: screen.height + above + below + 80)
 
     func move(_ view: NSView, by dy: CGFloat) {
       guard let layer = view.layer, let superview = view.superview else { return }
-      let shift = superview.convert(NSPoint(x: 0, y: dy), from: host).y - superview.convert(NSPoint.zero, from: host).y
+      let shift = superview.convert(NSPoint(x: 0, y: dy - startShift), from: host).y - superview.convert(NSPoint.zero, from: host).y
       let end = endShift == 0 ? 0
         : superview.convert(NSPoint(x: 0, y: endShift), from: host).y - superview.convert(NSPoint.zero, from: host).y
       let animation = CABasicAnimation(keyPath: "position")
@@ -4630,19 +4635,18 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       }
       child = parent
     }
-    // Blocks of a section opening or closing: cut off where what follows it
-    // is, fading.
+    // Where what follows starts, as it slides.
     let edge = textView.convert(NSPoint(x: 0, y: top), to: host).y
     let edgeOffset = shift(at: edge)
-    for view in cut {
-      guard let layer = view.layer else { continue }
+    func cutOff(_ view: NSView) {
+      guard let layer = view.layer else { return }
       let frame = view.frame
       let flipped = layer.contentsAreFlipped()
       var bounds: [NSValue] = [], positions: [NSValue] = []
       let steps = 30
       for step in 0...steps {
         let left = CGFloat(1 - curve(Double(step) / Double(steps)))
-        let shown = min(frame.height, max(0, edge + edgeOffset * left + endShift * (1 - left) - frame.minY))
+        let shown = min(frame.height, max(0, edge + (edgeOffset - startShift) * left + endShift * (1 - left) - frame.minY))
         let rect = CGRect(x: 0, y: flipped ? 0 : frame.height - shown, width: frame.width, height: shown)
         bounds.append(NSValue(rect: CGRect(origin: .zero, size: rect.size)))
         positions.append(NSValue(point: CGPoint(x: rect.midX, y: rect.midY)))
@@ -4660,6 +4664,41 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
         mask.add(animation, forKey: key)
       }
       layer.mask = mask
+    }
+    // A section opening or closing at the editor's end: nothing in the
+    // editor follows it to slide over it. Its pictures show only above where
+    // what follows is, and below that, under what follows the editor (as
+    // itself), the page's background slides along.
+    if !overlays.isEmpty, column !== self {
+      overlays.forEach(cutOff)
+      var item: NSView = self
+      while let superview = item.superview, superview !== column { item = superview }
+      let offset = offsets.last ?? 0
+      let bottom = visible.maxY - min(offset - startShift, endShift, 0)
+      if abs(offset) > 0.5, bottom > editor.maxY {
+        // In the column, over the editor; then in the margin, over the gutter.
+        let below = NSRect(x: column.frame.minX, y: editor.maxY, width: column.frame.width, height: bottom - editor.maxY)
+        let cover = SlideOverlayView(frame: column.convert(below, from: host))
+        cover.wantsLayer = true
+        cover.layer?.backgroundColor = resolvedCGColor(Theme.background)
+        column.addSubview(cover, positioned: .above, relativeTo: item)
+        slide.overlays.append(cover)
+        move(cover, by: offset)
+        let columnX = column.frame.minX
+        if left < columnX {
+          let margin = SlideOverlayView(frame: NSRect(x: left, y: below.minY, width: columnX - left, height: below.height))
+          margin.wantsLayer = true
+          margin.layer?.backgroundColor = resolvedCGColor(Theme.background)
+          place(margin)
+          move(margin, by: offset)
+        }
+      }
+    }
+    // Blocks of a section opening or closing: cut off where what follows it
+    // is, fading.
+    for view in cut {
+      guard let layer = view.layer else { continue }
+      cutOff(view)
       let fade = CABasicAnimation(keyPath: "opacity")
       fade.fromValue = fadingIn ? 0 : 1
       fade.toValue = fadingIn ? 1 : 0
