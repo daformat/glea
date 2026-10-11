@@ -98,7 +98,7 @@ final class TabsView: NSView {
   private var tabInfos: [ObjectIdentifier: TabInfo] = [:]
   private var groupInfos: [GroupInfo] = []
   private var capsules: [UUID: GroupCapsule] = [:]
-  private var underlines: [UUID: CALayer] = [:]
+  private var underlines: [UUID: GroupLineView] = [:]
   private var drag: TabDrag?
   private var lastDragEventTime: CFTimeInterval = 0
   /// Views just dropped (back in the strip): their spring starts where they are.
@@ -1258,12 +1258,11 @@ extension TabsView {
       }()
       capsule.configure(label: info.label, color: info.color)
       if underlines[info.id] == nil {
-        let line = CALayer()
-        line.cornerRadius = 0.75
-        tabStrip.layer?.addSublayer(line)
+        let line = GroupLineView()
+        tabStrip.addSubview(line, positioned: .below, relativeTo: nil)
         underlines[info.id] = line
       }
-      underlines[info.id]?.backgroundColor = resolvedCGColor(info.color)
+      underlines[info.id]?.color = info.color
     }
     for (id, capsule) in capsules where !ids.contains(id) {
       capsules[id] = nil
@@ -1271,7 +1270,7 @@ extension TabsView {
     }
     for (id, line) in underlines where !ids.contains(id) {
       underlines[id] = nil
-      line.removeFromSuperlayer()
+      line.removeFromSuperview()
     }
   }
 
@@ -1496,7 +1495,9 @@ extension TabsView {
     let tabCount = CGFloat(items.filter { if case .tab = $0 { return true }; return $0 == nil && isDraggingTab }.count)
     let capsulesLength = items.reduce(CGFloat(0)) { sum, item in
       if case .capsule(let g) = item { return sum + capsuleLength(g) }
-      if item == nil, case .group(let g)? = drag?.kind { return sum + capsuleLength(g) }
+      // (A dragged group's gap: all of it, capsule and tabs, so the others
+      // keep their widths.)
+      if item == nil, case .group(let g)? = drag?.kind { return sum + (drag?.length ?? capsuleLength(g)) }
       return sum
     }
     let gaps = CGFloat(max(0, items.count - 1)) * spacing + 8
@@ -1626,49 +1627,30 @@ extension TabsView {
       }
     }
 
-    // Group lines: along a group's capsule and tabs.
-    CATransaction.begin()
-    CATransaction.setDisableActions(!animated)
-    CATransaction.setAnimationDuration(0.25)
-    CATransaction.setAnimationTimingFunction(Motion.easeOut)
+    // Group lines: along a group's capsule and tabs, moving with them.
     for info in groupInfos {
       guard let line = underlines[info.id] else { continue }
       // (A dragged group's follows it, below.)
       if case .group(info.id)? = drag?.kind { continue }
-      // Dropped: back in the strip, springing from where it was like its
-      // capsule and tabs.
-      var springsFrom: (position: CGPoint, bounds: CGRect)?
-      if line.superlayer !== tabStrip.layer, let stripLayer = tabStrip.layer {
-        Motion.withoutAnimation {
-          let frame = stripLayer.convert(line.frame, from: line.superlayer)
-          stripLayer.addSublayer(line)
-          line.frame = frame
-        }
-        springsFrom = (line.position, line.bounds)
+      if line.superview !== tabStrip {
+        // Dropped: back in the strip, springing from where it was like its
+        // capsule and tabs.
+        let frame = line.convert(line.bounds, to: tabStrip)
+        tabStrip.addSubview(line, positioned: .below, relativeTo: nil)
+        line.frame = frame
+        releasedViews.append(line)
       }
       var parts = ([BarItem.capsule(info.id)] + members(info.id).map { BarItem.tab($0) }).compactMap { frames[$0] }
       // The gap where a dragged tab would join the group.
       if !grouping, case .strip(_, let g)? = target, g == info.id, let gapFrame { parts.append(gapFrame) }
       guard let first = parts.first, let last = parts.max(by: { axis.maxMain($0) < axis.maxMain($1) }) else {
-        line.opacity = 0
+        Motion.animate(animated ? 0.2 : 0) { line.animator().alphaValue = 0 }
         continue
       }
-      line.opacity = 1
-      let frame = rect(main: axis.minMain(first) + 2, length: max(0, axis.maxMain(last) - axis.minMain(first) - 4), across: groupLineSpan)
-      guard let springsFrom, animated, !Motion.reduceMotion else {
-        line.frame = frame
-        continue
-      }
-      Motion.withoutAnimation { line.frame = frame }
-      for (key, from, to) in [("position", NSValue(point: springsFrom.position), NSValue(point: line.position)),
-                              ("bounds", NSValue(rect: springsFrom.bounds), NSValue(rect: line.bounds))] {
-        let spring = Motion.spring(key, stiffness: 420, damping: 34)
-        spring.fromValue = from
-        spring.toValue = to
-        line.add(spring, forKey: "glea.spring.\(key)")
-      }
+      if line.alphaValue < 1 { Motion.animate(animated ? 0.2 : 0) { line.animator().alphaValue = 1 } }
+      place(line, rect(main: axis.minMain(first) + 2, length: max(0, axis.maxMain(last) - axis.minMain(first) - 4), across: groupLineSpan),
+            animated: animated)
     }
-    CATransaction.commit()
 
     // What's being dragged follows the pointer (above everything).
     if let drag {
@@ -1716,15 +1698,13 @@ extension TabsView {
         }
         // Its line follows it, above the strip while it's carried.
         if let line = underlines[g] {
-          Motion.withoutAnimation {
-            if line.superlayer !== layer, let layer {
-              let frame = layer.convert(line.frame, from: line.superlayer)
-              layer.addSublayer(line)
-              line.frame = frame
-            }
-            line.opacity = 1
-            line.frame = rect(main: left + 2, length: max(0, offset - spacing - left - 4), across: groupLineSpan)
+          if line.superview !== self {
+            let frame = line.convert(line.bounds, to: self)
+            addSubview(line)
+            line.frame = frame
           }
+          line.alphaValue = 1
+          place(line, rect(main: left + 2, length: max(0, offset - spacing - left - 4), across: groupLineSpan), animated: false)
         }
       }
     }
@@ -2241,6 +2221,30 @@ extension TabsView {
       relayout(animated: true)
     }
   }
+}
+
+/// A group's line: under its capsule and tabs in the bar, along their left in
+/// a sidebar. A view, so it moves (springs) exactly like them.
+private final class GroupLineView: NSView {
+  var color: NSColor = .gray {
+    didSet { needsDisplay = true }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layer?.cornerRadius = 0.75
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override var wantsUpdateLayer: Bool { true }
+
+  override func updateLayer() {
+    layer?.backgroundColor = resolvedCGColor(color)
+  }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
 /// A group's capsule in the tab bar: its name (and count, when collapsed) on
