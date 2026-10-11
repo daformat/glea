@@ -822,6 +822,15 @@ enum TestHooks {
         let shown = view.layer?.presentation()?.position.x ?? -1
         NSLog("Glea tabs: %@ %@ hidden=%d alpha=%.2f opacity=%.2f shownX=%.1f", String(describing: type(of: view)), NSStringFromRect(view.convert(view.bounds, to: nil)), view.isHidden, view.alphaValue, view.layer?.opacity ?? -1, shown)
       }
+    case "bar-views":
+      // Every view in the top bar, in window coordinates (where it's shown).
+      let views = allSubviews(controller.topBar).dropFirst()
+      for view in views where !view.isHiddenOrHasHiddenAncestor {
+        let r = view.convert(view.bounds, to: nil)
+        let shown = view.layer?.presentation()?.position ?? .zero
+        NSLog("Glea bar: %@ %@ alpha=%.2f opacity=%.2f shown=%.1f,%.1f", String(describing: type(of: view)), NSStringFromRect(r),
+              view.alphaValue, view.layer?.opacity ?? -1, shown.x, shown.y)
+      }
     case "debug":
       if let window = controller.window, let content = window.contentView {
         NSLog("Glea debug: frame=\(NSStringFromRect(window.frame)) fitting=\(NSStringFromSize(content.fittingSize))")
