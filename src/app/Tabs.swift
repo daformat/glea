@@ -1454,7 +1454,8 @@ extension TabsView {
     func capsuleSpan(_ g: UUID) -> (cross: CGFloat, thickness: CGFloat) {
       axis == .horizontal ? across(GroupCapsule.height) : across(min(capsuleWidth(g), rowWidth))
     }
-    let plusLength: CGFloat = 28 + 6
+    let plusSize: CGFloat = axis == .vertical ? rowLength : 28
+    let plusLength = plusSize + 6
     let target = dropTarget()
     updateDraggedTabLook()
 
@@ -1627,6 +1628,16 @@ extension TabsView {
     CATransaction.setAnimationTimingFunction(Motion.easeOut)
     for info in groupInfos {
       guard let line = underlines[info.id] else { continue }
+      // (A dragged group's follows it, below.)
+      if case .group(info.id)? = drag?.kind { continue }
+      if line.superlayer !== tabStrip.layer, let stripLayer = tabStrip.layer {
+        // Dropped: back in the strip, from where it was.
+        Motion.withoutAnimation {
+          let frame = stripLayer.convert(line.frame, from: line.superlayer)
+          stripLayer.addSublayer(line)
+          line.frame = frame
+        }
+      }
       var parts = ([BarItem.capsule(info.id)] + members(info.id).map { BarItem.tab($0) }).compactMap { frames[$0] }
       // The gap where a dragged tab would join the group.
       if !grouping, case .strip(_, let g)? = target, g == info.id, let gapFrame { parts.append(gapFrame) }
@@ -1683,11 +1694,26 @@ extension TabsView {
           pill.frame = rect(main: offset, length: length, across: pillSpan)
           offset += length + spacing
         }
+        // Its line follows it, above the strip while it's carried.
+        if let line = underlines[g] {
+          Motion.withoutAnimation {
+            if line.superlayer !== layer, let layer {
+              let frame = layer.convert(line.frame, from: line.superlayer)
+              layer.addSublayer(line)
+              line.frame = frame
+            }
+            line.opacity = 1
+            line.frame = rect(main: left + 2, length: max(0, offset - spacing - left - 4), across: groupLineSpan)
+          }
+        }
       }
     }
 
-    let plusMain = min(x + stripLength + 6, end - 28)
-    place(newTabButton, rect(main: plusMain, length: 28, across: across(28)), animated: animated && isWeb)
+    let plusMain = min(x + stripLength + 6, end - plusSize)
+    // (A sidebar's spans the row, like a tab.)
+    let plusFrame = axis == .vertical ? rect(main: plusMain, length: rowLength, across: across(0, fills: true))
+      : rect(main: plusMain, length: 28, across: across(28))
+    place(newTabButton, plusFrame, animated: animated && isWeb)
   }
 
   private func appear(_ pill: TabPill, at frame: NSRect, animated: Bool) {

@@ -921,7 +921,9 @@ private final class SidebarEdge: NSView {
 
   override var mouseDownCanMoveWindow: Bool { false }
 
-  override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+  // The resize cursor from the tracking area (cursor rects aren't
+  // refreshed reliably here), kept while dragging.
+  override func cursorUpdate(with event: NSEvent) { NSCursor.resizeLeftRight.set() }
 
   override func layout() {
     super.layout()
@@ -936,13 +938,22 @@ private final class SidebarEdge: NSView {
   override func updateTrackingAreas() {
     super.updateTrackingAreas()
     if let tracking { removeTrackingArea(tracking) }
-    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .cursorUpdate, .activeInActiveApp, .inVisibleRect],
+                              owner: self)
     addTrackingArea(area)
     tracking = area
   }
 
-  override func mouseEntered(with event: NSEvent) { showLine(true) }
-  override func mouseExited(with event: NSEvent) { if !resizing { showLine(false) } }
+  override func mouseEntered(with event: NSEvent) {
+    NSCursor.resizeLeftRight.set()
+    showLine(true)
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    guard !resizing else { return }
+    NSCursor.arrow.set()
+    showLine(false)
+  }
 
   private func showLine(_ shown: Bool) {
     CATransaction.begin()
@@ -962,6 +973,7 @@ private final class SidebarEdge: NSView {
 
   override func mouseDragged(with event: NSEvent) {
     guard resizing else { return }
+    NSCursor.resizeLeftRight.set()
     onResize?(startWidth + event.locationInWindow.x - startX, false)
   }
 
@@ -969,7 +981,10 @@ private final class SidebarEdge: NSView {
     guard resizing else { return }
     resizing = false
     onResize?(startWidth + event.locationInWindow.x - startX, true)
-    if !bounds.contains(convert(event.locationInWindow, from: nil)) { showLine(false) }
+    if !bounds.contains(convert(event.locationInWindow, from: nil)) {
+      NSCursor.arrow.set()
+      showLine(false)
+    }
   }
 }
 
