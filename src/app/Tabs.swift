@@ -2,6 +2,36 @@ import AppKit
 
 // MARK: - Tabs
 
+/// The direction tabs run in: along the top bar, or down a sidebar. The
+/// tabs' views are flipped, so "along" is x, or y from the top.
+enum TabAxis {
+  case horizontal, vertical
+
+  /// A point's position along the axis.
+  func main(_ point: NSPoint) -> CGFloat { self == .horizontal ? point.x : point.y }
+  /// Its position across.
+  func cross(_ point: NSPoint) -> CGFloat { self == .horizontal ? point.y : point.x }
+  func minMain(_ rect: NSRect) -> CGFloat { self == .horizontal ? rect.minX : rect.minY }
+  func maxMain(_ rect: NSRect) -> CGFloat { self == .horizontal ? rect.maxX : rect.maxY }
+  func midMain(_ rect: NSRect) -> CGFloat { self == .horizontal ? rect.midX : rect.midY }
+  /// A rect's extent along the axis.
+  func length(_ rect: NSRect) -> CGFloat { self == .horizontal ? rect.width : rect.height }
+  /// Its extent across.
+  func thickness(_ rect: NSRect) -> CGFloat { self == .horizontal ? rect.height : rect.width }
+
+  /// `length` long from `main` along the axis, `thickness` wide from `cross` across it.
+  func rect(main: CGFloat, length: CGFloat, cross: CGFloat, thickness: CGFloat) -> NSRect {
+    self == .horizontal
+      ? NSRect(x: main, y: cross, width: length, height: thickness)
+      : NSRect(x: cross, y: main, width: thickness, height: length)
+  }
+
+  /// `rect` moved along the axis to start at `main`, `length` long.
+  func rect(_ rect: NSRect, main: CGFloat, length: CGFloat) -> NSRect {
+    self.rect(main: main, length: length, cross: cross(rect.origin), thickness: thickness(rect))
+  }
+}
+
 /// The web's tabs: pinned ones, then the others with their groups' capsules,
 /// and the + button after them. Spans the bar it's in: draws nothing itself,
 /// and lets clicks on empty space through to the bar.
@@ -36,8 +66,8 @@ final class TabsView: NSView {
   /// The widest a tab may be in the strip now (tabs are narrower when their
   /// title is short).
   private var stripTabWidth: CGFloat = 0
-  /// Each strip tab's width in the last layout.
-  private var stripTabWidths: [ObjectIdentifier: CGFloat] = [:]
+  /// Each strip tab's length in the last layout.
+  private var stripTabLengths: [ObjectIdentifier: CGFloat] = [:]
 
   /// A tab's width for its title: never wider than its content (the icon,
   /// the title, a margin). The active tab, whose close button always shows,
@@ -100,7 +130,38 @@ final class TabsView: NSView {
 
   required init?(coder: NSCoder) { fatalError() }
 
+  override var isFlipped: Bool { true }
   override var mouseDownCanMoveWindow: Bool { false }
+
+  /// Along the bar, or down a sidebar.
+  var axis = TabAxis.horizontal {
+    didSet {
+      guard axis != oldValue else { return }
+      tabStrip.axis = axis
+      for pill in pills.values { pill.dragAxis = axis }
+      for capsule in capsules.values { capsule.dragAxis = axis }
+    }
+  }
+
+  /// Down a sidebar, tabs are rows this far from its sides.
+  static let rowInset: CGFloat = 8
+
+  /// Its extent across the axis (the bar's height, the sidebar's width).
+  fileprivate var crossExtent: CGFloat { axis.thickness(bounds) }
+
+  /// Where something `thickness` thick goes across the axis: centered in the
+  /// bar; in a sidebar, from the inset, filling it when it's a row.
+  fileprivate func across(_ thickness: CGFloat, fills: Bool = false) -> (cross: CGFloat, thickness: CGFloat) {
+    switch axis {
+    case .horizontal: return ((crossExtent - thickness) / 2, thickness)
+    case .vertical: return (Self.rowInset, fills ? max(0, crossExtent - 2 * Self.rowInset) : thickness)
+    }
+  }
+
+  /// A rect along the axis, placed across it by `across`.
+  fileprivate func rect(main: CGFloat, length: CGFloat, across span: (cross: CGFloat, thickness: CGFloat)) -> NSRect {
+    axis.rect(main: main, length: length, cross: span.cross, thickness: span.thickness)
+  }
 
   /// Only its tabs and buttons take clicks.
   override func hitTest(_ point: NSPoint) -> NSView? {
@@ -151,6 +212,7 @@ final class TabsView: NSView {
         self.delegate?.topBarToggleMute(at: index)
       }
       pill.onHoverChange = { [weak self] in self?.updatePinnedSeparator(animated: true) }
+      pill.dragAxis = axis
       pills[info.id] = pill
       (info.isPinned ? pinnedStrip : tabStrip).addSubview(pill)
       added.insert(info.id)
@@ -213,10 +275,19 @@ private final class TabStripView: NSView {
   @objc func _opaqueRectForWindowMoveWhenInTitlebar() -> NSRect { bounds }
 
   var onScroll: (() -> Void)?
-  var contentWidth: CGFloat = 0 {
+  var axis = TabAxis.horizontal {
+    didSet {
+      fade.startPoint = axis == .horizontal ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 0.5, y: 0)
+      fade.endPoint = axis == .horizontal ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0.5, y: 1)
+      clampOffset()
+      updateFade()
+    }
+  }
+  /// The tabs' extent along the axis.
+  var contentLength: CGFloat = 0 {
     didSet {
       // (Set on every layout: only a real change ends an overscroll.)
-      guard contentWidth != oldValue else { return }
+      guard contentLength != oldValue else { return }
       clampOffset()
       updateFade()
     }
@@ -243,11 +314,14 @@ private final class TabStripView: NSView {
 
   required init?(coder: NSCoder) { fatalError() }
 
+  override var isFlipped: Bool { true }
   override var mouseDownCanMoveWindow: Bool { false }
   // Empty strip space behaves like the rest of the bar (drag, zoom).
   override func mouseDown(with event: NSEvent) { superview?.mouseDown(with: event) }
 
-  private var maxOffset: CGFloat { max(0, contentWidth - bounds.width) }
+  /// Its own extent along the axis.
+  private var length: CGFloat { axis.length(bounds) }
+  private var maxOffset: CGFloat { max(0, contentLength - length) }
 
   override func setFrameSize(_ newSize: NSSize) {
     let changed = newSize != frame.size
@@ -265,9 +339,10 @@ private final class TabStripView: NSView {
 
   override func scrollWheel(with event: NSEvent) {
     guard maxOffset > 0 || scrollOffset != 0 else { return super.scrollWheel(with: event) }
-    // Sideways or vertical: both scroll the tabs.
+    // Sideways or vertical: both scroll a bar's tabs (a sidebar's only go
+    // up and down).
     let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
-    var delta = abs(dx) > abs(dy) ? -dx : -dy
+    var delta = axis == .horizontal && abs(dx) > abs(dy) ? -dx : -dy
     // A mouse wheel stops at the ends.
     guard event.hasPreciseScrollingDeltas else {
       delta *= 12
@@ -313,7 +388,7 @@ private final class TabStripView: NSView {
 
   /// AppKit's resistance curve (the farther past the end, the less it
   /// moves), flattening out at a short distance.
-  private var rubberDimension: CGFloat { max(1, min(bounds.width, 70)) }
+  private var rubberDimension: CGFloat { max(1, min(length, 70)) }
   private func rubber(_ x: CGFloat) -> CGFloat {
     let d = rubberDimension
     return (1 - 1 / (x * 0.55 / d + 1)) * d
@@ -396,11 +471,11 @@ private final class TabStripView: NSView {
     return true
   }
 
-  /// Scrolls just enough to show the span [minX, maxX] of the content.
-  func reveal(minX: CGFloat, maxX: CGFloat, animated _: Bool) {
+  /// Scrolls just enough to show the span [start, end] of the content.
+  func reveal(from start: CGFloat, to end: CGFloat, animated _: Bool) {
     let previous = scrollOffset
-    if minX - fadeWidth < scrollOffset { scrollOffset = minX - fadeWidth }
-    if maxX + fadeWidth > scrollOffset + bounds.width { scrollOffset = maxX + fadeWidth - bounds.width }
+    if start - fadeWidth < scrollOffset { scrollOffset = start - fadeWidth }
+    if end + fadeWidth > scrollOffset + length { scrollOffset = end + fadeWidth - length }
     clampOffset()
     if scrollOffset != previous { updateFade() }
   }
@@ -409,26 +484,26 @@ private final class TabStripView: NSView {
   private func updateFade() {
     guard let layer else { return }
     Motion.withoutAnimation {
-      guard maxOffset > 0, bounds.width > fadeWidth * 2 else {
+      guard maxOffset > 0, length > fadeWidth * 2 else {
         layer.mask = nil
         return
       }
       fade.frame = layer.bounds
-      let edge = Double(fadeWidth / bounds.width)
+      let edge = Double(fadeWidth / length)
       let steps = 6
       var colors: [CGColor] = []
       var locations: [NSNumber] = []
-      let leftHidden = scrollOffset > 0.5, rightHidden = scrollOffset < maxOffset - 0.5
+      let startHidden = scrollOffset > 0.5, endHidden = scrollOffset < maxOffset - 0.5
       for i in 0...steps {
         let t = CGFloat(i) / CGFloat(steps)
         let eased = t * t * (3 - 2 * t)
-        colors.append(NSColor.black.withAlphaComponent(leftHidden ? eased : 1).cgColor)
+        colors.append(NSColor.black.withAlphaComponent(startHidden ? eased : 1).cgColor)
         locations.append(NSNumber(value: edge * Double(t)))
       }
       for i in 0...steps {
         let t = CGFloat(i) / CGFloat(steps)
         let eased = t * t * (3 - 2 * t)
-        colors.append(NSColor.black.withAlphaComponent(rightHidden ? 1 - eased : 1).cgColor)
+        colors.append(NSColor.black.withAlphaComponent(endHidden ? 1 - eased : 1).cgColor)
         locations.append(NSNumber(value: 1 - edge + edge * Double(t)))
       }
       fade.colors = colors
@@ -485,6 +560,8 @@ private final class TabPill: NSView {
   var onClose: (() -> Void)?
   var onMenu: (() -> NSMenu?)?
   var onDrag: ((DragPhase, NSEvent) -> Void)?
+  /// Drags start once the pointer moves this way (along the tabs).
+  var dragAxis = TabAxis.horizontal
   var onToggleMute: (() -> Void)?
   /// Hidden inside its collapsed group's capsule: not clickable.
   var isCollapsedAway = false
@@ -946,7 +1023,7 @@ private final class TabPill: NSView {
 
   override func mouseDragged(with event: NSEvent) {
     guard let start = pressStart else { return }
-    if !dragging, abs(event.locationInWindow.x - start.x) > 4 {
+    if !dragging, abs(dragAxis.main(event.locationInWindow) - dragAxis.main(start)) > 4 {
       dragging = true
       layer?.removeAnimation(forKey: "press")
       onDrag?(.began, event)
@@ -1046,18 +1123,19 @@ private enum BarItem: Hashable {
 private struct TabDrag {
   enum Kind { case tab(ObjectIdentifier), group(UUID) }
   var kind: Kind
-  /// Where it was grabbed, as a fraction of its width (kept as a tab
+  /// Where it was grabbed, as a fraction of its length (kept as a tab
   /// shrinks to or grows from its pinned look).
   var grabFraction: CGFloat
-  /// Pointer x in the bar.
+  /// The pointer along the axis, in the tabs' view.
   var pointer: CGFloat
-  /// Its width where it would land (the room the layout makes for it).
-  var width: CGFloat
-  /// Its width as drawn: eases to `width`.
-  var shownWidth: CGFloat
-  /// Pointer x minus its left edge, as drawn (it stays under the pointer as
+  /// Its length where it would land (the room the layout makes for it).
+  var length: CGFloat
+  /// Its length as drawn: eases to `length`.
+  var shownLength: CGFloat
+  /// The pointer minus its start, as drawn (it stays under the pointer as
   /// it shrinks to or grows from its pinned look).
-  var grab: CGFloat { grabFraction * shownWidth }
+  var grab: CGFloat { grabFraction * shownLength }
+
   /// Where it would land the last time the pointer was over the bar: a
   /// release anywhere else snaps it there.
   var lastTarget: DropTarget?
@@ -1083,9 +1161,11 @@ private final class PinnedStripView: NSView {
   /// and the bar drags the window from its empty space itself (mouseDown).
   @objc func _opaqueRectForWindowMoveWhenInTitlebar() -> NSRect { bounds }
 
+  override var isFlipped: Bool { true }
   override var mouseDownCanMoveWindow: Bool { false }
   override func mouseDown(with event: NSEvent) { superview?.mouseDown(with: event) }
 }
+
 
 extension TabsView {
   private var pinnedWidth: CGFloat { 32 }
@@ -1103,6 +1183,8 @@ extension TabsView {
         capsule.onToggle = { [weak self] in self?.delegate?.topBarToggleGroup(id) }
         capsule.onMenu = { [weak self] in self?.delegate?.topBarMenu(forGroup: id) }
         capsule.onDrag = { [weak self] phase, event in self?.dragGroup(id, phase: phase, event: event) }
+        capsule.dragAxis = axis
+
         capsules[id] = capsule
         tabStrip.addSubview(capsule)
         if window != nil { capsule.animateIn(scale: 0.8, duration: 0.2) }
@@ -1199,12 +1281,11 @@ extension TabsView {
   /// Places a hairline in the gap after each tab followed by another tab
   /// (not next to a group's capsule or a drop gap).
   fileprivate func layoutTabSeparators(items: [BarItem?], frames: [BarItem: NSRect], animated: Bool) {
-    let h = bounds.height
     var placed: Set<ObjectIdentifier> = []
     for (item, next) in zip(items, items.dropFirst()) {
       guard case .tab(let left)? = item, case .tab(let right)? = next, let frame = frames[.tab(left)],
             pills[left]?.superview === tabStrip, pills[right]?.superview === tabStrip else { continue }
-      let separatorFrame = NSRect(x: (frame.maxX + spacing / 2 - 0.5).rounded(), y: ((h - 16) / 2).rounded(), width: 1, height: 16)
+      let separatorFrame = rect(main: (axis.maxMain(frame) + spacing / 2 - 0.5).rounded(), length: 1, across: separatorSpan)
       if let existing = tabSeparators[left] {
         tabSeparators[left] = (existing.view, right)
         place(existing.view, separatorFrame, animated: animated && isWeb)
@@ -1224,26 +1305,56 @@ extension TabsView {
     updateTabSeparators(animated: animated)
   }
 
-  /// Lays the tabs out between `start` and `rightEdge` (+ included).
-  func layoutTabs(from start: CGFloat, to rightEdge: CGFloat, animated: Bool, added: Set<ObjectIdentifier>,
+  /// Across the axis: separators are 16pt lines in the bar, and span a
+  /// sidebar's rows (short of their ends).
+  private var separatorSpan: (cross: CGFloat, thickness: CGFloat) {
+    switch axis {
+    case .horizontal: return (((crossExtent - 16) / 2).rounded(), 16)
+    case .vertical:
+      let row = across(0, fills: true)
+      return (row.cross + 8, max(0, row.thickness - 16))
+    }
+  }
+
+  /// A group's line (and the ⌥-drag preview's): under its tabs in the bar,
+  /// along their left in a sidebar.
+  private var groupLineSpan: (cross: CGFloat, thickness: CGFloat) {
+    switch axis {
+    case .horizontal:
+      let pill = across(Theme.tabHeight)
+      return (pill.cross + pill.thickness + 2.5, 1.5)
+    case .vertical: return (Self.rowInset - 4, 1.5)
+    }
+  }
+
+  /// A tab's length in the strip: a bar's tabs share its width, a
+  /// sidebar's rows are all the same height.
+  private var rowLength: CGFloat { Theme.tabHeight }
+
+  /// A group's capsule's length along the axis (a sidebar's are rows).
+  private func capsuleLength(_ group: UUID) -> CGFloat {
+    axis == .horizontal ? capsuleWidth(group) : GroupCapsule.height
+  }
+
+  /// Lays the tabs out from `start` to `end` along the axis (+ included).
+  func layoutTabs(from start: CGFloat, to end: CGFloat, animated: Bool, added: Set<ObjectIdentifier>,
                   reveal: ObjectIdentifier?) {
     tabsStart = start
-    tabsEnd = rightEdge
-    let h = bounds.height
-    let pillY = (h - Theme.tabHeight) / 2
-    let buttonY = (h - 28) / 2
-    let plusWidth: CGFloat = 28 + 6
+    tabsEnd = end
+    let pillSpan = across(Theme.tabHeight, fills: true)
+    let capsuleSpan = across(GroupCapsule.height, fills: true)
+    let plusLength: CGFloat = 28 + 6
     let target = dropTarget()
     updateDraggedTabLook()
 
     // Pinned tabs, with a gap where a dragged tab would land.
     var pinned: [ObjectIdentifier?] = pinnedItems(excludingDrag: true).map { $0 }
     if drag?.groupWith == nil, case .pinned(let slot) = target { pinned.insert(nil, at: min(slot, pinned.count)) }
-    let pinnedStripWidth = pinned.isEmpty ? 0 : CGFloat(pinned.count) * pinnedWidth + CGFloat(pinned.count - 1) * 2
-    pinnedStrip.frame = NSRect(x: start, y: 0, width: max(pinnedStripWidth, 1), height: h)
+    let pinnedStripLength = pinned.isEmpty ? 0 : CGFloat(pinned.count) * pinnedWidth + CGFloat(pinned.count - 1) * 2
+    pinnedStrip.frame = axis.rect(main: start, length: max(pinnedStripLength, 1), cross: 0, thickness: crossExtent)
     for (i, id) in pinned.enumerated() {
       guard let id, let pill = pills[id], pill.superview === pinnedStrip else { continue }
-      let frame = NSRect(x: CGFloat(i) * (pinnedWidth + 2), y: pillY, width: pinnedWidth, height: Theme.tabHeight)
+      let frame = rect(main: CGFloat(i) * (pinnedWidth + 2), length: pinnedWidth, across: across(Theme.tabHeight))
       if pill.needsAppear || added.contains(id) {
         appear(pill, at: frame, animated: animated)
       } else {
@@ -1252,8 +1363,8 @@ extension TabsView {
     }
     // Beam's separator after the pinned tabs: 1×16, 7.5 after the last one
     // and 5.5 before the next.
-    let x = start + pinnedStripWidth + (pinned.isEmpty ? 0 : 14) - 4
-    let separatorFrame = NSRect(x: start + pinnedStripWidth + 7.5, y: ((h - 16) / 2).rounded(), width: 1, height: 16)
+    let x = start + pinnedStripLength + (pinned.isEmpty ? 0 : 14) - 4
+    let separatorFrame = rect(main: start + pinnedStripLength + 7.5, length: 1, across: separatorSpan)
     place(pinnedSeparator, separatorFrame, animated: animated && isWeb && !pinnedSeparator.frame.isEmpty)
     pinnedSeparatorHasPins = !pinned.isEmpty
     updatePinnedSeparator(animated: animated)
@@ -1265,11 +1376,11 @@ extension TabsView {
     // ⌥-dragging onto a loose tab: room for the new group's capsule before it.
     let previewFor = drag?.groupWith.flatMap { tabInfos[$0]?.groupID == nil ? $0 : nil }
     if let previewFor, let index = items.firstIndex(of: .tab(previewFor)) { items.insert(.capsule(Self.previewID), at: index) }
-    let available = max(0, rightEdge - plusWidth - x)
+    let available = max(0, end - plusLength - x)
     let tabCount = CGFloat(items.filter { if case .tab = $0 { return true }; return $0 == nil && isDraggingTab }.count)
-    let capsulesWidth = items.reduce(CGFloat(0)) { sum, item in
-      if case .capsule(let g) = item { return sum + capsuleWidth(g) }
-      if item == nil, case .group(let g)? = drag?.kind { return sum + capsuleWidth(g) }
+    let capsulesLength = items.reduce(CGFloat(0)) { sum, item in
+      if case .capsule(let g) = item { return sum + capsuleLength(g) }
+      if item == nil, case .group(let g)? = drag?.kind { return sum + capsuleLength(g) }
       return sum
     }
     let gaps = CGFloat(max(0, items.count - 1)) * spacing + 8
@@ -1284,7 +1395,7 @@ extension TabsView {
       default: return nil
       }
     }
-    let room = available - capsulesWidth - gaps
+    let room = available - capsulesLength - gaps
     var shared = Self.sharedTabWidth(naturals: slots.map(\.natural), room: room)
     // Crowded: the active tab keeps its minimum, the others share the rest.
     if shared < Self.activeTabMinWidth, let activeID, slots.contains(where: { $0.id == activeID }) {
@@ -1292,53 +1403,54 @@ extension TabsView {
                                    room: room - Self.activeTabMinWidth)
     }
     let tabWidth = tabCount > 0 ? min(Theme.tabMaxWidth, max(Theme.tabMinWidth, shared)) : 0
-    /// A tab's width in the strip: its natural width up to the shared one
-    /// (never below the active tab's minimum).
-    func stripWidth(_ id: ObjectIdentifier) -> CGFloat {
+    /// A tab's length in the strip: in the bar, its natural width up to the
+    /// shared one (never below the active tab's minimum).
+    func stripLength(_ id: ObjectIdentifier) -> CGFloat {
+      guard axis == .horizontal else { return rowLength }
       let width = min(naturalTabWidth(id), tabWidth)
       return id == activeID ? max(Self.activeTabMinWidth, width) : width
     }
     if tabCount > 0 { stripTabWidth = tabWidth }
-    // A tab dragged over the strip takes (and leaves room for) its width in
+    // A tab dragged over the strip takes (and leaves room for) its length in
     // the strip, as laid out now.
     if isDraggingTab, !grouping, case .strip? = target, tabCount > 0, let draggedID {
-      drag?.width = stripWidth(draggedID)
+      drag?.length = stripLength(draggedID)
     }
-    func width(_ item: BarItem?) -> CGFloat {
+    func length(_ item: BarItem?) -> CGFloat {
       switch item {
-      case .capsule(let g): return capsuleWidth(g)
-      case .tab(let id): return stripWidth(id)
-      case nil: return drag?.width ?? tabWidth
+      case .capsule(let g): return capsuleLength(g)
+      case .tab(let id): return stripLength(id)
+      case nil: return drag?.length ?? (axis == .horizontal ? tabWidth : rowLength)
       }
     }
-    stripTabWidths = [:]
-    for case .tab(let id)? in items { stripTabWidths[id] = width(.tab(id)) }
-    // Inset from the strip's edges (room for a capsule's bounce).
+    stripTabLengths = [:]
+    for case .tab(let id)? in items { stripTabLengths[id] = length(.tab(id)) }
+    // Inset from the strip's ends (room for a capsule's bounce).
     let inset: CGFloat = 4
     var offsets: [CGFloat] = []
     var cursor: CGFloat = inset
     for item in items {
       offsets.append(cursor)
-      cursor += width(item) + spacing
+      cursor += length(item) + spacing
     }
-    let contentWidth = items.isEmpty ? 0 : cursor - spacing + inset
+    let contentLength = items.isEmpty ? 0 : cursor - spacing + inset
     // The strip spans all the room for tabs (drops land anywhere in it);
     // the + button follows the last tab.
-    let stripWidth = min(available, contentWidth)
-    tabStrip.frame = NSRect(x: x, y: 0, width: available, height: h)
-    tabStrip.contentWidth = contentWidth
+    let stripLength = min(available, contentLength)
+    tabStrip.frame = axis.rect(main: x, length: available, cross: 0, thickness: crossExtent)
+    tabStrip.contentLength = contentLength
     if drag == nil, let reveal, let index = items.firstIndex(of: .tab(reveal)) {
-      tabStrip.reveal(minX: offsets[index], maxX: offsets[index] + width(.tab(reveal)), animated: animated)
+      tabStrip.reveal(from: offsets[index], to: offsets[index] + length(.tab(reveal)), animated: animated)
     }
     let scroll = tabStrip.scrollOffset
     var frames: [BarItem: NSRect] = [:]
     var gapFrame: NSRect?
     for (i, item) in items.enumerated() {
       guard let item else {
-        gapFrame = NSRect(x: offsets[i] - scroll, y: pillY, width: width(nil), height: Theme.tabHeight)
+        gapFrame = rect(main: offsets[i] - scroll, length: length(nil), across: pillSpan)
         continue
       }
-      let frame = NSRect(x: offsets[i] - scroll, y: pillY, width: width(item), height: Theme.tabHeight)
+      let frame = rect(main: offsets[i] - scroll, length: length(item), across: pillSpan)
       frames[item] = frame
       switch item {
       case .tab(let id):
@@ -1351,7 +1463,7 @@ extension TabsView {
         }
         if pill.alphaValue < 1 { Motion.animate(animated ? 0.2 : 0) { pill.animator().alphaValue = 1 } }
       case .capsule(let g):
-        let capsuleFrame = NSRect(x: frame.minX, y: (h - GroupCapsule.height) / 2, width: frame.width, height: GroupCapsule.height)
+        let capsuleFrame = rect(main: offsets[i] - scroll, length: length(item), across: capsuleSpan)
         if g == Self.previewID {
           showPreview(at: capsuleFrame)
           continue
@@ -1363,7 +1475,7 @@ extension TabsView {
 
     layoutTabSeparators(items: items, frames: frames, animated: animated)
 
-    // The ⌥-drag preview: its underline spans the capsule and target tab.
+    // The ⌥-drag preview: its line spans the capsule and target tab.
     if let previewFor, let capsuleFrame = frames[.capsule(Self.previewID)], let tabFrame = frames[.tab(previewFor)] {
       CATransaction.begin()
       CATransaction.setAnimationDuration(0.25)
@@ -1373,10 +1485,11 @@ extension TabsView {
         tabStrip.layer?.addSublayer(previewLine)
         previewLine.cornerRadius = 0.75
         Motion.withoutAnimation {
-          previewLine.frame = NSRect(x: capsuleFrame.minX + 2, y: pillY - 4, width: 0, height: 1.5)
+          previewLine.frame = rect(main: axis.minMain(capsuleFrame) + 2, length: 0, across: groupLineSpan)
         }
       }
-      previewLine.frame = NSRect(x: capsuleFrame.minX + 2, y: pillY - 4, width: tabFrame.maxX - capsuleFrame.minX - 4, height: 1.5)
+      previewLine.frame = rect(main: axis.minMain(capsuleFrame) + 2, length: axis.maxMain(tabFrame) - axis.minMain(capsuleFrame) - 4,
+                               across: groupLineSpan)
       CATransaction.commit()
     } else {
       hidePreview()
@@ -1388,12 +1501,12 @@ extension TabsView {
       for id in members(info.id) {
         guard let pill = pills[id], pill.superview === tabStrip else { continue }
         pill.isCollapsedAway = true
-        place(pill, NSRect(x: capsuleFrame.minX, y: pillY, width: capsuleFrame.width, height: Theme.tabHeight), animated: animated)
+        place(pill, rect(main: axis.minMain(capsuleFrame), length: axis.length(capsuleFrame), across: pillSpan), animated: animated)
         Motion.animate(animated ? 0.18 : 0) { pill.animator().alphaValue = 0 }
       }
     }
 
-    // Underlines: under a group's capsule and tabs.
+    // Group lines: along a group's capsule and tabs.
     CATransaction.begin()
     CATransaction.setDisableActions(!animated)
     CATransaction.setAnimationDuration(0.25)
@@ -1403,12 +1516,12 @@ extension TabsView {
       var parts = ([BarItem.capsule(info.id)] + members(info.id).map { BarItem.tab($0) }).compactMap { frames[$0] }
       // The gap where a dragged tab would join the group.
       if !grouping, case .strip(_, let g)? = target, g == info.id, let gapFrame { parts.append(gapFrame) }
-      guard let first = parts.first, let last = parts.max(by: { $0.maxX < $1.maxX }) else {
+      guard let first = parts.first, let last = parts.max(by: { axis.maxMain($0) < axis.maxMain($1) }) else {
         line.opacity = 0
         continue
       }
       line.opacity = 1
-      line.frame = NSRect(x: first.minX + 2, y: pillY - 4, width: max(0, last.maxX - first.minX - 4), height: 1.5)
+      line.frame = rect(main: axis.minMain(first) + 2, length: max(0, axis.maxMain(last) - axis.minMain(first) - 4), across: groupLineSpan)
     }
     CATransaction.commit()
 
@@ -1419,28 +1532,33 @@ extension TabsView {
       case .tab(let id):
         let frame = draggedTabFrame(drag)
         if let pill = pills[id] {
-          pill.frame = NSRect(x: frame.minX, y: pillY, width: frame.width, height: Theme.tabHeight)
+          // (Down a sidebar, it takes a pinned tab's size over the pinned tabs.)
+          let pinnedLook: Bool = { if case .pinned? = drag.lastTarget { return drag.groupWith == nil }; return false }()
+          pill.frame = rect(main: frame.start, length: frame.length,
+                            across: axis == .vertical && pinnedLook ? across(Theme.tabHeight) : pillSpan)
           // Its content fades as it compresses toward its pinned size.
-          let range = drag.shownWidth - pinnedWidth
-          pill.contentFade = range > 1 ? max(0, min(1, (frame.width - pinnedWidth) / range)) : 1
+          let range = drag.shownLength - pinnedWidth
+          pill.contentFade = range > 1 ? max(0, min(1, (frame.length - pinnedWidth) / range)) : 1
         }
       case .group(let g):
         var offset = left
         if let capsule = capsules[g] {
-          capsule.frame = NSRect(x: offset, y: (h - GroupCapsule.height) / 2, width: capsule.frame.width, height: GroupCapsule.height)
-          offset += capsule.frame.width + spacing
+          let length = axis.length(capsule.frame)
+          capsule.frame = rect(main: offset, length: length, across: capsuleSpan)
+          offset += length + spacing
         }
         let collapsed = group(g)?.collapsed ?? false
         for id in members(g) where !collapsed {
           guard let pill = pills[id] else { continue }
-          pill.frame = NSRect(x: offset, y: pillY, width: pill.frame.width, height: Theme.tabHeight)
-          offset += pill.frame.width + spacing
+          let length = axis.length(pill.frame)
+          pill.frame = rect(main: offset, length: length, across: pillSpan)
+          offset += length + spacing
         }
       }
     }
 
-    let plusX = min(x + stripWidth + 6, rightEdge - 28)
-    place(newTabButton, NSRect(x: plusX, y: buttonY, width: 28, height: 28), animated: animated && isWeb)
+    let plusMain = min(x + stripLength + 6, end - 28)
+    place(newTabButton, rect(main: plusMain, length: 28, across: across(28)), animated: animated && isWeb)
   }
 
   private func appear(_ pill: TabPill, at frame: NSRect, animated: Bool) {
@@ -1485,7 +1603,7 @@ extension TabsView {
       CATransaction.begin()
       CATransaction.setAnimationDuration(0.18)
       CATransaction.setCompletionBlock { if self.previewCapsule == nil { line.removeFromSuperlayer() } }
-      line.frame = NSRect(x: line.frame.minX, y: line.frame.minY, width: 0, height: line.frame.height)
+      line.frame = axis.rect(line.frame, main: axis.minMain(line.frame), length: 0)
       CATransaction.commit()
     }
   }
@@ -1516,13 +1634,13 @@ extension TabsView {
   /// Past the tab area's left edge it compresses, its left edge held there,
   /// down to its pinned size, where it pins; a pinned tab dragged out
   /// expands the same way.
-  private func draggedTabFrame(_ drag: TabDrag) -> (minX: CGFloat, width: CGFloat) {
-    var width = drag.shownWidth
+  private func draggedTabFrame(_ drag: TabDrag) -> (start: CGFloat, length: CGFloat) {
+    var length = drag.shownLength
     if case .tab = drag.kind, drag.grabFraction > 0.01 {
-      let room = (drag.pointer - (tabStrip.frame.minX + 4)) / drag.grabFraction
-      width = min(width, max(pinnedWidth, room))
+      let room = (drag.pointer - (axis.minMain(tabStrip.frame) + 4)) / drag.grabFraction
+      length = min(length, max(pinnedWidth, room))
     }
-    return (drag.pointer - drag.grabFraction * width, width)
+    return (drag.pointer - drag.grabFraction * length, length)
   }
 
   /// ⌥ held and the pointer over another (unpinned) tab: that tab.
@@ -1534,12 +1652,12 @@ extension TabsView {
     guard option, isValidDragPoint(point), let drag, let dragged = pills[id] else { return nil }
     // The dragged tab, where it's drawn (following the pointer).
     let drawn = draggedTabFrame(drag)
-    let draggedSpan = (drawn.minX, drawn.minX + drawn.width)
+    let draggedSpan = (drawn.start, drawn.start + drawn.length)
     func overlap(_ other: ObjectIdentifier) -> CGFloat {
       guard let pill = pills[other], pill.superview === tabStrip, !pill.isCollapsedAway else { return 0 }
       let frame = pill.convert(pill.bounds, to: self)
-      let width = min(draggedSpan.1, frame.maxX) - max(draggedSpan.0, frame.minX)
-      return max(0, width) / max(1, min(frame.width, dragged.frame.width))
+      let covered = min(draggedSpan.1, axis.maxMain(frame)) - max(draggedSpan.0, axis.minMain(frame))
+      return max(0, covered) / max(1, min(axis.length(frame), axis.length(dragged.frame)))
     }
     // Stay on the current target while it's still covered at all (its new
     // capsule pushes it right), so the preview doesn't flicker.
@@ -1570,9 +1688,10 @@ extension TabsView {
   }
 
   private func isValidDragPoint(_ point: NSPoint) -> Bool {
-    let left = pinnedStrip.frame.minX - 40
-    let right = max(newTabButton.frame.maxX, tabStrip.frame.maxX) + 40
-    return point.x >= left && point.x <= right && point.y >= -24 && point.y <= bounds.height + 24
+    let start = axis.minMain(pinnedStrip.frame) - 40
+    let end = max(axis.maxMain(newTabButton.frame), axis.maxMain(tabStrip.frame)) + 40
+    let main = axis.main(point), cross = axis.cross(point)
+    return main >= start && main <= end && cross >= -24 && cross <= crossExtent + 24
   }
 
   private func updateDropTarget(_ event: NSEvent) {
@@ -1593,21 +1712,21 @@ extension TabsView {
       // or when the pointer itself is left of the strip. A little slack
       // keeps it from flickering at the edge.
       let leftEdge = pointer - drag.grabFraction * pinnedWidth
-      let areaLeft = tabStrip.frame.minX + 4
+      let areaLeft = axis.minMain(tabStrip.frame) + 4
       let wasPinned: Bool = { if case .pinned? = drag.lastTarget { return true }; return false }()
       let staysPinned: Bool
       if drag.startedPinned {
         // A pinned tab unpins as soon as its center passes the separator
         // (and pins back when it comes back over it).
         let center = leftEdge + pinnedWidth / 2
-        staysPinned = center <= pinnedSeparator.frame.midX + (wasPinned ? 2 : -2)
+        staysPinned = center <= axis.midMain(pinnedSeparator.frame) + (wasPinned ? 2 : -2)
       } else {
-        staysPinned = leftEdge < areaLeft - 2 + (wasPinned ? 8 : 0) || pointer < tabStrip.frame.minX - 4
+        staysPinned = leftEdge < areaLeft - 2 + (wasPinned ? 8 : 0) || pointer < axis.minMain(tabStrip.frame) - 4
       }
       if staysPinned {
         // By where its icon is (its left end), not the pointer.
         let iconCenter = leftEdge + pinnedWidth / 2
-        let slot = pinned.indices.filter { pinnedStrip.frame.minX + CGFloat($0) * (pinnedWidth + 2) + pinnedWidth / 2 < iconCenter }.count
+        let slot = pinned.indices.filter { axis.minMain(pinnedStrip.frame) + CGFloat($0) * (pinnedWidth + 2) + pinnedWidth / 2 < iconCenter }.count
         return .pinned(slot)
       }
     }
@@ -1615,30 +1734,30 @@ extension TabsView {
     // A neighbour moves aside once the dragged item's leading edge passes its
     // middle, with the gap where it is now (half-way over it: a tab can still
     // overlap its neighbour a little without pushing it, to ⌥-group them).
-    func width(_ item: BarItem) -> CGFloat {
+    func length(_ item: BarItem) -> CGFloat {
       switch item {
-      case .capsule(let g): return capsuleWidth(g)
-      case .tab(let id): return stripTabWidths[id] ?? pills[id]?.frame.width ?? Theme.tabMinWidth
+      case .capsule(let g): return capsuleLength(g)
+      case .tab(let id): return stripTabLengths[id] ?? pills[id].map { axis.length($0.frame) } ?? Theme.tabMinWidth
       }
     }
-    let start = tabStrip.frame.minX - tabStrip.scrollOffset + 4
+    let start = axis.minMain(tabStrip.frame) - tabStrip.scrollOffset + 4
     func center(of index: Int, gapAt gap: Int) -> CGFloat {
       var cursor = start
       for i in 0...index {
-        if i == gap { cursor += drag.width + spacing }
-        if i == index { return cursor + width(items[i]) / 2 }
-        cursor += width(items[i]) + spacing
+        if i == gap { cursor += drag.length + spacing }
+        if i == index { return cursor + length(items[i]) / 2 }
+        cursor += length(items[i]) + spacing
       }
       return cursor
     }
-    let draggedCenter = pointer + (0.5 - drag.grabFraction) * drag.width
+    let draggedCenter = pointer + (0.5 - drag.grabFraction) * drag.length
     var slot: Int
     if case .strip(let last, _)? = drag.lastTarget { slot = min(last, items.count) } else {
       // First evaluation: where it was.
       slot = items.indices.filter { center(of: $0, gapAt: items.count) < draggedCenter }.count
     }
-    let draggedLeft = draggedCenter - drag.width / 2
-    let draggedRight = draggedCenter + drag.width / 2
+    let draggedLeft = draggedCenter - drag.length / 2
+    let draggedRight = draggedCenter + drag.length / 2
     while slot < items.count, draggedRight > center(of: slot, gapAt: slot) { slot += 1 }
     while slot > 0, draggedLeft < center(of: slot - 1, gapAt: slot) { slot -= 1 }
     if case .group = drag.kind {
@@ -1653,7 +1772,7 @@ extension TabsView {
     // group as soon as the pointer is over it (its capsule coming from the
     // left, its last tab coming from the right), and leaves it once the
     // pointer is past its ends (with the gap, while it's in the group).
-    func left(of index: Int, gapAt gap: Int) -> CGFloat { center(of: index, gapAt: gap) - width(items[index]) / 2 }
+    func left(of index: Int, gapAt gap: Int) -> CGFloat { center(of: index, gapAt: gap) - length(items[index]) / 2 }
     var current: UUID?
     switch drag.lastTarget {
     case .strip(_, let g)?: current = g
@@ -1665,17 +1784,18 @@ extension TabsView {
       var e = c
       while e + 1 < items.count, case .tab(let id) = items[e + 1], tabInfos[id]?.groupID == g { e += 1 }
       let inside = current == g
-      let minX = left(of: c, gapAt: inside ? e + 1 : c)
-      let maxX = left(of: e, gapAt: e + 1) + width(items[e]) + (inside ? spacing + drag.width : 0)
-      if pointer >= minX, pointer <= maxX { return .strip(min(max(slot, c + 1), e + 1), group: g) }
-      if slot > c, slot <= e { return .strip(pointer < minX ? c : e + 1, group: nil) }
+      let groupStart = left(of: c, gapAt: inside ? e + 1 : c)
+      let groupEnd = left(of: e, gapAt: e + 1) + length(items[e]) + (inside ? spacing + drag.length : 0)
+      if pointer >= groupStart, pointer <= groupEnd { return .strip(min(max(slot, c + 1), e + 1), group: g) }
+      if slot > c, slot <= e { return .strip(pointer < groupStart ? c : e + 1, group: nil) }
+
     }
     return .strip(slot, group: nil)
   }
 
   /// The dragged item stays over the bar's tab area.
-  private func clampedPointer(_ x: CGFloat) -> CGFloat {
-    min(max(x, pinnedStrip.frame.minX - 20), max(newTabButton.frame.maxX, tabStrip.frame.maxX))
+  private func clampedPointer(_ main: CGFloat) -> CGFloat {
+    min(max(main, axis.minMain(pinnedStrip.frame) - 20), max(axis.maxMain(newTabButton.frame), axis.maxMain(tabStrip.frame)))
   }
 
   /// A drag always ends: if the release never reaches the tab (another
@@ -1688,7 +1808,36 @@ extension TabsView {
     pills[order[index]]?.simulateHover(on)
   }
 
+  /// Test hooks: drags the tab at `index` (or, with `group`, that group's
+  /// capsule) from `from` to `to` (window points) as the mouse would, minus
+  /// the window's event routing (which a locked screen stops).
+  func simulateDrag(tabAt index: Int?, group: Int?, from: NSPoint, to: NSPoint, option: Bool) {
+    guard let window else { return }
+    let send: (DragPhase, NSEvent) -> Void
+    if let group, groupInfos.indices.contains(group) {
+      let g = groupInfos[group].id
+      send = { [weak self] phase, event in self?.dragGroup(g, phase: phase, event: event) }
+    } else if let index, order.indices.contains(index) {
+      let id = order[index]
+      send = { [weak self] phase, event in self?.dragTab(id, phase: phase, event: event) }
+    } else {
+      return
+    }
+    func event(_ t: CGFloat) -> NSEvent? {
+      NSEvent.mouseEvent(with: .leftMouseDragged, location: NSPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t),
+                         modifierFlags: option ? [.option] : [], timestamp: ProcessInfo.processInfo.systemUptime,
+                         windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+    }
+    for step in 0...13 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + Double(step) * 0.03 + (step == 13 ? 1.2 : 0)) {
+        guard let e = event(CGFloat(min(step, 12)) / 12) else { return }
+        send(step == 0 ? .began : step == 13 ? .ended : .moved, e)
+      }
+    }
+  }
+
   private func isDragged(_ id: ObjectIdentifier) -> Bool {
+
     switch drag?.kind {
     case .tab(let dragged)?: return dragged == id
     case .group(let g)?: return tabInfos[id]?.groupID == g
@@ -1706,25 +1855,26 @@ extension TabsView {
     case .strip?: pinned = false
     case nil: pinned = tabInfos[id]?.isPinned == true
     }
-    let width = pinned ? pinnedWidth : min(naturalTabWidth(id), max(stripTabWidth, Theme.tabMinWidth))
-    self.drag?.width = width
-    if Motion.reduceMotion { self.drag?.shownWidth = width }
+    let length = pinned ? pinnedWidth
+      : axis == .horizontal ? min(naturalTabWidth(id), max(stripTabWidth, Theme.tabMinWidth)) : rowLength
+    self.drag?.length = length
+    if Motion.reduceMotion { self.drag?.shownLength = length }
     pills[id]?.setPinnedLook(pinned)
   }
 
   private func autoScroll() {
     guard let drag else { return }
-    // The dragged tab eases to its new width.
-    if drag.shownWidth != drag.width {
-      let delta = drag.width - drag.shownWidth
-      self.drag?.shownWidth = abs(delta) < 0.5 ? drag.width : drag.shownWidth + delta * 0.3
+    // The dragged tab eases to its new length.
+    if drag.shownLength != drag.length {
+      let delta = drag.length - drag.shownLength
+      self.drag?.shownLength = abs(delta) < 0.5 ? drag.length : drag.shownLength + delta * 0.3
       relayout(animated: true)
     }
     let edge: CGFloat = 48
-    let strip = tabStrip.frame
+    let stripStart = axis.minMain(tabStrip.frame), stripEnd = axis.maxMain(tabStrip.frame)
     var speed: CGFloat = 0
-    if drag.pointer >= strip.minX + 2, drag.pointer < strip.minX + edge { speed = -(strip.minX + edge - drag.pointer) / edge }
-    if drag.pointer > strip.maxX - edge { speed = (drag.pointer - (strip.maxX - edge)) / edge }
+    if drag.pointer >= stripStart + 2, drag.pointer < stripStart + edge { speed = -(stripStart + edge - drag.pointer) / edge }
+    if drag.pointer > stripEnd - edge { speed = (drag.pointer - (stripEnd - edge)) / edge }
     if speed != 0, tabStrip.scroll(by: min(1, max(-1, speed)) * 14) {
       // What's under the pointer changed.
       let target = computeDropTarget()
@@ -1751,24 +1901,24 @@ extension TabsView {
   fileprivate func dragTab(_ id: ObjectIdentifier, phase: DragPhase, event: NSEvent) {
     guard let pill = pills[id], isWeb else { return }
     lastDragEventTime = CACurrentMediaTime()
-    let pointer = convert(event.locationInWindow, from: nil).x
+    let pointer = axis.main(convert(event.locationInWindow, from: nil))
     switch phase {
     case .began:
       // Where it is on screen: it may still be springing from a drop.
       var shown = pill.frame
       if let layer = pill.layer, layer.animation(forKey: "glea.spring.position") != nil, let presentation = layer.presentation() {
-        shown.origin.x += presentation.position.x - layer.position.x
-        shown.size.width = presentation.bounds.width
+        shown = axis.rect(shown, main: axis.minMain(shown) + axis.main(presentation.position) - axis.main(layer.position),
+                          length: axis.length(presentation.bounds))
       }
       pill.layer?.removeAnimation(forKey: "glea.spring.position")
       pill.layer?.removeAnimation(forKey: "glea.spring.bounds")
       let frame = pill.superview.map { convert(shown, from: $0) } ?? pill.frame
-      let width = tabInfos[id]?.isPinned == true ? pinnedWidth : frame.width
+      let length = tabInfos[id]?.isPinned == true ? pinnedWidth : axis.length(frame)
       // Held where it was pressed (the drag starts a few points later).
-      let pressed = pill.pressStart.map { convert($0, from: nil).x } ?? pointer
-      let fraction = min(1, max(0, (pressed - frame.minX) / max(1, frame.width)))
+      let pressed = pill.pressStart.map { axis.main(convert($0, from: nil)) } ?? pointer
+      let fraction = min(1, max(0, (pressed - axis.minMain(frame)) / max(1, axis.length(frame))))
       drag = TabDrag(kind: .tab(id), grabFraction: fraction, pointer: pointer,
-                     width: width, shownWidth: frame.width)
+                     length: length, shownLength: axis.length(frame))
       drag?.startedPinned = tabInfos[id]?.isPinned == true
       // It starts where it is (the gap it leaves), then moves from there.
       if tabInfos[id]?.isPinned == true {
@@ -1837,16 +1987,17 @@ extension TabsView {
   fileprivate func dragGroup(_ g: UUID, phase: DragPhase, event: NSEvent) {
     guard let capsule = capsules[g], isWeb else { return }
     lastDragEventTime = CACurrentMediaTime()
-    let pointer = convert(event.locationInWindow, from: nil).x
+    let pointer = axis.main(convert(event.locationInWindow, from: nil))
     switch phase {
     case .began:
       let frame = capsule.convert(capsule.bounds, to: self)
       let collapsed = group(g)?.collapsed ?? false
       let views: [NSView] = [capsule] + (collapsed ? [] : members(g).compactMap { pills[$0] })
-      let right = views.map { $0.convert($0.bounds, to: self).maxX }.max() ?? frame.maxX
-      let width = right - frame.minX
-      drag = TabDrag(kind: .group(g), grabFraction: (pointer - frame.minX) / max(1, width), pointer: pointer, width: width,
-                     shownWidth: width)
+      let end = views.map { axis.maxMain($0.convert($0.bounds, to: self)) }.max() ?? axis.maxMain(frame)
+      let length = end - axis.minMain(frame)
+      drag = TabDrag(kind: .group(g), grabFraction: (pointer - axis.minMain(frame)) / max(1, length), pointer: pointer,
+                     length: length, shownLength: length)
+
       for view in views {
         let f = view.convert(view.bounds, to: self)
         addSubview(view)
@@ -1903,6 +2054,8 @@ private final class GroupCapsule: NSView {
   var onToggle: (() -> Void)?
   var onMenu: (() -> NSMenu?)?
   var onDrag: ((DragPhase, NSEvent) -> Void)?
+  /// Drags start once the pointer moves this way (along the tabs).
+  var dragAxis = TabAxis.horizontal
 
   private let label = NSTextField.label("", size: 11, weight: .medium)
   private let fill = CALayer()
@@ -2000,7 +2153,7 @@ private final class GroupCapsule: NSView {
 
   override func mouseDragged(with event: NSEvent) {
     guard let start = pressStart else { return }
-    if !dragging, abs(event.locationInWindow.x - start.x) > 4 {
+    if !dragging, abs(dragAxis.main(event.locationInWindow) - dragAxis.main(start)) > 4 {
       dragging = true
       onDrag?(.began, event)
     }

@@ -642,7 +642,7 @@ final class TopBarView: NSView {
 
   private func layoutItems(animated: Bool, added: Set<ObjectIdentifier>, reveal: ObjectIdentifier? = nil) {
     Motion.withoutAnimation {
-      tabsView.frame = bounds
+      tabsView.frame = tabsHost?.bounds ?? bounds
       backgroundLayer.frame = bounds
       separatorLayer.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 1)
     }
@@ -704,7 +704,11 @@ final class TopBarView: NSView {
     // hidden), so switching modes doesn't resize them.
     var tabsRightEdge = (showsExtensions ? extensionX : buttonsLeft) - 12
     if !updatePill.isHidden { tabsRightEdge = min(tabsRightEdge, updatePill.frame.minX - 12) }
-    tabsView.layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
+    if let tabsHost {
+      tabsView.layoutTabs(from: 8, to: tabsHost.bounds.height - 8, animated: animated, added: added, reveal: reveal)
+    } else {
+      tabsView.layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
+    }
   }
 
   private func place(_ view: NSView, _ frame: NSRect, animated: Bool) {
@@ -763,6 +767,22 @@ final class TopBarView: NSView {
 
   /// Test hooks: the tab at `index` as if hovered.
   func simulateHover(tabAt index: Int, _ on: Bool) { tabsView.simulateHover(tabAt: index, on) }
+
+  /// Test hooks: a tab (or a group's capsule) dragged, see TabsView.
+  func simulateDrag(tabAt index: Int?, group: Int?, from: NSPoint, to: NSPoint, option: Bool) {
+    tabsView.simulateDrag(tabAt: index, group: group, from: from, to: to, option: option)
+  }
+
+  /// Test hooks: the tabs down `host` (a stand-in for a sidebar), or back
+  /// in the bar.
+  private weak var tabsHost: NSView?
+  func hostTabsForTesting(in host: NSView?) {
+    tabsHost = host
+    (host ?? self).addSubview(tabsView)
+    tabsView.axis = host == nil ? .horizontal : .vertical
+    layoutItems(animated: false, added: [])
+  }
+
 }
 
 /// "Incognito", with its glasses, at the right of an incognito window's bar.

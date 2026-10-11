@@ -822,9 +822,78 @@ enum TestHooks {
         let shown = view.layer?.presentation()?.position.x ?? -1
         NSLog("Glea tabs: %@ %@ hidden=%d alpha=%.2f opacity=%.2f shownX=%.1f", String(describing: type(of: view)), NSStringFromRect(view.convert(view.bounds, to: nil)), view.isHidden, view.alphaValue, view.layer?.opacity ?? -1, shown)
       }
+    case "tabs-sidebar":
+      // tabs-sidebar:1|0: the tabs down a stand-in sidebar on the left, under
+      // the bar (vertical tabs, before they have a real sidebar), or back.
+      guard let content = controller.window?.contentView else { break }
+      let id = NSUserInterfaceItemIdentifier("glea.test.tabs-sidebar")
+      content.subviews.first { $0.identifier == id }?.removeFromSuperview()
+      guard argument == "1" else {
+        controller.topBar.hostTabsForTesting(in: nil)
+        break
+      }
+      let bar = controller.topBar.convert(controller.topBar.bounds, to: content)
+      let below = content.isFlipped ? NSRect(x: 0, y: bar.maxY, width: 240, height: content.bounds.height - bar.maxY)
+        : NSRect(x: 0, y: 0, width: 240, height: bar.minY)
+      let host = NSView(frame: below)
+      host.identifier = id
+      host.wantsLayer = true
+      host.layer?.backgroundColor = Theme.webBar.cgColor
+      content.addSubview(host)
+      controller.topBar.hostTabsForTesting(in: host)
+    case "drag-at":
+      // drag-at:x1,y1,x2,y2[,opt] (points in the window, y down from its top): a mouse drag.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      let flags: NSEvent.ModifierFlags = argument.hasSuffix(",opt") ? [.option] : []
+      guard v.count >= 4, let window = controller.window else { break }
+      let height = window.contentView?.bounds.height ?? window.frame.height
+      func mouse(_ type: NSEvent.EventType, _ t: Double) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: NSPoint(x: v[0] + (v[2] - v[0]) * t, y: height - (v[1] + (v[3] - v[1]) * t)),
+                           modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+      }
+      var events: [NSEvent] = []
+      if let e = mouse(.leftMouseDown, 0) { events.append(e) }
+      for step in 1...12 { if let e = mouse(.leftMouseDragged, Double(step) / 12) { events.append(e) } }
+      if let e = mouse(.leftMouseUp, 1) { events.append(e) }
+      // (Holds before the release so a screenshot can catch the drag.)
+      for (i, e) in events.enumerated() {
+        let delay = Double(i) * 0.03 + (e.type == .leftMouseUp ? 1.2 : 0)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { NSApp.postEvent(e, atStart: false) }
+      }
+    case "snapshot":
+      // snapshot:<png path>: the window's content, rendered from its layers
+      // (works with the screen locked; blend modes and the pages don't show).
+      guard let content = controller.window?.contentView, let layer = content.layer else { break }
+      let scale: CGFloat = 2
+      let size = content.bounds.size
+      guard let context = CGContext(data: nil, width: Int(size.width * scale), height: Int(size.height * scale), bitsPerComponent: 8,
+                                    bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { break }
+      context.scaleBy(x: scale, y: scale)
+      if layer.isGeometryFlipped || content.isFlipped {
+        context.translateBy(x: 0, y: size.height)
+        context.scaleBy(x: 1, y: -1)
+      }
+      content.effectiveAppearance.performAsCurrentDrawingAppearance { layer.render(in: context) }
+      if let image = context.makeImage() {
+        try? NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: argument))
+      }
+    case "drag-tab", "drag-group":
+      // drag-tab:<index>,x1,y1,x2,y2[,opt] (window points, y down from its
+      // top): that tab dragged, straight to the tabs (no window routing).
+      // drag-group:<index>,... the same with that group's capsule.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      guard v.count >= 5, let height = controller.window?.contentView?.bounds.height else { break }
+      let index = Int(v[0])
+      controller.topBar.simulateDrag(tabAt: parts[0] == "drag-tab" ? index : nil, group: parts[0] == "drag-group" ? index : nil,
+                                     from: NSPoint(x: v[1], y: height - v[2]), to: NSPoint(x: v[3], y: height - v[4]),
+                                     option: argument.hasSuffix(",opt"))
     case "bar-views":
       // Every view in the top bar, in window coordinates (where it's shown).
-      let views = allSubviews(controller.topBar).dropFirst()
+      // (And the stand-in sidebar's, see tabs-sidebar.)
+      let sidebar = controller.window?.contentView?.subviews.first { $0.identifier?.rawValue == "glea.test.tabs-sidebar" }
+      let views = allSubviews(controller.topBar).dropFirst() + (sidebar.map(allSubviews) ?? []).dropFirst()
       for view in views where !view.isHiddenOrHasHiddenAncestor {
         let r = view.convert(view.bounds, to: nil)
         let shown = view.layer?.presentation()?.position ?? .zero
