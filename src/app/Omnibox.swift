@@ -905,7 +905,7 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
     let previewHeight = preview.stringValue.isEmpty ? -8 : min(preview.intrinsicContentSize.height, Self.maxPreviewHeight)
     let size = NSSize(width: 340, height: 102 + rows * list.rowHeight + previewHeight)
     let margin: CGFloat = 12
-    let top = Theme.topBarHeight + margin
+    let top = TabLayout.pageTop + margin
     let fitsVertically = { (y: CGFloat) in y >= top && y + size.height <= self.bounds.height - margin }
     let clampY = { (y: CGFloat) in min(max(top, y), self.bounds.height - size.height - margin) }
     let clampX = { (x: CGFloat) in min(max(margin, x), self.bounds.width - size.width - margin) }

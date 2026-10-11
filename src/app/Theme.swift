@@ -32,6 +32,10 @@ enum Theme {
   static let hover = dynamic(
     light: NSColor(white: 0, alpha: 0.05),
     dark: NSColor(white: 1, alpha: 0.07))
+  /// A sidebar's pinned tab at rest (lighter than a hovered one).
+  static let pinnedTile = dynamic(
+    light: NSColor(white: 0, alpha: 0.03),
+    dark: NSColor(white: 1, alpha: 0.04))
   static let selected = dynamic(
     light: NSColor(white: 0, alpha: 0.08),
     dark: NSColor(white: 1, alpha: 0.12))

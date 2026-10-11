@@ -233,6 +233,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     item(view, "Journal", #selector(BrowserWindowController.showJournal(_:)), "j", [.command, .shift])
     item(view, "All Notes", #selector(BrowserWindowController.showAllNotes(_:)), "h", [.command, .shift])
     view.addItem(.separator())
+    view.addItem(withTitle: "Vertical Tabs", action: #selector(toggleVerticalTabs(_:)), keyEquivalent: "")
+    view.addItem(.separator())
     view.addItem(withTitle: "Reload Page", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
     view.addItem(withTitle: "Stop", action: #selector(BrowserWindowController.stopLoading(_:)), keyEquivalent: ".")
     view.addItem(.separator())
@@ -401,10 +403,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     SearchEngine.current = SearchEngine.allCases[sender.tag]
   }
 
+  @objc private func toggleVerticalTabs(_ sender: Any?) {
+    TabLayout.isVertical.toggle()
+  }
+
   @objc func validateMenuItem(_ item: NSMenuItem) -> Bool {
     if item.action == #selector(setSearchEngine(_:)) {
       item.state = SearchEngine.allCases[item.tag] == SearchEngine.current ? .on : .off
     }
+    if item.action == #selector(toggleVerticalTabs(_:)) { item.state = TabLayout.isVertical ? .on : .off }
     // (Builds that don't update, or a check already running.)
     if item.action == #selector(checkForUpdates(_:)) { return Updater.shared.canCheckForUpdates }
     return true

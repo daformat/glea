@@ -2,6 +2,47 @@ import AppKit
 
 // MARK: - Tabs
 
+/// Where the tabs go: along the top bar (the default), or down a sidebar
+/// that runs the window's height (View > Vertical Tabs).
+@MainActor
+enum TabLayout {
+  static let didChange = Notification.Name("app.glea.tabLayoutDidChange")
+
+  /// (Test copies keep their own, not to switch the real app's.)
+  private static let defaults = ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] == "1"
+    ? UserDefaults(suiteName: "app.glea.test-copy") ?? .standard : .standard
+
+  static var isVertical: Bool {
+    get { defaults.bool(forKey: "verticalTabs") }
+    set {
+      guard newValue != isVertical else { return }
+      defaults.set(newValue, forKey: "verticalTabs")
+      NotificationCenter.default.post(name: didChange, object: nil)
+    }
+  }
+
+  static let minSidebarWidth: CGFloat = 180
+  static let maxSidebarWidth: CGFloat = 400
+
+  /// The sidebar's width (dragged at its edge, remembered).
+  static var sidebarWidth: CGFloat {
+    get {
+      let width = defaults.double(forKey: "sidebarWidth")
+      return width > 0 ? min(max(width, minSidebarWidth), maxSidebarWidth) : 240
+    }
+    set { defaults.set(Double(min(max(newValue, minSidebarWidth), maxSidebarWidth).rounded()), forKey: "sidebarWidth") }
+  }
+
+  /// With vertical tabs, the page is a card on the sidebar's color: this
+  /// far from the window's top, right and bottom, its corners this round.
+  static let cardInset: CGFloat = 8
+  static let cardRadius: CGFloat = 10
+
+  /// Where a page starts in the window: below the top bar, or (the card's
+  /// inset) at the top when the sidebar takes its place.
+  static var pageTop: CGFloat { isVertical ? cardInset : Theme.topBarHeight }
+}
+
 /// The direction tabs run in: along the top bar, or down a sidebar. The
 /// tabs' views are flipped, so "along" is x, or y from the top.
 enum TabAxis {
@@ -138,7 +179,10 @@ final class TabsView: NSView {
     didSet {
       guard axis != oldValue else { return }
       tabStrip.axis = axis
-      for pill in pills.values { pill.dragAxis = axis }
+      for pill in pills.values {
+        pill.dragAxis = axis
+        pill.sidebarStyle = axis == .vertical
+      }
       for capsule in capsules.values { capsule.dragAxis = axis }
     }
   }
@@ -213,7 +257,9 @@ final class TabsView: NSView {
       }
       pill.onHoverChange = { [weak self] in self?.updatePinnedSeparator(animated: true) }
       pill.dragAxis = axis
+      pill.sidebarStyle = axis == .vertical
       pills[info.id] = pill
+
       (info.isPinned ? pinnedStrip : tabStrip).addSubview(pill)
       added.insert(info.id)
     }
@@ -565,6 +611,16 @@ private final class TabPill: NSView {
   var onToggleMute: (() -> Void)?
   /// Hidden inside its collapsed group's capsule: not clickable.
   var isCollapsedAway = false
+  /// In a sidebar: the title starts after the icon rather than centered,
+  /// and pinned, it's a tile (lightly filled at rest).
+  var sidebarStyle = false {
+    didSet {
+      guard sidebarStyle != oldValue else { return }
+      needsLayout = true
+      refresh(animated: false)
+    }
+  }
+
   /// Just moved between the pinned and regular strips.
   var needsAppear = false
   private var isPinned = false
@@ -905,7 +961,9 @@ private final class TabPill: NSView {
 
   private func refresh(animated: Bool) {
     if animated { updateText(animated: true) }
-    let color: NSColor = showsSelection ? Theme.activeTab : (hovering ? Theme.hover : .clear)
+    let resting: NSColor = sidebarStyle && isPinned ? Theme.pinnedTile : .clear
+    let color: NSColor = showsSelection ? Theme.activeTab : (hovering ? Theme.hover : resting)
+
     background.backgroundColor = resolvedCGColor(color)
     // Beam's hairline around the active and hovered tabs.
     let stroke: NSColor = pressed ? Theme.pressedTabStroke : showsSelection ? Theme.activeTabStroke : hovering ? Theme.tabStroke : .clear
@@ -945,7 +1003,8 @@ private final class TabPill: NSView {
     Motion.withoutAnimation { background.frame = bounds }
     // Pinned: just the icon, centered. Otherwise the icon stays at the left
     // and the title (after its padlock, when shown) is centered in the tab
-    // when it fits, else it fills the room after the icon.
+    // when it fits, else it fills the room after the icon (a sidebar's rows
+    // keep it after the icon).
     // Room on the right only for the buttons shown (the text shrinks).
     // The media indicator: in the favicon's place (pinned, narrow), else
     // just before the close button (making room for it as it appears), with
@@ -959,7 +1018,7 @@ private final class TabPill: NSView {
     // The text's own width (+ the field's 2pt padding each side).
     let textWidth = min(ceil(titleLabel.attributedStringValue.size().width) + 4, maxText)
     let groupWidth = lockWidth + textWidth
-    let groupX = max(31, min((bounds.width - groupWidth) / 2, bounds.width - reserved - groupWidth))
+    let groupX = sidebarStyle ? 31 : max(31, min((bounds.width - groupWidth) / 2, bounds.width - reserved - groupWidth))
     let iconFrame = NSRect(x: isPinned ? (bounds.width - 16) / 2 : 9, y: (h - 16) / 2, width: 16, height: 16)
     let lockFrame = NSRect(x: groupX - 1, y: (h - 16) / 2, width: 12, height: 16)
     let titleFrame = NSRect(x: groupX + lockWidth, y: (h - 16) / 2, width: textWidth, height: 16)
@@ -1110,7 +1169,6 @@ private final class TabPill: NSView {
   }
 }
 
-
 // MARK: - Pinned tabs, groups and drag & drop
 
 /// A tab bar item, left to right: a group's capsule, or a tab.
@@ -1135,7 +1193,6 @@ private struct TabDrag {
   /// The pointer minus its start, as drawn (it stays under the pointer as
   /// it shrinks to or grows from its pinned look).
   var grab: CGFloat { grabFraction * shownLength }
-
   /// Where it would land the last time the pointer was over the bar: a
   /// release anywhere else snaps it there.
   var lastTarget: DropTarget?
@@ -1143,8 +1200,18 @@ private struct TabDrag {
   var groupWith: ObjectIdentifier?
   /// A pinned tab being dragged (it unpins past the separator).
   var startedPinned = false
-  /// The pointer in the bar at the last drag event (for ⌥ pressed while still).
+  /// The pointer in the tabs' view at the last drag event (for ⌥ pressed
+  /// while still, and a sidebar's pinned tiles).
   var point: NSPoint = .zero
+  /// Down a sidebar: where it was grabbed across, as a fraction of its
+  /// thickness (a tile follows the pointer sideways from there).
+  var crossFraction: CGFloat = 0.5
+  /// Down a sidebar: where it would be across (a row's inset, or a tile's
+  /// place under the pointer) and how thick, and both as drawn, easing there.
+  var cross: CGFloat = 0
+  var thickness: CGFloat = 0
+  var shownCross: CGFloat = 0
+  var shownThickness: CGFloat = 0
 }
 
 /// A slot among the pinned tabs, or among the other items (and for a tab,
@@ -1166,7 +1233,6 @@ private final class PinnedStripView: NSView {
   override func mouseDown(with event: NSEvent) { superview?.mouseDown(with: event) }
 }
 
-
 extension TabsView {
   private var pinnedWidth: CGFloat { 32 }
   private var spacing: CGFloat { 4 }
@@ -1184,7 +1250,6 @@ extension TabsView {
         capsule.onMenu = { [weak self] in self?.delegate?.topBarMenu(forGroup: id) }
         capsule.onDrag = { [weak self] phase, event in self?.dragGroup(id, phase: phase, event: event) }
         capsule.dragAxis = axis
-
         capsules[id] = capsule
         tabStrip.addSubview(capsule)
         if window != nil { capsule.animateIn(scale: 0.8, duration: 0.2) }
@@ -1282,7 +1347,8 @@ extension TabsView {
   /// (not next to a group's capsule or a drop gap).
   fileprivate func layoutTabSeparators(items: [BarItem?], frames: [BarItem: NSRect], animated: Bool) {
     var placed: Set<ObjectIdentifier> = []
-    for (item, next) in zip(items, items.dropFirst()) {
+    // (A sidebar's rows have none.)
+    for (item, next) in zip(items, items.dropFirst()) where axis == .horizontal {
       guard case .tab(let left)? = item, case .tab(let right)? = next, let frame = frames[.tab(left)],
             pills[left]?.superview === tabStrip, pills[right]?.superview === tabStrip else { continue }
       let separatorFrame = rect(main: (axis.maxMain(frame) + spacing / 2 - 0.5).rounded(), length: 1, across: separatorSpan)
@@ -1331,6 +1397,48 @@ extension TabsView {
   /// sidebar's rows are all the same height.
   private var rowLength: CGFloat { Theme.tabHeight }
 
+  // MARK: Pinned tiles
+
+  /// Down a sidebar, pinned tabs are tiles, as many to a row as fit.
+  private var tileHeight: CGFloat { 34 }
+  private var tileGap: CGFloat { 4 }
+  private var rowWidth: CGFloat { across(0, fills: true).thickness }
+  private var tileColumns: Int { max(1, Int((rowWidth + tileGap) / (44 + tileGap))) }
+  private var tileWidth: CGFloat {
+    let columns = CGFloat(tileColumns)
+    return ((rowWidth - (columns - 1) * tileGap) / columns).rounded(.down)
+  }
+
+  /// A pinned tile's frame in the pinned strip.
+  private func tileFrame(_ index: Int) -> NSRect {
+    let row = index / tileColumns, column = index % tileColumns
+    return NSRect(x: Self.rowInset + CGFloat(column) * (tileWidth + tileGap), y: CGFloat(row) * (tileHeight + tileGap),
+                  width: tileWidth, height: tileHeight)
+  }
+
+  /// The pinned strip's length for `count` tabs.
+  private func pinnedLength(_ count: Int) -> CGFloat {
+    guard count > 0 else { return 0 }
+    switch axis {
+    case .horizontal: return CGFloat(count) * pinnedWidth + CGFloat(count - 1) * 2
+    case .vertical:
+      let rows = (count + tileColumns - 1) / tileColumns
+      return CGFloat(rows) * (tileHeight + tileGap) - tileGap
+    }
+  }
+
+  /// Down a sidebar: the slot among `count` tiles for a tile dropped at
+  /// `point` (in this view), in reading order.
+  private func tileSlot(at point: NSPoint, count: Int) -> Int {
+    let p = pinnedStrip.convert(point, from: self)
+    let row = Int(max(0, p.y) / (tileHeight + tileGap))
+    return (0..<count).filter { i in
+      let frame = tileFrame(i)
+      let tileRow = i / tileColumns
+      return tileRow < row || (tileRow == row && frame.midX < p.x)
+    }.count
+  }
+
   /// A group's capsule's length along the axis (a sidebar's are rows).
   private func capsuleLength(_ group: UUID) -> CGFloat {
     axis == .horizontal ? capsuleWidth(group) : GroupCapsule.height
@@ -1342,7 +1450,11 @@ extension TabsView {
     tabsStart = start
     tabsEnd = end
     let pillSpan = across(Theme.tabHeight, fills: true)
-    let capsuleSpan = across(GroupCapsule.height, fills: true)
+    /// A capsule across the axis: centered in the bar; a sidebar's sit at
+    /// the start of their row, as wide as their name.
+    func capsuleSpan(_ g: UUID) -> (cross: CGFloat, thickness: CGFloat) {
+      axis == .horizontal ? across(GroupCapsule.height) : across(min(capsuleWidth(g), rowWidth))
+    }
     let plusLength: CGFloat = 28 + 6
     let target = dropTarget()
     updateDraggedTabLook()
@@ -1350,11 +1462,12 @@ extension TabsView {
     // Pinned tabs, with a gap where a dragged tab would land.
     var pinned: [ObjectIdentifier?] = pinnedItems(excludingDrag: true).map { $0 }
     if drag?.groupWith == nil, case .pinned(let slot) = target { pinned.insert(nil, at: min(slot, pinned.count)) }
-    let pinnedStripLength = pinned.isEmpty ? 0 : CGFloat(pinned.count) * pinnedWidth + CGFloat(pinned.count - 1) * 2
+    let pinnedStripLength = pinnedLength(pinned.count)
     pinnedStrip.frame = axis.rect(main: start, length: max(pinnedStripLength, 1), cross: 0, thickness: crossExtent)
     for (i, id) in pinned.enumerated() {
       guard let id, let pill = pills[id], pill.superview === pinnedStrip else { continue }
-      let frame = rect(main: CGFloat(i) * (pinnedWidth + 2), length: pinnedWidth, across: across(Theme.tabHeight))
+      let frame = axis == .vertical ? tileFrame(i)
+        : rect(main: CGFloat(i) * (pinnedWidth + 2), length: pinnedWidth, across: across(Theme.tabHeight))
       if pill.needsAppear || added.contains(id) {
         appear(pill, at: frame, animated: animated)
       } else {
@@ -1463,7 +1576,7 @@ extension TabsView {
         }
         if pill.alphaValue < 1 { Motion.animate(animated ? 0.2 : 0) { pill.animator().alphaValue = 1 } }
       case .capsule(let g):
-        let capsuleFrame = rect(main: offsets[i] - scroll, length: length(item), across: capsuleSpan)
+        let capsuleFrame = rect(main: offsets[i] - scroll, length: length(item), across: capsuleSpan(g))
         if g == Self.previewID {
           showPreview(at: capsuleFrame)
           continue
@@ -1501,7 +1614,9 @@ extension TabsView {
       for id in members(info.id) {
         guard let pill = pills[id], pill.superview === tabStrip else { continue }
         pill.isCollapsedAway = true
-        place(pill, rect(main: axis.minMain(capsuleFrame), length: axis.length(capsuleFrame), across: pillSpan), animated: animated)
+        let into = axis == .vertical ? capsuleFrame
+          : rect(main: axis.minMain(capsuleFrame), length: axis.length(capsuleFrame), across: pillSpan)
+        place(pill, into, animated: animated)
         Motion.animate(animated ? 0.18 : 0) { pill.animator().alphaValue = 0 }
       }
     }
@@ -1532,19 +1647,34 @@ extension TabsView {
       case .tab(let id):
         let frame = draggedTabFrame(drag)
         if let pill = pills[id] {
-          // (Down a sidebar, it takes a pinned tab's size over the pinned tabs.)
-          let pinnedLook: Bool = { if case .pinned? = drag.lastTarget { return drag.groupWith == nil }; return false }()
-          pill.frame = rect(main: frame.start, length: frame.length,
-                            across: axis == .vertical && pinnedLook ? across(Theme.tabHeight) : pillSpan)
-          // Its content fades as it compresses toward its pinned size.
-          let range = drag.shownLength - pinnedWidth
-          pill.contentFade = range > 1 ? max(0, min(1, (frame.length - pinnedWidth) / range)) : 1
+          if axis == .vertical {
+            // A row keeps to the sidebar's inset; over the pinned tabs it's
+            // a tile, following the pointer sideways too.
+            let pinnedLook: Bool = { if case .pinned? = drag.lastTarget { return drag.groupWith == nil }; return false }()
+            let thickness = pinnedLook ? tileWidth : rowWidth
+            let cross = pinnedLook
+              ? min(max(drag.point.x - drag.crossFraction * thickness, 0), crossExtent - thickness)
+              : Self.rowInset
+            self.drag?.cross = cross
+            self.drag?.thickness = thickness
+            if Motion.reduceMotion || drag.shownThickness == 0 {
+              self.drag?.shownCross = cross
+              self.drag?.shownThickness = thickness
+            }
+            let shown = self.drag ?? drag
+            pill.frame = axis.rect(main: frame.start, length: frame.length, cross: shown.shownCross, thickness: shown.shownThickness)
+          } else {
+            pill.frame = rect(main: frame.start, length: frame.length, across: pillSpan)
+            // Its content fades as it compresses toward its pinned size.
+            let range = drag.shownLength - pinnedWidth
+            pill.contentFade = range > 1 ? max(0, min(1, (frame.length - pinnedWidth) / range)) : 1
+          }
         }
       case .group(let g):
         var offset = left
         if let capsule = capsules[g] {
           let length = axis.length(capsule.frame)
-          capsule.frame = rect(main: offset, length: length, across: capsuleSpan)
+          capsule.frame = rect(main: offset, length: length, across: capsuleSpan(g))
           offset += length + spacing
         }
         let collapsed = group(g)?.collapsed ?? false
@@ -1636,7 +1766,8 @@ extension TabsView {
   /// expands the same way.
   private func draggedTabFrame(_ drag: TabDrag) -> (start: CGFloat, length: CGFloat) {
     var length = drag.shownLength
-    if case .tab = drag.kind, drag.grabFraction > 0.01 {
+    // (In the bar: down a sidebar, it becomes a tile over the pinned tabs instead.)
+    if case .tab = drag.kind, drag.grabFraction > 0.01, axis == .horizontal {
       let room = (drag.pointer - (axis.minMain(tabStrip.frame) + 4)) / drag.grabFraction
       length = min(length, max(pinnedWidth, room))
     }
@@ -1660,8 +1791,14 @@ extension TabsView {
       return max(0, covered) / max(1, min(axis.length(frame), axis.length(dragged.frame)))
     }
     // Stay on the current target while it's still covered at all (its new
-    // capsule pushes it right), so the preview doesn't flicker.
+    // capsule pushes it right), so the preview doesn't flicker. (Down a
+    // sidebar the capsule is a row that pushes it out from under the tab:
+    // covering the capsule counts too.)
     if let current = drag.groupWith, overlap(current) > 0.05 { return current }
+    if axis == .vertical, let current = drag.groupWith, let preview = previewCapsule {
+      let frame = preview.convert(preview.bounds, to: self)
+      if min(draggedSpan.1, axis.maxMain(frame)) > max(draggedSpan.0, axis.minMain(frame)) { return current }
+    }
     // Otherwise the tab it covers most, once it covers a quarter of it.
     let best = pills.keys.filter { $0 != id }.map { ($0, overlap($0)) }.max { $0.1 < $1.1 }
     guard let best, best.1 >= 0.25 else { return nil }
@@ -1705,7 +1842,16 @@ extension TabsView {
   private func computeDropTarget() -> DropTarget? {
     guard let drag else { return nil }
     let pointer = drag.pointer
-    if case .tab = drag.kind {
+    if case .tab = drag.kind, axis == .vertical {
+      // Down a sidebar, a tab pins over the pinned tiles (above their
+      // separator), or above the first row when there are none yet; its
+      // tile goes where the pointer is among them. A little slack keeps it
+      // from flickering at the line.
+      let pinned = pinnedItems(excludingDrag: true)
+      let wasPinned: Bool = { if case .pinned? = drag.lastTarget { return true }; return false }()
+      let line = pinned.isEmpty && !wasPinned ? axis.minMain(tabStrip.frame) + 6 : axis.midMain(pinnedSeparator.frame)
+      if pointer < line + (wasPinned ? 8 : 0) { return .pinned(tileSlot(at: drag.point, count: pinned.count)) }
+    } else if case .tab = drag.kind {
       let pinned = pinnedItems(excludingDrag: true)
       // The tab pins once the icon it would shrink to (under the pointer)
       // reaches the tab area's left edge, so it pins right where it shows;
@@ -1788,7 +1934,6 @@ extension TabsView {
       let groupEnd = left(of: e, gapAt: e + 1) + length(items[e]) + (inside ? spacing + drag.length : 0)
       if pointer >= groupStart, pointer <= groupEnd { return .strip(min(max(slot, c + 1), e + 1), group: g) }
       if slot > c, slot <= e { return .strip(pointer < groupStart ? c : e + 1, group: nil) }
-
     }
     return .strip(slot, group: nil)
   }
@@ -1837,7 +1982,6 @@ extension TabsView {
   }
 
   private func isDragged(_ id: ObjectIdentifier) -> Bool {
-
     switch drag?.kind {
     case .tab(let dragged)?: return dragged == id
     case .group(let g)?: return tabInfos[id]?.groupID == g
@@ -1855,8 +1999,8 @@ extension TabsView {
     case .strip?: pinned = false
     case nil: pinned = tabInfos[id]?.isPinned == true
     }
-    let length = pinned ? pinnedWidth
-      : axis == .horizontal ? min(naturalTabWidth(id), max(stripTabWidth, Theme.tabMinWidth)) : rowLength
+    let length = axis == .vertical ? (pinned ? tileHeight : rowLength)
+      : pinned ? pinnedWidth : min(naturalTabWidth(id), max(stripTabWidth, Theme.tabMinWidth))
     self.drag?.length = length
     if Motion.reduceMotion { self.drag?.shownLength = length }
     pills[id]?.setPinnedLook(pinned)
@@ -1864,10 +2008,16 @@ extension TabsView {
 
   private func autoScroll() {
     guard let drag else { return }
-    // The dragged tab eases to its new length.
+    // The dragged tab eases to its new length (and down a sidebar, its place
+    // and thickness across).
+    func eased(_ shown: CGFloat, _ target: CGFloat) -> CGFloat { abs(target - shown) < 0.5 ? target : shown + (target - shown) * 0.3 }
+    if axis == .vertical, drag.shownCross != drag.cross || drag.shownThickness != drag.thickness {
+      self.drag?.shownCross = eased(drag.shownCross, drag.cross)
+      self.drag?.shownThickness = eased(drag.shownThickness, drag.thickness)
+      if drag.shownLength == drag.length { relayout(animated: true) }
+    }
     if drag.shownLength != drag.length {
-      let delta = drag.length - drag.shownLength
-      self.drag?.shownLength = abs(delta) < 0.5 ? drag.length : drag.shownLength + delta * 0.3
+      self.drag?.shownLength = eased(drag.shownLength, drag.length)
       relayout(animated: true)
     }
     let edge: CGFloat = 48
@@ -1920,6 +2070,14 @@ extension TabsView {
       drag = TabDrag(kind: .tab(id), grabFraction: fraction, pointer: pointer,
                      length: length, shownLength: axis.length(frame))
       drag?.startedPinned = tabInfos[id]?.isPinned == true
+      drag?.point = convert(event.locationInWindow, from: nil)
+      if axis == .vertical {
+        // Across, it starts where it is, held where it was pressed.
+        let pressedAt = pill.pressStart.map { convert($0, from: nil) } ?? convert(event.locationInWindow, from: nil)
+        drag?.crossFraction = min(1, max(0, (pressedAt.x - frame.minX) / max(1, frame.width)))
+        drag?.shownCross = frame.minX
+        drag?.shownThickness = frame.width
+      }
       // It starts where it is (the gap it leaves), then moves from there.
       if tabInfos[id]?.isPinned == true {
         drag?.lastTarget = pinnedItems(excludingDrag: false).firstIndex(of: id).map { .pinned($0) }
@@ -1997,7 +2155,6 @@ extension TabsView {
       let length = end - axis.minMain(frame)
       drag = TabDrag(kind: .group(g), grabFraction: (pointer - axis.minMain(frame)) / max(1, length), pointer: pointer,
                      length: length, shownLength: length)
-
       for view in views {
         let f = view.convert(view.bounds, to: self)
         addSubview(view)

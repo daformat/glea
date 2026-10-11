@@ -105,6 +105,16 @@ enum ExtensionPins {
 }
 
 /// The puzzle-piece dropdown: installed extensions, then "Manage Extensions".
+/// Where the extensions menu or a popup goes (flipped coordinates): under
+/// its button, right-aligned with it; above it when there's no room below
+/// (the sidebar's buttons are at the window's bottom).
+private func extensionCardOrigin(size: NSSize, anchor: NSRect, in bounds: NSRect) -> NSPoint {
+  let x = min(max(12, anchor.maxX - size.width), bounds.width - size.width - 12)
+  let below = anchor.maxY + 6
+  let fitsBelow = below + size.height <= bounds.height - 12
+  return NSPoint(x: x, y: fitsBelow ? below : max(12, anchor.minY - 6 - size.height))
+}
+
 final class ExtensionsMenu: OverlayView {
   var onChoose: ((PickerItem) -> Void)?
   /// The pin toggle of an extension's row.
@@ -151,8 +161,7 @@ final class ExtensionsMenu: OverlayView {
   override func layout() {
     super.layout()
     let size = NSSize(width: 260, height: CGFloat(min(list.items.count, 10)) * list.rowHeight + 12)
-    let x = min(max(12, anchor.maxX - size.width), bounds.width - size.width - 12)
-    cardFrame = NSRect(origin: NSPoint(x: x, y: anchor.maxY + 6), size: size)
+    cardFrame = NSRect(origin: extensionCardOrigin(size: size, anchor: anchor, in: bounds), size: size)
   }
 
   override func keyDown(with event: NSEvent) {
@@ -263,8 +272,7 @@ final class ExtensionPopup: OverlayView, GleaBrowserViewDelegate {
     super.layout()
     let size = NSSize(width: min(max(contentSize.width, Self.minimumSize.width), Self.maximumSize.width),
                       height: min(max(contentSize.height, Self.minimumSize.height), Self.maximumSize.height))
-    let x = min(max(12, anchor.maxX - size.width), bounds.width - size.width - 12)
-    cardFrame = NSRect(origin: NSPoint(x: x, y: anchor.maxY + 6), size: size)
+    cardFrame = NSRect(origin: extensionCardOrigin(size: size, anchor: anchor, in: bounds), size: size)
     // The page's window can appear after animateAppear(): keep it invisible.
     if !revealed { page.chromeWindow?.alphaValue = 0 }
   }

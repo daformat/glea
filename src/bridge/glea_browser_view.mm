@@ -903,6 +903,15 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
 /// Where the page meets the bottom of the (rounded) window, round it too.
 /// The mask goes on the window's frame view: its layer is the root of the
 /// window's layer tree, so it isn't flipped (Chromium's content view is).
+- (void)setChromeCornerRadius:(CGFloat)radius {
+  if (radius == _chromeCornerRadius) return;
+  _chromeCornerRadius = radius;
+  if (_chromeWindow) {
+    [self updateChromePlacement];
+    [self roundChromeWindowCorners];
+  }
+}
+
 - (void)roundChromeWindowCorners {
   NSWindow* parent = self.window;
   NSView* frameView = _chromeWindow.window.contentView.superview;
@@ -910,8 +919,14 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   frameView.wantsLayer = YES;
   CALayer* layer = frameView.layer;
   CGFloat inset = ChromeWindowBorderInset(parent);
-  BOOL atBottom = NSMinY(_chromeWindow.window.frame) <= NSMinY(parent.frame) + inset + 1 &&
-                  !(parent.styleMask & NSWindowStyleMaskFullScreen);
+  // The page's corners that are the window's (the page meets its bottom,
+  // and with vertical tabs its top right too).
+  NSRect page = _chromeWindow.window.frame, outer = parent.frame;
+  BOOL windowed = !(parent.styleMask & NSWindowStyleMaskFullScreen);
+  BOOL atBottom = windowed && NSMinY(page) <= NSMinY(outer) + inset + 1;
+  BOOL atTop = windowed && NSMaxY(page) >= NSMaxY(outer) - inset - 1;
+  BOOL atLeft = NSMinX(page) <= NSMinX(outer) + inset + 1;
+  BOOL atRight = NSMaxX(page) >= NSMaxX(outer) - inset - 1;
   // The Glea window's own corner radius (larger on recent macOS).
   CGFloat windowRadius = 10;
   SEL cornerRadius = NSSelectorFromString(@"_cornerRadius");
@@ -919,11 +934,15 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
     CGFloat value = ((CGFloat(*)(id, SEL))objc_msgSend)(parent, cornerRadius);
     if (value > 0) windowRadius = value;
   }
-  CGFloat radius = _chromeCornerRadius > 0 ? _chromeCornerRadius : (atBottom ? windowRadius - inset : 0);
   CACornerMask all = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
-  CACornerMask bottom = layer.geometryFlipped ? (kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner)
-                                              : (kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner);
-  CACornerMask corners = _chromeCornerRadius > 0 ? all : bottom;
+  BOOL flipped = layer.geometryFlipped;
+  CACornerMask windowCorners = 0;
+  if (atBottom && atLeft) windowCorners |= flipped ? kCALayerMinXMaxYCorner : kCALayerMinXMinYCorner;
+  if (atBottom && atRight) windowCorners |= flipped ? kCALayerMaxXMaxYCorner : kCALayerMaxXMinYCorner;
+  if (atTop && atLeft) windowCorners |= flipped ? kCALayerMinXMinYCorner : kCALayerMinXMaxYCorner;
+  if (atTop && atRight) windowCorners |= flipped ? kCALayerMaxXMinYCorner : kCALayerMaxXMaxYCorner;
+  CGFloat radius = _chromeCornerRadius > 0 ? _chromeCornerRadius : (windowCorners ? windowRadius - inset : 0);
+  CACornerMask corners = _chromeCornerRadius > 0 ? all : windowCorners;
   if (layer.cornerRadius != radius || layer.maskedCorners != corners) {
     layer.cornerRadius = radius;
     layer.cornerCurve = kCACornerCurveContinuous;

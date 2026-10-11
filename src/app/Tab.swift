@@ -108,6 +108,8 @@ final class Tab: NSObject, GleaBrowserViewDelegate {
     let view = GleaBrowserView(url: url, contentScript: Tab.contentScript)
     // A Chrome-style browser where the window allows it (extensions work).
     view.prefersChromeStyle = true
+    // (With vertical tabs, the page is a card beside the sidebar.)
+    view.chromeCornerRadius = TabLayout.isVertical ? TabLayout.cardRadius : 0
     view.session = session
     view.audioMuted = isMuted
     view.keepsRunningWhenHidden = isAudible && !isMuted

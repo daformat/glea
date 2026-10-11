@@ -608,12 +608,29 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       topBar.topAnchor.constraint(equalTo: root.topAnchor),
       topBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
       topBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+    ])
+    barConstraints = [
       topBar.heightAnchor.constraint(equalToConstant: Theme.topBarHeight),
       contentArea.topAnchor.constraint(equalTo: topBar.bottomAnchor),
       contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor),
       contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor),
       contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-    ])
+    ]
+    // Vertical tabs: the bar fills the window, its tabs down the left, and
+    // the page is a card over it (its color all around).
+    let inset = TabLayout.cardInset
+    sidebarConstraints = [
+      topBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+      sidebarWidth,
+      contentArea.topAnchor.constraint(equalTo: root.topAnchor, constant: inset),
+      contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -inset),
+      contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -inset),
+    ]
+    topBar.onResize = { [weak self] width, ended in self?.resizeSidebar(to: width, ended: ended) }
+    applyTabLayout()
+    NotificationCenter.default.addObserver(forName: TabLayout.didChange, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.applyTabLayout() }
+    }
     for view in [journalView, noteView, notesView, webContainer] {
       contentArea.addSubview(view)
       view.pinEdges(to: contentArea)
@@ -639,6 +656,49 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       toast.centerXAnchor.constraint(equalTo: overlayRoot.centerXAnchor),
       toast.bottomAnchor.constraint(equalTo: overlayRoot.bottomAnchor, constant: -24),
     ])
+  }
+
+  // MARK: Vertical tabs
+
+  /// The top bar along the window's top, or (vertical tabs) as a sidebar
+  /// down its left, the page beside it.
+  private var barConstraints: [NSLayoutConstraint] = []
+  private var sidebarConstraints: [NSLayoutConstraint] = []
+  /// The page card's left edge: the sidebar's width.
+  private lazy var sidebarWidth = contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: TabLayout.sidebarWidth)
+
+  private func applyTabLayout() {
+    let vertical = TabLayout.isVertical && mode == .web
+    sidebarWidth.constant = TabLayout.sidebarWidth
+    topBar.sidebarWidth = TabLayout.sidebarWidth
+    NSLayoutConstraint.deactivate(vertical ? barConstraints : sidebarConstraints)
+    NSLayoutConstraint.activate(vertical ? sidebarConstraints : barConstraints)
+    // The bar over the page, or (vertical tabs) the card over the bar.
+    root.addSubview(vertical ? contentArea : topBar, positioned: .above, relativeTo: vertical ? topBar : contentArea)
+    contentArea.wantsLayer = true
+    contentArea.layer?.cornerRadius = vertical ? TabLayout.cardRadius : 0
+    contentArea.layer?.cornerCurve = .continuous
+    contentArea.layer?.masksToBounds = vertical
+    for tab in tabs { tab.browserView?.chromeCornerRadius = vertical ? TabLayout.cardRadius : 0 }
+    topBar.isVertical = vertical
+    root.layoutSubtreeIfNeeded()
+    positionTrafficLights()
+    syncOverlayWindow()
+  }
+
+  private func resizeSidebar(to width: CGFloat, ended: Bool) {
+    // (The page keeps some room.)
+    let maxWidth = min(TabLayout.maxSidebarWidth, root.bounds.width - 320)
+    sidebarWidth.constant = min(max(width, TabLayout.minSidebarWidth), max(TabLayout.minSidebarWidth, maxWidth)).rounded()
+    topBar.sidebarWidth = sidebarWidth.constant
+    root.layoutSubtreeIfNeeded()
+    positionTrafficLights()
+    syncOverlayWindow()
+    if ended {
+      // Other windows follow.
+      TabLayout.sidebarWidth = sidebarWidth.constant
+      NotificationCenter.default.post(name: TabLayout.didChange, object: nil)
+    }
   }
 
   func windowDidResize(_ notification: Notification) {
@@ -1032,6 +1092,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let shown = isShowingNewTab ? nil : activeTab
     // Back and Forward go through the tab's pages, or the notes' places.
     let web = mode == .web
+    // Vertical tabs are the web's: the notes keep the top bar.
+    if (TabLayout.isVertical && web) != topBar.isVertical { applyTabLayout() }
     topBar.update(section: section, tabs: infos, groups: groupInfos, activeID: shown.map(ObjectIdentifier.init),
                   canGoBack: web ? shown?.canGoBack ?? false : canGoBackInNotes,
                   canGoForward: web ? shown?.canGoForward ?? false : canGoForwardInNotes,
@@ -1821,7 +1883,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from tab: Tab?,
                                 onDismiss: (() -> Void)? = nil, onCollect: ((NoteRef) -> Void)? = nil) {
     let root = rootView
-    var anchor = NSRect(x: root.bounds.midX - 170, y: Theme.topBarHeight + 8, width: 0, height: 0)
+    var anchor = NSRect(x: root.bounds.midX - 170, y: TabLayout.pageTop + 8, width: 0, height: 0)
     if let rect = anchorInWindow {
       // Window coordinates are bottom-up; the overlay is flipped.
       anchor = NSRect(x: rect.minX, y: root.bounds.height - rect.maxY, width: rect.width, height: rect.height)
@@ -2254,7 +2316,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     bar.translatesAutoresizingMaskIntoConstraints = false
     overlayRoot.addSubview(bar)
     NSLayoutConstraint.activate([
-      bar.topAnchor.constraint(equalTo: overlayRoot.topAnchor, constant: Theme.topBarHeight + 10),
+      bar.topAnchor.constraint(equalTo: overlayRoot.topAnchor, constant: TabLayout.pageTop + 10),
       bar.trailingAnchor.constraint(equalTo: overlayRoot.trailingAnchor, constant: -14),
     ])
     findBar = bar

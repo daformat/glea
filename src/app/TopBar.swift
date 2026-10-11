@@ -476,6 +476,8 @@ final class TopBarView: NSView {
 
   /// The tabs: pinned, then the others (and their groups), and +.
   private let tabsView = TabsView()
+  /// The sidebar's right edge, dragged to resize it.
+  private let resizeEdge = SidebarEdge()
   /// Color the next new group gets (for the ⌥-drag preview).
   var nextGroupColor: NSColor {
     get { tabsView.nextGroupColor }
@@ -487,6 +489,8 @@ final class TopBarView: NSView {
   private var progress: Double = 0
 
   private(set) var section: Section = .journal
+  /// Vertical at the last update (see update).
+  private var wasVertical = false
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
@@ -518,6 +522,8 @@ final class TopBarView: NSView {
     updateUpdatePill()
     // Above the buttons: a dragged tab passes over them.
     addSubview(tabsView)
+    resizeEdge.isHidden = true
+    addSubview(resizeEdge)
     for view in webOnlyViews { view.alphaValue = 0; view.isHidden = true }
   }
 
@@ -606,9 +612,13 @@ final class TopBarView: NSView {
       applyColors()
       separatorLayer.opacity = isWeb ? 1 : 0
     }
+    // The web's sidebar ↔ the notes' bar: the other mode's views would
+    // show in the new layout as they faded, so they go at once.
+    let layoutChanged = isVertical != wasVertical
+    wasVertical = isVertical
     if sectionChanged {
-      setVisible(webOnlyViews, isWeb, animated: animated)
-      setVisible(notesOnlyViews, !isWeb, animated: animated)
+      setVisible(webOnlyViews, isWeb, animated: animated && !layoutChanged)
+      setVisible(notesOnlyViews, !isWeb, animated: animated && !layoutChanged)
     }
     updateSoundButton()
     layoutItems(animated: animated, added: isWeb ? added : [], reveal: reveal)
@@ -642,10 +652,13 @@ final class TopBarView: NSView {
 
   private func layoutItems(animated: Bool, added: Set<ObjectIdentifier>, reveal: ObjectIdentifier? = nil) {
     Motion.withoutAnimation {
-      tabsView.frame = tabsHost?.bounds ?? bounds
       backgroundLayer.frame = bounds
-      separatorLayer.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 1)
+      // (The sidebar needs no line: the page's card has its own edge.)
+      separatorLayer.frame = isVertical ? .zero : NSRect(x: 0, y: 0, width: bounds.width, height: 1)
+      resizeEdge.frame = NSRect(x: sidebarWidth - 6, y: 0, width: 6, height: bounds.height)
     }
+    if isVertical { return layoutSidebar(animated: animated, added: added, reveal: reveal) }
+    Motion.withoutAnimation { tabsView.frame = bounds }
     let h = bounds.height
     let buttonY = (h - 28) / 2
     let left: CGFloat = 86  // clear of the traffic lights
@@ -704,11 +717,56 @@ final class TopBarView: NSView {
     // hidden), so switching modes doesn't resize them.
     var tabsRightEdge = (showsExtensions ? extensionX : buttonsLeft) - 12
     if !updatePill.isHidden { tabsRightEdge = min(tabsRightEdge, updatePill.frame.minX - 12) }
-    if let tabsHost {
-      tabsView.layoutTabs(from: 8, to: tabsHost.bounds.height - 8, animated: animated, added: added, reveal: reveal)
-    } else {
-      tabsView.layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
+    tabsView.layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
+  }
+
+  /// Vertical tabs (the web only): the bar is a sidebar, the window's
+  /// height. At its top, beside the traffic lights, Back / Forward / Reload;
+  /// at its bottom the bar's other buttons; the tabs in between.
+  private func layoutSidebar(animated: Bool, added: Set<ObjectIdentifier>, reveal: ObjectIdentifier?) {
+    let w = sidebarWidth, h = bounds.height
+    let top = Theme.topBarHeight, bottom: CGFloat = 44
+    /// A frame given from the top (the bar isn't flipped).
+    func fromTop(_ x: CGFloat, _ y: CGFloat, _ width: CGFloat, _ height: CGFloat) -> NSRect {
+      NSRect(x: x, y: h - y - height, width: width, height: height)
     }
+    let topY = (top - 28) / 2
+    // Top: navigation, at the right (the traffic lights are at the left).
+    var x = w - 10 - 3 * 28
+    for button in [backButton, forwardButton, reloadButton] {
+      place(button, fromTop(x, topY, 28, 28), animated: false)
+      x += 28
+    }
+
+    // Bottom: the extensions at the left, search and the web/notes toggle
+    // (in the corner) at the right.
+    let bottomY = (bottom - 28) / 2
+    place(modeButton, NSRect(x: w - 10 - 28, y: bottomY, width: 28, height: 28), animated: false)
+    place(searchButton, NSRect(x: modeButton.frame.minX - 4 - 28, y: bottomY, width: 28, height: 28), animated: false)
+    var left: CGFloat = 10
+    if isIncognito {
+      let size = incognitoBadge.fittingSize
+      place(incognitoBadge, NSRect(x: left, y: ((bottom - size.height) / 2).rounded(), width: size.width, height: size.height),
+            animated: false)
+      left = incognitoBadge.frame.maxX + 6
+    }
+    place(extensionsButton, NSRect(x: left, y: bottomY, width: 28, height: 28), animated: false)
+    var extensionX = extensionsButton.frame.maxX + 2
+    for entry in extensionButtons {
+      place(entry.button, NSRect(x: extensionX, y: bottomY, width: 28, height: 28), animated: animated)
+      extensionX += 28 + 2
+    }
+    // Over the bottom buttons: relaunch to update.
+    var tabsBottom = bottom
+    if !updatePill.isHidden {
+      let size = updatePill.fittingSize
+      place(updatePill, NSRect(x: 10, y: bottom, width: min(size.width, w - 20), height: size.height), animated: false)
+      tabsBottom = updatePill.frame.maxY + 6
+    }
+
+    // The tabs, between the two.
+    Motion.withoutAnimation { tabsView.frame = NSRect(x: 0, y: tabsBottom, width: w, height: max(0, h - top - tabsBottom)) }
+    tabsView.layoutTabs(from: 4, to: tabsView.bounds.height - 4, animated: animated, added: added, reveal: reveal)
   }
 
   private func place(_ view: NSView, _ frame: NSRect, animated: Bool) {
@@ -728,11 +786,13 @@ final class TopBarView: NSView {
     CATransaction.begin()
     CATransaction.setAnimationDuration(Motion.reduceMotion ? 0 : 0.25)
     CATransaction.setAnimationTimingFunction(Motion.easeOut)
+    // (In the sidebar: under the navigation, at the top.)
+    let y = isVertical ? bounds.height - Theme.topBarHeight - 1 : 0
     if visible && progressLayer.opacity == 0 {
       // Restart from the left edge.
-      Motion.withoutAnimation { progressLayer.frame = NSRect(x: 0, y: 0, width: 0, height: 2) }
+      Motion.withoutAnimation { progressLayer.frame = NSRect(x: 0, y: y, width: 0, height: 2) }
     }
-    progressLayer.frame = NSRect(x: 0, y: 0, width: bounds.width * (visible ? progress : 1), height: 2)
+    progressLayer.frame = NSRect(x: 0, y: y, width: (isVertical ? sidebarWidth : bounds.width) * (visible ? progress : 1), height: 2)
     progressLayer.opacity = visible ? 1 : 0
     CATransaction.commit()
   }
@@ -765,6 +825,9 @@ final class TopBarView: NSView {
   /// ⌥ pressed or released mid-drag.
   func dragModifiersChanged(_ flags: NSEvent.ModifierFlags) { tabsView.dragModifiersChanged(flags) }
 
+  /// Test hooks: the puzzle button, as if clicked.
+  func clickExtensionsButtonForTesting() { showExtensions() }
+
   /// Test hooks: the tab at `index` as if hovered.
   func simulateHover(tabAt index: Int, _ on: Bool) { tabsView.simulateHover(tabAt: index, on) }
 
@@ -773,19 +836,64 @@ final class TopBarView: NSView {
     tabsView.simulateDrag(tabAt: index, group: group, from: from, to: to, option: option)
   }
 
-  /// Test hooks: the tabs down `host` (a stand-in for a sidebar), or back
-  /// in the bar.
-  private weak var tabsHost: NSView?
-  func hostTabsForTesting(in host: NSView?) {
-    tabsHost = host
-    (host ?? self).addSubview(tabsView)
-    tabsView.axis = host == nil ? .horizontal : .vertical
-    layoutItems(animated: false, added: [])
+  /// Vertical tabs: the bar is a sidebar, the window's height (see
+  /// layoutSidebar). The window sets its frame.
+  var isVertical = false {
+    didSet {
+      guard isVertical != oldValue else { return }
+      tabsView.axis = isVertical ? .vertical : .horizontal
+      resizeEdge.isHidden = !isVertical
+      layoutItems(animated: false, added: [], reveal: tabsView.activeID)
+      updateProgress()
+    }
   }
 
+  /// Vertical tabs: the bar spans the window (its color around the page's
+  /// card); the sidebar is this wide at its left.
+  var sidebarWidth: CGFloat = 240 {
+    didSet { if sidebarWidth != oldValue, isVertical { needsLayout = true } }
+  }
+
+  /// The sidebar's edge dragged to `width` (`ended`: let go).
+  var onResize: ((_ width: CGFloat, _ ended: Bool) -> Void)? {
+    get { resizeEdge.onResize }
+    set { resizeEdge.onResize = newValue }
+  }
+}
+
+/// The sidebar's right edge (vertical tabs): drag it to resize the sidebar.
+private final class SidebarEdge: NSView {
+  var onResize: ((_ width: CGFloat, _ ended: Bool) -> Void)?
+  private var startWidth: CGFloat = 0
+  private var startX: CGFloat = 0
+
+  override var mouseDownCanMoveWindow: Bool { false }
+
+  override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+
+  /// Pressed here (a release alone resizes nothing).
+  private var resizing = false
+
+  override func mouseDown(with event: NSEvent) {
+    resizing = true
+    startWidth = (superview as? TopBarView)?.sidebarWidth ?? 0
+    startX = event.locationInWindow.x
+  }
+
+  override func mouseDragged(with event: NSEvent) {
+    guard resizing else { return }
+    onResize?(startWidth + event.locationInWindow.x - startX, false)
+  }
+
+  override func mouseUp(with event: NSEvent) {
+    guard resizing else { return }
+    resizing = false
+    onResize?(startWidth + event.locationInWindow.x - startX, true)
+  }
 }
 
 /// "Incognito", with its glasses, at the right of an incognito window's bar.
+
 extension TopBarView {
   /// Shows the pill once an update is ready (popping in), hides it otherwise.
   fileprivate func updateUpdatePill() {

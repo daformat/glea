@@ -363,9 +363,8 @@ enum TestHooks {
       }
       NSLog("Glea line heights:\n%@", out.joined(separator: "\n"))
     case "extensions-menu":
-      // Opens the puzzle menu as if its button (near the top-right) was clicked.
-      let width = controller.window?.frame.width ?? 1200
-      controller.topBarShowExtensions(from: NSRect(x: width - 112, y: 12, width: 28, height: 28))
+      // Opens the puzzle menu as if its button was clicked.
+      controller.topBar.clickExtensionsButtonForTesting()
     case "hittest":
       // hittest:x,y (window points from the top left): which view gets a click there.
       let xy = argument.split(separator: ",").compactMap { Double($0) }
@@ -822,25 +821,9 @@ enum TestHooks {
         let shown = view.layer?.presentation()?.position.x ?? -1
         NSLog("Glea tabs: %@ %@ hidden=%d alpha=%.2f opacity=%.2f shownX=%.1f", String(describing: type(of: view)), NSStringFromRect(view.convert(view.bounds, to: nil)), view.isHidden, view.alphaValue, view.layer?.opacity ?? -1, shown)
       }
-    case "tabs-sidebar":
-      // tabs-sidebar:1|0: the tabs down a stand-in sidebar on the left, under
-      // the bar (vertical tabs, before they have a real sidebar), or back.
-      guard let content = controller.window?.contentView else { break }
-      let id = NSUserInterfaceItemIdentifier("glea.test.tabs-sidebar")
-      content.subviews.first { $0.identifier == id }?.removeFromSuperview()
-      guard argument == "1" else {
-        controller.topBar.hostTabsForTesting(in: nil)
-        break
-      }
-      let bar = controller.topBar.convert(controller.topBar.bounds, to: content)
-      let below = content.isFlipped ? NSRect(x: 0, y: bar.maxY, width: 240, height: content.bounds.height - bar.maxY)
-        : NSRect(x: 0, y: 0, width: 240, height: bar.minY)
-      let host = NSView(frame: below)
-      host.identifier = id
-      host.wantsLayer = true
-      host.layer?.backgroundColor = Theme.webBar.cgColor
-      content.addSubview(host)
-      controller.topBar.hostTabsForTesting(in: host)
+    case "vertical-tabs":
+      // vertical-tabs:1|0: View > Vertical Tabs.
+      TabLayout.isVertical = argument == "1"
     case "drag-at":
       // drag-at:x1,y1,x2,y2[,opt] (points in the window, y down from its top): a mouse drag.
       let v = argument.split(separator: ",").compactMap { Double($0) }
@@ -891,9 +874,7 @@ enum TestHooks {
                                      option: argument.hasSuffix(",opt"))
     case "bar-views":
       // Every view in the top bar, in window coordinates (where it's shown).
-      // (And the stand-in sidebar's, see tabs-sidebar.)
-      let sidebar = controller.window?.contentView?.subviews.first { $0.identifier?.rawValue == "glea.test.tabs-sidebar" }
-      let views = allSubviews(controller.topBar).dropFirst() + (sidebar.map(allSubviews) ?? []).dropFirst()
+      let views = allSubviews(controller.topBar).dropFirst()
       for view in views where !view.isHiddenOrHasHiddenAncestor {
         let r = view.convert(view.bounds, to: nil)
         let shown = view.layer?.presentation()?.position ?? .zero
