@@ -17,6 +17,7 @@
   <key>NSHighResolutionCapable</key><true/>
   <key>NSCameraUsageDescription</key><string>Websites you visit can ask to use your camera.</string>
   <key>NSMicrophoneUsageDescription</key><string>Websites you visit can ask to use your microphone.</string>
+  <key>NSLocationUsageDescription</key><string>Websites you visit can ask for your location.</string>
   <key>NSPrincipalClass</key><string>GleaApplication</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <!-- Updates (Sparkle). The feed is the latest release's appcast on
