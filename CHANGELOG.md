@@ -2,6 +2,15 @@
 
 What changed in each release of Glea.
 
+## 0.16.2 Beta — 2026-10-11
+
+- Settings, in Glea ▸ Settings… (<kbd>⌘,</kbd>): its Browser pane has
+  vertical tabs, the search engine, and a switch to open the links in your
+  notes in another browser, which you pick. Pages you browse in Glea still
+  open their links in its tabs.
+- Glea is listed among the web browsers in System Settings ▸ Desktop &
+  Dock ▸ Default web browser.
+
 ## 0.16.1 Beta — 2026-10-11
 
 - Expanding a tab group no longer leaves its tabs looking hovered.
