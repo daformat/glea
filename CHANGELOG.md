@@ -2,6 +2,11 @@
 
 What changed in each release of Glea.
 
+## 0.16.4 Beta — 2026-10-11
+
+- While an update downloads in the background, Glea ▸ Check for Updates…
+  says so, then that it's preparing it, instead of just being greyed out.
+
 ## 0.16.3 Beta — 2026-10-11
 
 - Websites you allow to know your location now get it: Glea tells macOS
