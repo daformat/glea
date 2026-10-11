@@ -676,6 +676,21 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
   return session;
 }
 
++ (GleaBrowsingSession*)embedSession {
+  static GleaBrowsingSession* session;
+  if (!session) {
+    session = [super new];
+    // Beside Default, under the root cache path (where CEF requires it).
+    NSString* path =
+        [GleaCEF.profilePath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"Embeds"];
+    CefRequestContextSettings settings;
+    CefString(&settings.cache_path) = path.UTF8String;
+    settings.persist_session_cookies = true;
+    session->_context = CefRequestContext::CreateContext(settings, nullptr);
+  }
+  return session;
+}
+
 @end
 
 @implementation GleaBrowserView {

@@ -56,6 +56,9 @@ NS_SWIFT_UI_ACTOR
 /// A new off-the-record session: everything stays in memory, shared by the
 /// browsers created with it, and is gone once the last of them closes.
 + (instancetype)incognitoSession;
+/// The session notes' embeds share: a profile on disk of its own, so they
+/// keep their caches and cookies without reaching the browsing history.
+@property(class, nonatomic, readonly) GleaBrowsingSession* embedSession;
 - (instancetype)init NS_UNAVAILABLE;
 @end
 

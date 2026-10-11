@@ -1034,6 +1034,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
             case .html(let html)? = resolution?.target else { return }
       self.discardPending()
       let view = GleaBrowserView(url: EmbedService.hostURL, contentScript: EmbedService.sizeReporter)
+      view.session = .embed
       view.audioMuted = self.soundMuted
       view.servedHTML = EmbedService.hostPage(html, dark: dark)
       view.delegate = self
@@ -1391,6 +1392,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   private func showBrowser(_ url: String, served html: String? = nil, script: String?) {
     let view = GleaBrowserView(url: url, contentScript: script)
+    view.session = .embed
     view.audioMuted = soundMuted
     view.servedHTML = html
     view.delegate = self
