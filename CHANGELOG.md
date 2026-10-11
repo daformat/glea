@@ -11,14 +11,16 @@ What changed in each release of Glea.
 
 ## 0.15.8 Beta — 2026-10-10
 
-- Glea Clipper for Safari keeps the popup's Into and Open Glea afterwards
-  as you set them, and point and shoot follows them: a new note is named
-  after the page.
+- Glea Clipper keeps the popup's Into and Open Glea afterwards as you set
+  them, and point and shoot, the context menu and the shortcut follow them:
+  a new note is named after the page. (In Safari with this release; in
+  Chrome and Firefox with Glea Clipper 1.0.2.)
 
 ## 0.15.7 Beta — 2026-10-10
 
-- Glea Clipper for Safari no longer says "Collected to Today" after point
-  and shoot: it can't know where the capture went.
+- Glea Clipper no longer says "Collected to Today" after point and shoot:
+  it can't know where the capture went. (In Safari with this release; in
+  Chrome and Firefox with Glea Clipper 1.0.1.)
 - Images linked by their bare name are found in your assets folder, like
   Obsidian's.
 - The chevrons on All Notes' groups show in the dark theme.
