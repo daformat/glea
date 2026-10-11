@@ -311,9 +311,10 @@ final class TabsView: NSView {
 }
 
 /// One tab in the strip: favicon, title and a close button on hover.
-/// Holds the tab pills: clips them, scrolls sideways with the wheel or
-/// trackpad when they overflow, and fades the clipped edges.
-private final class TabStripView: NSView {
+/// Holds the tab pills (and a sidebar's pinned extensions): clips them,
+/// scrolls along its axis with the wheel or trackpad when they overflow, and
+/// fades the clipped edges.
+final class TabStripView: NSView {
   /// The bar sits in the window's title bar, where macOS drags the window
   /// from any view that doesn't claim its area (controls do, plain views
   /// don't), before the app even sees the press. Claim it: tabs drag tabs,
@@ -1403,11 +1404,9 @@ extension TabsView {
   private var tileHeight: CGFloat { 34 }
   private var tileGap: CGFloat { 4 }
   private var rowWidth: CGFloat { across(0, fills: true).thickness }
-  private var tileColumns: Int { max(1, Int((rowWidth + tileGap) / (44 + tileGap))) }
-  private var tileWidth: CGFloat {
-    let columns = CGFloat(tileColumns)
-    return ((rowWidth - (columns - 1) * tileGap) / columns).rounded(.down)
-  }
+  /// A fixed size: resizing the sidebar changes how many fit in a row.
+  private var tileWidth: CGFloat { 52 }
+  private var tileColumns: Int { max(1, Int((rowWidth + tileGap) / (tileWidth + tileGap))) }
 
   /// A pinned tile's frame in the pinned strip.
   private func tileFrame(_ index: Int) -> NSRect {

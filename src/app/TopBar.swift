@@ -452,7 +452,8 @@ final class TopBarView: NSView {
 
   @objc private func openPinnedExtension(_ sender: IconButton) {
     guard let entry = extensionButtons.first(where: { $0.button === sender }) else { return }
-    delegate?.topBarOpenExtension(entry.id, from: sender.frame)
+    // (In the sidebar, the button is in its strip.)
+    delegate?.topBarOpenExtension(entry.id, from: sender.convert(sender.bounds, to: self))
   }
   private lazy var searchButton = IconButton(symbol: "magnifyingglass", size: 13, tooltip: "Search (⌘T)", target: self, action: #selector(search))
   /// Notes only: a new note.
@@ -478,6 +479,11 @@ final class TopBarView: NSView {
   private let tabsView = TabsView()
   /// The sidebar's right edge, dragged to resize it.
   private let resizeEdge = SidebarEdge()
+  /// The sidebar's pinned extensions (see layoutSidebar).
+  private let extensionStrip = TabStripView()
+  /// A hairline just outside the page's card (the card covers the rest): its
+  /// edge shows even on a page the sidebar's color.
+  private let cardOutline = CALayer()
   /// Color the next new group gets (for the ⌥-drag preview).
   var nextGroupColor: NSColor {
     get { tabsView.nextGroupColor }
@@ -501,6 +507,11 @@ final class TopBarView: NSView {
     backgroundLayer.cornerRadius = 0
     layer?.addSublayer(backgroundLayer)
     layer?.addSublayer(separatorLayer)
+    cardOutline.borderWidth = 1
+    cardOutline.cornerCurve = .continuous
+    cardOutline.cornerRadius = TabLayout.cardRadius + 1
+    cardOutline.isHidden = true
+    layer?.addSublayer(cardOutline)
     progressLayer.anchorPoint = .zero
     progressLayer.cornerRadius = 1
     layer?.addSublayer(progressLayer)
@@ -524,6 +535,9 @@ final class TopBarView: NSView {
     addSubview(tabsView)
     resizeEdge.isHidden = true
     addSubview(resizeEdge)
+    extensionStrip.isHidden = true
+    extensionStrip.onScroll = { [weak self] in self?.layoutExtensionStrip(animated: false) }
+    addSubview(extensionStrip, positioned: .below, relativeTo: tabsView)
     for view in webOnlyViews { view.alphaValue = 0; view.isHidden = true }
   }
 
@@ -589,6 +603,7 @@ final class TopBarView: NSView {
     let bar = !isWeb ? Theme.background : windowIsActive ? Theme.webBar : Theme.inactiveWebBar
     backgroundLayer.backgroundColor = resolvedCGColor(bar)
     separatorLayer.backgroundColor = resolvedCGColor(Theme.separator)
+    cardOutline.borderColor = resolvedCGColor(Theme.separator)
     progressLayer.backgroundColor = resolvedCGColor(Theme.accent)
   }
 
@@ -656,8 +671,18 @@ final class TopBarView: NSView {
       // (The sidebar needs no line: the page's card has its own edge.)
       separatorLayer.frame = isVertical ? .zero : NSRect(x: 0, y: 0, width: bounds.width, height: 1)
       resizeEdge.frame = NSRect(x: sidebarWidth - 6, y: 0, width: 6, height: bounds.height)
+      let inset = TabLayout.cardInset
+      cardOutline.isHidden = !isVertical
+      cardOutline.frame = NSRect(x: sidebarWidth, y: inset, width: max(0, bounds.width - sidebarWidth - inset),
+                                 height: max(0, bounds.height - 2 * inset)).insetBy(dx: -1, dy: -1)
     }
     if isVertical { return layoutSidebar(animated: animated, added: added, reveal: reveal) }
+    // (Back from the sidebar's strip.)
+    extensionStrip.isHidden = true
+    for entry in extensionButtons where entry.button.superview !== self {
+      addSubview(entry.button, positioned: .below, relativeTo: tabsView)
+      entry.button.frame = .zero
+    }
     Motion.withoutAnimation { tabsView.frame = bounds }
     let h = bounds.height
     let buttonY = (h - 28) / 2
@@ -751,11 +776,17 @@ final class TopBarView: NSView {
       left = incognitoBadge.frame.maxX + 6
     }
     place(extensionsButton, NSRect(x: left, y: bottomY, width: 28, height: 28), animated: false)
-    var extensionX = extensionsButton.frame.maxX + 2
-    for entry in extensionButtons {
-      place(entry.button, NSRect(x: extensionX, y: bottomY, width: 28, height: 28), animated: animated)
-      extensionX += 28 + 2
+    // The pinned extensions after it, scrolling (fading at the ends) when
+    // they don't all fit before search, like the bar's tabs.
+    let stripX = extensionsButton.frame.maxX + 2
+    extensionStrip.isHidden = extensionButtons.isEmpty
+    extensionStrip.frame = NSRect(x: stripX, y: bottomY - 2, width: max(0, searchButton.frame.minX - 4 - stripX), height: 32)
+    extensionStrip.contentLength = CGFloat(extensionButtons.count) * 30 - 2
+    for entry in extensionButtons where entry.button.superview !== extensionStrip {
+      extensionStrip.addSubview(entry.button)
+      entry.button.frame = .zero
     }
+    layoutExtensionStrip(animated: animated)
     // Over the bottom buttons: relaunch to update.
     var tabsBottom = bottom
     if !updatePill.isHidden {
@@ -767,6 +798,14 @@ final class TopBarView: NSView {
     // The tabs, between the two.
     Motion.withoutAnimation { tabsView.frame = NSRect(x: 0, y: tabsBottom, width: w, height: max(0, h - top - tabsBottom)) }
     tabsView.layoutTabs(from: 4, to: tabsView.bounds.height - 4, animated: animated, added: added, reveal: reveal)
+  }
+
+  /// The sidebar's pinned extensions, in their strip as it's scrolled.
+  private func layoutExtensionStrip(animated: Bool) {
+    for (i, entry) in extensionButtons.enumerated() where entry.button.superview === extensionStrip {
+      place(entry.button, NSRect(x: CGFloat(i) * 30 - extensionStrip.scrollOffset, y: 2, width: 28, height: 28),
+            animated: animated && entry.button.frame != .zero)
+    }
   }
 
   private func place(_ view: NSView, _ frame: NSRect, animated: Bool) {
@@ -867,9 +906,50 @@ private final class SidebarEdge: NSView {
   private var startWidth: CGFloat = 0
   private var startX: CGFloat = 0
 
+  /// Lights up along the card's edge while the pointer is on it.
+  private let line = CALayer()
+  private var tracking: NSTrackingArea?
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    line.opacity = 0
+    layer?.addSublayer(line)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
   override var mouseDownCanMoveWindow: Bool { false }
 
   override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+
+  override func layout() {
+    super.layout()
+    Motion.withoutAnimation {
+      line.frame = NSRect(x: bounds.width - 2, y: TabLayout.cardInset + TabLayout.cardRadius, width: 2,
+                          height: max(0, bounds.height - 2 * (TabLayout.cardInset + TabLayout.cardRadius)))
+      line.cornerRadius = 1
+      line.backgroundColor = resolvedCGColor(Theme.tertiaryText)
+    }
+  }
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  override func mouseEntered(with event: NSEvent) { showLine(true) }
+  override func mouseExited(with event: NSEvent) { if !resizing { showLine(false) } }
+
+  private func showLine(_ shown: Bool) {
+    CATransaction.begin()
+    CATransaction.setAnimationDuration(0.15)
+    line.opacity = shown ? 1 : 0
+    CATransaction.commit()
+  }
 
   /// Pressed here (a release alone resizes nothing).
   private var resizing = false
@@ -889,6 +969,7 @@ private final class SidebarEdge: NSView {
     guard resizing else { return }
     resizing = false
     onResize?(startWidth + event.locationInWindow.x - startX, true)
+    if !bounds.contains(convert(event.locationInWindow, from: nil)) { showLine(false) }
   }
 }
 

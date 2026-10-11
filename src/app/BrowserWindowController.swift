@@ -602,38 +602,40 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     _ = knownExtensionIDs
     topBar.translatesAutoresizingMaskIntoConstraints = false
     contentArea.translatesAutoresizingMaskIntoConstraints = false
-    root.addSubview(contentArea)
+    // The content over the bar: it lets clicks through where it shows
+    // nothing, and with vertical tabs the page's card sits on the bar.
     root.addSubview(topBar)
+    root.addSubview(contentArea)
+    contentArea.pinEdges(to: root)
     NSLayoutConstraint.activate([
       topBar.topAnchor.constraint(equalTo: root.topAnchor),
       topBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
       topBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
     ])
-    barConstraints = [
-      topBar.heightAnchor.constraint(equalToConstant: Theme.topBarHeight),
-      contentArea.topAnchor.constraint(equalTo: topBar.bottomAnchor),
-      contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-      contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-      contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-    ]
-    // Vertical tabs: the bar fills the window, its tabs down the left, and
-    // the page is a card over it (its color all around).
-    let inset = TabLayout.cardInset
-    sidebarConstraints = [
-      topBar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-      sidebarWidth,
-      contentArea.topAnchor.constraint(equalTo: root.topAnchor, constant: inset),
-      contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -inset),
-      contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -inset),
-    ]
-    topBar.onResize = { [weak self] width, ended in self?.resizeSidebar(to: width, ended: ended) }
-    applyTabLayout()
-    NotificationCenter.default.addObserver(forName: TabLayout.didChange, object: nil, queue: .main) { [weak self] _ in
-      MainActor.assumeIsolated { self?.applyTabLayout() }
-    }
+    // The notes are always under the top bar. The web is too, or with
+    // vertical tabs it's a card beside the sidebar, its color all around.
+    // Each keeps its place whatever the mode: switching modes moves nothing.
     for view in [journalView, noteView, notesView, webContainer] {
       contentArea.addSubview(view)
-      view.pinEdges(to: contentArea)
+      view.translatesAutoresizingMaskIntoConstraints = false
+    }
+    for view in [journalView, noteView, notesView] { pinUnderBar(view) }
+    webUnderBar = pinUnderBar(webContainer, activate: false)
+    let inset = TabLayout.cardInset
+    webInCard = [
+      sidebarWidth,
+      webContainer.topAnchor.constraint(equalTo: contentArea.topAnchor, constant: inset),
+      webContainer.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor, constant: -inset),
+      webContainer.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor, constant: -inset),
+    ]
+    webContainer.wantsLayer = true
+    webContainer.layer?.cornerCurve = .continuous
+    barHeight = topBar.heightAnchor.constraint(equalToConstant: Theme.topBarHeight)
+    sidebarHeight = topBar.bottomAnchor.constraint(equalTo: root.bottomAnchor)
+    topBar.onResize = { [weak self] width, ended in self?.resizeSidebar(to: width, ended: ended) }
+    applyTabLayout(animated: false)
+    NotificationCenter.default.addObserver(forName: TabLayout.didChange, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.applyTabLayout(animated: false) }
     }
     journalView.navigator = self
     noteView.navigator = self
@@ -660,30 +662,79 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   // MARK: Vertical tabs
 
-  /// The top bar along the window's top, or (vertical tabs) as a sidebar
-  /// down its left, the page beside it.
-  private var barConstraints: [NSLayoutConstraint] = []
-  private var sidebarConstraints: [NSLayoutConstraint] = []
+  /// The top bar along the window's top, or (vertical tabs, in the web) a
+  /// sidebar down its left: the bar spans the window then, its color around
+  /// the page's card.
+  private var barHeight: NSLayoutConstraint!
+  private var sidebarHeight: NSLayoutConstraint!
+  /// The web under the top bar, or in its card (vertical tabs, in every mode).
+  private var webUnderBar: [NSLayoutConstraint] = []
+  private var webInCard: [NSLayoutConstraint] = []
   /// The page card's left edge: the sidebar's width.
-  private lazy var sidebarWidth = contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: TabLayout.sidebarWidth)
+  private lazy var sidebarWidth = webContainer.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor, constant: TabLayout.sidebarWidth)
 
-  private func applyTabLayout() {
-    let vertical = TabLayout.isVertical && mode == .web
+  /// Pins `view` to the content under the top bar.
+  @discardableResult
+  private func pinUnderBar(_ view: NSView, activate: Bool = true) -> [NSLayoutConstraint] {
+    let constraints = [
+      view.topAnchor.constraint(equalTo: contentArea.topAnchor, constant: Theme.topBarHeight),
+      view.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+      view.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+      view.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+    ]
+    if activate { NSLayoutConstraint.activate(constraints) }
+    return constraints
+  }
+
+  /// Lays the bar out as the mode and setting want it. `animated` (a mode
+  /// switch): the old bar fades out over the new one, nothing moving.
+  private func applyTabLayout(animated: Bool) {
+    let card = TabLayout.isVertical
+    let sidebar = card && mode == .web
+    let fade = animated && sidebar != topBar.isVertical && window?.isVisible == true && !Motion.reduceMotion
+    let snapshot = fade ? barSnapshot() : nil
     sidebarWidth.constant = TabLayout.sidebarWidth
     topBar.sidebarWidth = TabLayout.sidebarWidth
-    NSLayoutConstraint.deactivate(vertical ? barConstraints : sidebarConstraints)
-    NSLayoutConstraint.activate(vertical ? sidebarConstraints : barConstraints)
-    // The bar over the page, or (vertical tabs) the card over the bar.
-    root.addSubview(vertical ? contentArea : topBar, positioned: .above, relativeTo: vertical ? topBar : contentArea)
-    contentArea.wantsLayer = true
-    contentArea.layer?.cornerRadius = vertical ? TabLayout.cardRadius : 0
-    contentArea.layer?.cornerCurve = .continuous
-    contentArea.layer?.masksToBounds = vertical
-    for tab in tabs { tab.browserView?.chromeCornerRadius = vertical ? TabLayout.cardRadius : 0 }
-    topBar.isVertical = vertical
+    NSLayoutConstraint.deactivate(card ? webUnderBar : webInCard)
+    NSLayoutConstraint.activate(card ? webInCard : webUnderBar)
+    barHeight.isActive = !sidebar
+    sidebarHeight.isActive = sidebar
+    webContainer.layer?.cornerRadius = card ? TabLayout.cardRadius : 0
+    webContainer.layer?.masksToBounds = card
+    for tab in tabs { tab.browserView?.chromeCornerRadius = card ? TabLayout.cardRadius : 0 }
+    topBar.isVertical = sidebar
     root.layoutSubtreeIfNeeded()
     positionTrafficLights()
     syncOverlayWindow()
+    if let snapshot {
+      // The two bars crossfade (the notes don't hide what's under them).
+      root.addSubview(snapshot, positioned: .above, relativeTo: topBar)
+      snapshot.animateOut(scale: 1, fade: 0.2, duration: 0.2) { snapshot.removeFromSuperview() }
+      topBar.animateIn(scale: 1, fade: 0.2, duration: 0.2)
+    }
+  }
+
+  /// The bar as it looks now, as a view to put in its place.
+  private func barSnapshot() -> NSView? {
+    guard let layer = topBar.layer else { return nil }
+    let bounds = topBar.bounds
+    let scale = window?.backingScaleFactor ?? 2
+    let width = Int((bounds.width * scale).rounded(.up)), height = Int((bounds.height * scale).rounded(.up))
+    guard width > 0, height > 0,
+          let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+    context.scaleBy(x: scale, y: scale)
+    if layer.contentsAreFlipped() {
+      context.translateBy(x: 0, y: bounds.height)
+      context.scaleBy(x: 1, y: -1)
+    }
+    topBar.effectiveAppearance.performAsCurrentDrawingAppearance { layer.render(in: context) }
+    guard let image = context.makeImage() else { return nil }
+    let view = NSView(frame: topBar.frame)
+    view.wantsLayer = true
+    view.layer?.contents = image
+    return view
   }
 
   private func resizeSidebar(to width: CGFloat, ended: Bool) {
@@ -1093,7 +1144,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     // Back and Forward go through the tab's pages, or the notes' places.
     let web = mode == .web
     // Vertical tabs are the web's: the notes keep the top bar.
-    if (TabLayout.isVertical && web) != topBar.isVertical { applyTabLayout() }
+    if (TabLayout.isVertical && web) != topBar.isVertical { applyTabLayout(animated: true) }
     topBar.update(section: section, tabs: infos, groups: groupInfos, activeID: shown.map(ObjectIdentifier.init),
                   canGoBack: web ? shown?.canGoBack ?? false : canGoBackInNotes,
                   canGoForward: web ? shown?.canGoForward ?? false : canGoForwardInNotes,
