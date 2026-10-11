@@ -536,7 +536,12 @@ final class TopBarView: NSView {
     resizeEdge.isHidden = true
     addSubview(resizeEdge)
     extensionStrip.isHidden = true
-    extensionStrip.onScroll = { [weak self] in self?.layoutExtensionStrip(animated: false) }
+    extensionStrip.onScroll = { [weak self] in
+      guard let self else { return }
+      self.layoutExtensionStrip(animated: false)
+      // (They moved under a still pointer: no enter or exit events.)
+      for entry in self.extensionButtons { entry.button.syncHoverWithPointer() }
+    }
     addSubview(extensionStrip, positioned: .below, relativeTo: tabsView)
     for view in webOnlyViews { view.alphaValue = 0; view.isHidden = true }
   }

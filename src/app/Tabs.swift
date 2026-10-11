@@ -1452,8 +1452,11 @@ extension TabsView {
     /// A capsule across the axis: centered in the bar; a sidebar's sit at
     /// the start of their row, as wide as their name.
     func capsuleSpan(_ g: UUID) -> (cross: CGFloat, thickness: CGFloat) {
-      axis == .horizontal ? across(GroupCapsule.height) : across(min(capsuleWidth(g), rowWidth))
+      axis == .horizontal ? across(GroupCapsule.height) : across(0, fills: true)
     }
+    // A sidebar's capsules are drawn at their name's width.
+    for (g, capsule) in capsules { capsule.markerWidth = axis == .vertical ? min(capsuleWidth(g), rowWidth) : nil }
+    previewCapsule?.markerWidth = axis == .vertical ? min(capsuleWidth(Self.previewID), rowWidth) : nil
     let plusSize: CGFloat = axis == .vertical ? rowLength : 28
     let plusLength = plusSize + 6
     let target = dropTarget()
@@ -1614,7 +1617,9 @@ extension TabsView {
       for id in members(info.id) {
         guard let pill = pills[id], pill.superview === tabStrip else { continue }
         pill.isCollapsedAway = true
-        let into = axis == .vertical ? capsuleFrame
+        // (Into what's drawn of it.)
+        let into = axis == .vertical ? NSRect(x: capsuleFrame.minX, y: capsuleFrame.minY,
+                                              width: min(capsuleWidth(info.id), capsuleFrame.width), height: capsuleFrame.height)
           : rect(main: axis.minMain(capsuleFrame), length: axis.length(capsuleFrame), across: pillSpan)
         place(pill, into, animated: animated)
         Motion.animate(animated ? 0.18 : 0) { pill.animator().alphaValue = 0 }
@@ -1630,13 +1635,16 @@ extension TabsView {
       guard let line = underlines[info.id] else { continue }
       // (A dragged group's follows it, below.)
       if case .group(info.id)? = drag?.kind { continue }
+      // Dropped: back in the strip, springing from where it was like its
+      // capsule and tabs.
+      var springsFrom: (position: CGPoint, bounds: CGRect)?
       if line.superlayer !== tabStrip.layer, let stripLayer = tabStrip.layer {
-        // Dropped: back in the strip, from where it was.
         Motion.withoutAnimation {
           let frame = stripLayer.convert(line.frame, from: line.superlayer)
           stripLayer.addSublayer(line)
           line.frame = frame
         }
+        springsFrom = (line.position, line.bounds)
       }
       var parts = ([BarItem.capsule(info.id)] + members(info.id).map { BarItem.tab($0) }).compactMap { frames[$0] }
       // The gap where a dragged tab would join the group.
@@ -1646,7 +1654,19 @@ extension TabsView {
         continue
       }
       line.opacity = 1
-      line.frame = rect(main: axis.minMain(first) + 2, length: max(0, axis.maxMain(last) - axis.minMain(first) - 4), across: groupLineSpan)
+      let frame = rect(main: axis.minMain(first) + 2, length: max(0, axis.maxMain(last) - axis.minMain(first) - 4), across: groupLineSpan)
+      guard let springsFrom, animated, !Motion.reduceMotion else {
+        line.frame = frame
+        continue
+      }
+      Motion.withoutAnimation { line.frame = frame }
+      for (key, from, to) in [("position", NSValue(point: springsFrom.position), NSValue(point: line.position)),
+                              ("bounds", NSValue(rect: springsFrom.bounds), NSValue(rect: line.bounds))] {
+        let spring = Motion.spring(key, stiffness: 420, damping: 34)
+        spring.fromValue = from
+        spring.toValue = to
+        line.add(spring, forKey: "glea.spring.\(key)")
+      }
     }
     CATransaction.commit()
 
@@ -2269,6 +2289,12 @@ private final class GroupCapsule: NSView {
 
   override var mouseDownCanMoveWindow: Bool { false }
 
+  /// Down a sidebar the capsule takes its whole row (it's grabbed anywhere
+  /// on it) but is drawn this wide, at the row's start. Nil: as wide as it is.
+  var markerWidth: CGFloat? {
+    didSet { if markerWidth != oldValue { needsLayout = true } }
+  }
+
   var fittingWidth: CGFloat {
     let text = label.stringValue
     let marker = text.isEmpty ? 16 : min(300, max(22, ceil(label.intrinsicContentSize.width) + 16))
@@ -2300,12 +2326,14 @@ private final class GroupCapsule: NSView {
 
   override func layout() {
     super.layout()
+    // (A sidebar's spans its row, drawn at its start.)
+    let drawn = NSRect(x: 0, y: 0, width: markerWidth.map { min($0, bounds.width) } ?? bounds.width, height: bounds.height)
     Motion.withoutAnimation {
-      ring.frame = bounds
-      fill.frame = bounds.insetBy(dx: Self.ring, dy: Self.ring)
+      ring.frame = drawn
+      fill.frame = drawn.insetBy(dx: Self.ring, dy: Self.ring)
     }
     let h = label.intrinsicContentSize.height
-    label.frame = NSRect(x: Self.ring + 6, y: (bounds.height - h) / 2, width: max(0, bounds.width - 2 * Self.ring - 12), height: h)
+    label.frame = NSRect(x: Self.ring + 6, y: (bounds.height - h) / 2, width: max(0, drawn.width - 2 * Self.ring - 12), height: h)
   }
 
   override func updateTrackingAreas() {
