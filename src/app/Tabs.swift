@@ -1046,7 +1046,9 @@ private final class TabPill: NSView {
     tracking = area
   }
 
-  override func mouseEntered(with event: NSEvent) { hovering = true }
+  // (Not while hidden in its collapsed group's capsule, under the pointer
+  // that collapsed it.)
+  override func mouseEntered(with event: NSEvent) { if !isCollapsedAway { hovering = true } }
   override func mouseExited(with event: NSEvent) { hovering = false }
 
   /// Tabs that move under a still pointer (scrolling the strip) get no
@@ -1572,12 +1574,16 @@ extension TabsView {
       switch item {
       case .tab(let id):
         guard let pill = pills[id], pill.superview === tabStrip else { continue }
+        let expanding = pill.isCollapsedAway
         pill.isCollapsedAway = false
         if added.contains(id) || pill.needsAppear {
           appear(pill, at: frame, animated: animated)
         } else {
           place(pill, frame, animated: animated && isWeb)
         }
+        // Out of its expanding group's capsule: hovered only if the pointer
+        // is where it lands.
+        if expanding { pill.syncHoverWithPointer() }
         if pill.alphaValue < 1 { Motion.animate(animated ? 0.2 : 0) { pill.animator().alphaValue = 1 } }
       case .capsule(let g):
         let capsuleFrame = rect(main: offsets[i] - scroll, length: length(item), across: capsuleSpan(g))
