@@ -2,6 +2,11 @@
 
 What changed in each release of Glea.
 
+## 0.16.3 Beta — 2026-10-11
+
+- Websites you allow to know your location now get it: Glea tells macOS
+  why it asks, which macOS needs before it shares your location.
+
 ## 0.16.2 Beta — 2026-10-11
 
 - Settings, in Glea ▸ Settings… (<kbd>⌘,</kbd>): its Browser pane has
