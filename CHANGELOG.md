@@ -38,8 +38,8 @@ What changed in each release of Glea.
   view.
 - While you're in a table, a + on its bottom edge adds a row and one on its
   right edge adds a column.
-- Tables in quotes and callouts show as tables, and Enter and Tab keep new
-  rows in the quote.
+- Tables in quotes and callouts show as tables, and <kbd>Enter</kbd> and
+  <kbd>Tab</kbd> keep new rows in the quote.
 - A table's grip lines up with its header, like other blocks'.
 
 ## 0.15.4 Beta — 2026-10-08
@@ -68,7 +68,7 @@ What changed in each release of Glea.
 ## 0.15.1 Beta — 2026-10-04
 
 - "Collected to" and the capture picker stay on the window when it moves.
-- Option-Return in the capture picker collects, instead of creating a
+- <kbd>⌥↩</kbd> in the capture picker collects, instead of creating a
   note with an empty name.
 
 ## 0.15.0 Beta — 2026-10-04
@@ -83,7 +83,7 @@ What changed in each release of Glea.
 ## 0.14.0 — 2026-10-04
 
 - Glea Clipper browser extensions (Chrome, Firefox, Safari) collect
-  into Glea through glea://capture: point and shoot, selections,
+  into Glea through `glea://capture`: point and shoot, selections,
   articles, images and links.
 - Point and shoot shows on Reddit and leaves icons out of captures.
 - Long notes open faster, styled from the top a part at a time.
@@ -119,7 +119,8 @@ What changed in each release of Glea.
   with collapsing, renaming, undo and a table of contents for the groups.
 - More blocks in the slash menu: callouts, math, media files, web embeds
   and embedded notes.
-- All Notes on ⇧⌘H, and fixes to callouts, the cursor and inline code.
+- All Notes on <kbd>⇧⌘H</kbd>, and fixes to callouts, the cursor and inline
+  code.
 
 ## 0.11.1 — 2026-10-02
 
@@ -129,10 +130,10 @@ What changed in each release of Glea.
 
 ## 0.11.0 — 2026-10-02
 
-- Obsidian compatibility: links to headings and blocks, ![[embeds]] of
+- Obsidian compatibility: links to headings and blocks, `![[embeds]]` of
   files and notes (rendered in place), frontmatter properties, aliases and
-  tags, #tags, ==highlights==, %%comments%% and callouts. The link menu
-  completes headings and blocks, and "#" completes tags.
+  tags, `#tags`, `==highlights==`, `%%comments%%` and callouts. The link menu
+  completes headings and blocks, and `#` completes tags.
 
 ## 0.10.1 — 2026-10-01
 
@@ -143,13 +144,14 @@ What changed in each release of Glea.
 ## 0.10.0 — 2026-10-01
 
 - Math in notes: `$…$` and `$$…$$` LaTeX, typeset as you write. Click a
-  formula to edit its source where you clicked; "\" offers LaTeX commands,
-  Tab moves between their arguments.
+  formula to edit its source where you clicked; `\` offers LaTeX commands,
+  <kbd>Tab</kbd> moves between their arguments.
 
 ## 0.9.1 — 2026-10-01
 
-- ⌘↩ searches the web for the word at the cursor or the selection (⌥⌘↩:
-  the sentence) and links the searched text to the search.
+- <kbd>⌘↩</kbd> searches the web for the word at the cursor or the
+  selection (<kbd>⌥⌘↩</kbd>: the sentence) and links the searched text to
+  the search.
 - Switching between the web and the notes keeps the cursor where it was.
 - Typing is fast again on long notes.
 - No white line around web pages in light mode; the active tab stands out
@@ -171,7 +173,7 @@ What changed in each release of Glea.
 
 - Point and shoot collects YouTube videos and X, Bluesky and Instagram
   posts as embeds, on those sites and on pages that embed them. Hold
-  ⌥⌘ to collect their text instead.
+  <kbd>⌥⌘</kbd> to collect their text instead.
 - The Collected toast links to the note, stays longer, and stays while
   hovered.
 - Fixes crashes when clicking links in notes.
@@ -180,7 +182,7 @@ What changed in each release of Glea.
 
 - Daily summary: today's journal recaps what you worked on and read on
   your last active day, and suggests where to pick up.
-- Typing [[ in a note opens a menu of notes to link to, styled like the
+- Typing `[[` in a note opens a menu of notes to link to, styled like the
   slash menu, with an option to link to a new note.
 
 ## 0.7.3 — 2026-09-30
