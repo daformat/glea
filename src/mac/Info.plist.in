@@ -31,6 +31,18 @@
   <key>SUEnableAutomaticChecks</key><true/>
   <key>SUAutomaticallyUpdate</key><true/>
   <key>SUScheduledCheckInterval</key><integer>21600</integer>
+  <!-- A browser: macOS lists the apps that open web links (http, https)
+       and web pages (HTML) under Default web browser. Alternate: .html
+       files only open here when Glea is the default browser. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Web page</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>public.html</string><string>public.xhtml</string></array>
+    </dict>
+  </array>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>
