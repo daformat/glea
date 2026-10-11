@@ -2,6 +2,10 @@
 
 What changed in each release of Glea.
 
+## 0.16.1 Beta — 2026-10-11
+
+- Expanding a tab group no longer leaves its tabs looking hovered.
+
 ## 0.16.0 Beta — 2026-10-11
 
 - Vertical tabs, in View ▸ Vertical Tabs: browsing gets a sidebar down the
