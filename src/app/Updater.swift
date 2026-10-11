@@ -52,6 +52,24 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUUserDriver {
   /// and while a check runs).
   var canCheckForUpdates: Bool { updater?.canCheckForUpdates ?? false }
 
+  /// What an update in the background is doing now (the downloads are
+  /// Sparkle's, unseen: only its delegate hears of them).
+  private enum Activity: Equatable {
+    case idle
+    case downloading(String)
+    case preparing(String)
+  }
+  private var activity = Activity.idle
+
+  /// "Check for Updates…", or, while it can't run, what's happening instead.
+  var menuTitle: String {
+    switch activity {
+    case .downloading(let version): return "Downloading Glea \(version)…"
+    case .preparing(let version): return "Preparing Glea \(version)…"
+    case .idle: return updater != nil && !canCheckForUpdates ? "Checking for Updates…" : "Check for Updates…"
+    }
+  }
+
   func start() {
     let environment = ProcessInfo.processInfo.environment
     // Only Developer ID builds: a local build (signed ad hoc) would otherwise
@@ -101,6 +119,26 @@ final class Updater: NSObject, SPUUpdaterDelegate, SPUUserDriver {
 
   func feedURLString(for updater: SPUUpdater) -> String? {
     ProcessInfo.processInfo.environment["GLEA_UPDATE_FEED"]
+  }
+
+  func updater(_ updater: SPUUpdater, willDownloadUpdate item: SUAppcastItem, with request: NSMutableURLRequest) {
+    activity = .downloading(item.displayVersionString)
+  }
+
+  func updater(_ updater: SPUUpdater, willExtractUpdate item: SUAppcastItem) {
+    activity = .preparing(item.displayVersionString)
+  }
+
+  func updater(_ updater: SPUUpdater, didExtractUpdate item: SUAppcastItem) {
+    activity = .idle
+  }
+
+  func updater(_ updater: SPUUpdater, failedToDownloadUpdate item: SUAppcastItem, error: Error) {
+    activity = .idle
+  }
+
+  func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?) {
+    activity = .idle
   }
 
   /// Downloaded in the background, and set to install on quit: offered now

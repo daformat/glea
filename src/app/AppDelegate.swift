@@ -419,7 +419,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     if item.action == #selector(toggleVerticalTabs(_:)) { item.state = TabLayout.isVertical ? .on : .off }
     // (Builds that don't update, or a check already running.)
-    if item.action == #selector(checkForUpdates(_:)) { return Updater.shared.canCheckForUpdates }
+    if item.action == #selector(checkForUpdates(_:)) {
+      // (Disabled while an update downloads: it says so.)
+      item.title = Updater.shared.menuTitle
+      return Updater.shared.canCheckForUpdates
+    }
     return true
   }
 }
