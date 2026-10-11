@@ -2,6 +2,18 @@
 
 What changed in each release of Glea.
 
+## 0.16.0 Beta — 2026-10-11
+
+- Vertical tabs, in View ▸ Vertical Tabs: browsing gets a sidebar down the
+  window's left, with the traffic lights, navigation, the tabs and the
+  bar's buttons, the page beside it as a rounded card. Pinned tabs are
+  tiles at its top; drag a tab onto them to pin it. Groups, collapsing and
+  <kbd>⌥</kbd>-dragging a tab onto another to group them work as in the
+  bar. Drag the sidebar's edge to resize it. The notes keep their top bar.
+- Dragging a tab group, its line moves with it, and the other tabs keep
+  their widths.
+- Embeds in notes no longer show in your browsing history.
+
 ## 0.15.9 Beta — 2026-10-10
 
 - Folding opens and closes with its height everywhere, where some only
