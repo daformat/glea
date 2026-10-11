@@ -152,6 +152,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     app.addItem(withTitle: "About Glea", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
     app.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "").target = self
     app.addItem(.separator())
+    app.addItem(withTitle: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
+    app.addItem(.separator())
     let engines = NSMenu(title: "Search Engine")
     for (index, engine) in SearchEngine.allCases.enumerated() {
       let item = NSMenuItem(title: engine.name, action: #selector(setSearchEngine(_:)), keyEquivalent: "")
@@ -401,6 +403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   @objc private func setSearchEngine(_ sender: NSMenuItem) {
     SearchEngine.current = SearchEngine.allCases[sender.tag]
+  }
+
+  @objc private func showSettings(_ sender: Any?) {
+    SettingsWindow.shared.show()
   }
 
   @objc private func toggleVerticalTabs(_ sender: Any?) {

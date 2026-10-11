@@ -8,9 +8,7 @@ import AppKit
 enum TabLayout {
   static let didChange = Notification.Name("app.glea.tabLayoutDidChange")
 
-  /// (Test copies keep their own, not to switch the real app's.)
-  private static let defaults = ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] == "1"
-    ? UserDefaults(suiteName: "app.glea.test-copy") ?? .standard : .standard
+  private static var defaults: UserDefaults { AppDefaults.store }
 
   static var isVertical: Bool {
     get { defaults.bool(forKey: "verticalTabs") }

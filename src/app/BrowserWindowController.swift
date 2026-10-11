@@ -2057,7 +2057,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       setMode(.notes)
       notesView.search("#" + tag)
     } else if url.scheme == "http" || url.scheme == "https" {
-      openTab(url.absoluteString, background: NSApp.currentEvent?.modifierFlags.contains(.command) == true)
+      // (Or in another browser: Settings ▸ Browser.)
+      let background = NSApp.currentEvent?.modifierFlags.contains(.command) == true
+      if LinkOpening.openElsewhere(url, background: background) { return }
+      openTab(url.absoluteString, background: background)
     } else {
       NSWorkspace.shared.open(url)
     }
