@@ -2,6 +2,14 @@
 
 What changed in each release of Glea.
 
+## 0.17.1 Beta — 2026-10-16
+
+- A new journal starts with Glea 101 on the day before today: the few
+  shortcuts and tricks to get going, and a link to the User Guide.
+- An empty All Notes says so, with a button to write your first note.
+- Keys written as `<kbd>⌘K</kbd>` show as keycaps in your notes.
+- Inline code has rounded corners.
+
 ## 0.17.0 Beta — 2026-10-16
 
 - Find in your notes: <kbd>⌘F</kbd> searches the note you're reading, or
