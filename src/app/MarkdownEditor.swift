@@ -1529,6 +1529,9 @@ final class MarkdownLayoutManager: NSLayoutManager {
   /// How far each table wider than the text is scrolled sideways, by its
   /// first row's location (kept there as the text before it changes).
   var tableScroll: [Int: CGFloat] = [:]
+  /// What ⌘F found in the text, and the match it's on.
+  var findMatches: [NSRange] = []
+  var currentFindMatch: NSRange?
 
   /// How far a row's table is scrolled, within its bounds.
   func scrollX(of row: MarkdownTableRow) -> CGFloat {
@@ -1711,6 +1714,17 @@ final class MarkdownLayoutManager: NSLayoutManager {
         text.draw(with: row.cellRect(column, in: cells), options: [.usesLineFragmentOrigin, .usesFontLeading])
       }
       NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // What ⌘F found, the current match stronger.
+    for match in findMatches where NSIntersectionRange(match, chars).length > 0 && NSMaxRange(match) <= storage.length {
+      let glyphs = glyphRange(forCharacterRange: match, actualCharacterRange: nil)
+      let color = match == currentFindMatch ? Theme.findCurrent : Theme.findMatch
+      enumerateEnclosingRects(forGlyphRange: glyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0), in: container) { rect, _ in
+        guard rect.width > 0, rect.height > 0 else { return }
+        color.setFill()
+        NSBezierPath(roundedRect: rect.offsetBy(dx: origin.x, dy: origin.y).insetBy(dx: -1, dy: 0), xRadius: 3, yRadius: 3).fill()
+      }
     }
 
     // Formulas, over their hidden source: inline ones on the line's baseline
@@ -4866,6 +4880,43 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     // the text holding the link) while AppKit is still handling it.
     if let url, let open = onOpenLink { DispatchQueue.main.async { open(url) } }
     return true
+  }
+
+  /// Where `text` is in what the note shows (ignoring case and accents),
+  /// not in the syntax it hides, like a link's address.
+  func findMatches(of text: String) -> [NSRange] {
+    guard !text.isEmpty else { return [] }
+    finishStyling()
+    let content = storage.string as NSString
+    var matches: [NSRange] = []
+    var searchRange = NSRange(location: 0, length: content.length)
+    while searchRange.length > 0 {
+      let found = content.range(of: text, options: [.caseInsensitive, .diacriticInsensitive], range: searchRange)
+      guard found.location != NSNotFound, found.length > 0 else { break }
+      if !isConcealed(found) { matches.append(found) }
+      searchRange = NSRange(location: NSMaxRange(found), length: content.length - NSMaxRange(found))
+    }
+    return matches
+  }
+
+  /// Hidden characters are drawn clear.
+  private func isConcealed(_ range: NSRange) -> Bool {
+    var concealed = false
+    storage.enumerateAttribute(.foregroundColor, in: range) { value, _, stop in
+      if let color = value as? NSColor, (color.usingColorSpace(.sRGB)?.alphaComponent ?? 1) == 0 {
+        concealed = true
+        stop.pointee = true
+      }
+    }
+    return concealed
+  }
+
+  /// Highlights what ⌘F found in the text (none clears it).
+  func showFindMatches(_ matches: [NSRange], current: NSRange?) {
+    guard matches != layoutManager.findMatches || current != layoutManager.currentFindMatch else { return }
+    layoutManager.findMatches = matches
+    layoutManager.currentFindMatch = current
+    textView.needsDisplay = true
   }
 
   /// The line containing `index`, in this view's coordinates.

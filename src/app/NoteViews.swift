@@ -82,6 +82,7 @@ class ColumnPageView: NSView {
     // Heading positions settle only after the editors lay out.
     document.postsFrameChangedNotifications = true
     NotificationCenter.default.addObserver(self, selector: #selector(pageScrolled), name: NSView.frameDidChangeNotification, object: document)
+    NotificationCenter.default.addObserver(self, selector: #selector(findTextChanged(_:)), name: NSText.didChangeNotification, object: nil)
   }
 
   required init?(coder: NSCoder) { fatalError() }
@@ -193,12 +194,13 @@ class ColumnPageView: NSView {
   /// Scrolls a place in the page (a heading jumped to) near the top. It's
   /// found again as the page scrolls: blocks loading above it push it down,
   /// and the scroll and its highlight go along.
-  func scroll(to locate: @escaping () -> NSRect?, completion: (() -> Void)? = nil) {
+  /// `offset` is how far below the top it ends up; `highlight` lights it up.
+  func scroll(to locate: @escaping () -> NSRect?, offset: CGFloat = 40, highlight: Bool = true, completion: (() -> Void)? = nil) {
     guard let rect = locate() else { return }
     let clip = scrollView.contentView
     // The heading lights up at once and rides in with the page (the scroll
     // looks settled well before its end), fading once it has arrived.
-    flash(rect, locate: locate, fadingAfter: 0.5)
+    if highlight { flash(rect, locate: locate, fadingAfter: 0.5) }
     scrollTimer?.invalidate()
     scrollTimer = nil
     let duration: CFTimeInterval = Motion.reduceMotion ? 0 : 0.5
@@ -208,7 +210,7 @@ class ColumnPageView: NSView {
     // (it may have scrolled to keep what's in view in place).
     let step = { [weak self] () -> Bool in
       guard let self, let rect = locate() else { return true }
-      let y = min(max(0, rect.minY - 40), max(0, self.document.bounds.height - clip.bounds.height))
+      let y = min(max(0, rect.minY - offset), max(0, self.document.bounds.height - clip.bounds.height))
       let t = duration > 0 ? min(1, (CACurrentMediaTime() - start) / duration) : 1
       let next = CGFloat(CubicBezier.easeOut(t))
       let current = clip.bounds.minY
@@ -262,6 +264,135 @@ class ColumnPageView: NSView {
     }
     highlight.layer?.add(fade, forKey: "flash")
     CATransaction.commit()
+  }
+
+  // MARK: Find (⌘F)
+
+  /// The editors ⌘F searches, in page order.
+  var searchableEditors: [MarkdownEditorView] { [] }
+
+  private struct FindMatch {
+    weak var editor: MarkdownEditorView?
+    /// The editor's place in the page, to order matches across editors.
+    var editorIndex: Int
+    var range: NSRange
+  }
+
+  private var findText = ""
+  private var findMatches: [FindMatch] = []
+  private var findIndex: Int?
+  /// The text changed while finding: the new count, and which is current.
+  var onFindResult: ((Int, Int) -> Void)?
+
+  /// Finds `text` in the page (ignoring case and accents) and highlights
+  /// every match. Typing stays on the match it was on (or the first one
+  /// in view); `findNext` moves to the next or previous one. Returns how
+  /// many there are and which is current, from 1.
+  func find(_ text: String, forward: Bool, findNext: Bool) -> (count: Int, active: Int) {
+    let previous = findIndex.map { findMatches[$0] }
+    let sameText = text == findText
+    collectMatches(text)
+    guard !findMatches.isEmpty else {
+      findIndex = nil
+      highlightMatches()
+      return (0, 0)
+    }
+    if findNext, sameText, let previous, let index = findMatches.firstIndex(where: { $0.editor === previous.editor && $0.range == previous.range }) {
+      findIndex = (index + (forward ? 1 : findMatches.count - 1)) % findMatches.count
+    } else if let previous {
+      findIndex = firstMatch(from: previous) ?? 0
+    } else {
+      findIndex = firstMatchInView()
+    }
+    highlightMatches()
+    showCurrentMatch()
+    return (findMatches.count, (findIndex ?? 0) + 1)
+  }
+
+  /// Clears the highlights. `selecting` puts the cursor on the current
+  /// match (the find bar closed), true if there was one.
+  @discardableResult
+  func endFind(selecting: Bool) -> Bool {
+    let current = findIndex.map { findMatches[$0] }
+    findText = ""
+    findMatches = []
+    findIndex = nil
+    for editor in searchableEditors { editor.showFindMatches([], current: nil) }
+    guard selecting, let current, let editor = current.editor, NSMaxRange(current.range) <= editor.textView.string.utf16.count,
+          window?.makeFirstResponder(editor.textView) == true else { return false }
+    editor.textView.setSelectedRange(current.range)
+    return true
+  }
+
+  private func collectMatches(_ text: String) {
+    findText = text
+    findMatches = []
+    guard !text.isEmpty else { return }
+    for (editorIndex, editor) in searchableEditors.enumerated() {
+      findMatches += editor.findMatches(of: text).map { FindMatch(editor: editor, editorIndex: editorIndex, range: $0) }
+    }
+  }
+
+  /// The first match at or after where `match` starts.
+  private func firstMatch(from match: FindMatch) -> Int? {
+    findMatches.firstIndex {
+      $0.editorIndex > match.editorIndex || ($0.editorIndex == match.editorIndex && $0.range.location >= match.range.location)
+    }
+  }
+
+  /// The first match that isn't above the visible part of the page.
+  private func firstMatchInView() -> Int {
+    let top = scrollView.contentView.bounds.minY
+    return findMatches.firstIndex { match in
+      // Not laid out yet: further down.
+      guard let rect = locate(match) else { return true }
+      return rect.maxY > top
+    } ?? 0
+  }
+
+  private func locate(_ match: FindMatch) -> NSRect? {
+    guard let editor = match.editor, let rect = editor.lineRect(forCharacterAt: match.range.location) else { return nil }
+    return editor.convert(rect, to: document)
+  }
+
+  private func highlightMatches() {
+    let current = findIndex.map { findMatches[$0] }
+    for editor in searchableEditors {
+      let ranges = findMatches.filter { $0.editor === editor }.map(\.range)
+      editor.showFindMatches(ranges, current: current?.editor === editor ? current?.range : nil)
+    }
+  }
+
+  /// Scrolls the current match into view (opening the sections folded
+  /// over it), unless it's already there, and points it out.
+  private func showCurrentMatch() {
+    guard let index = findIndex, let editor = findMatches[index].editor else { return }
+    let match = findMatches[index]
+    editor.reveal(match.range.location)
+    layoutSubtreeIfNeeded()
+    guard let rect = locate(match) else { return }
+    let indicate = { [weak editor] in
+      guard let editor, NSMaxRange(match.range) <= editor.textView.string.utf16.count else { return }
+      editor.textView.showFindIndicator(for: match.range)
+    }
+    let visible = scrollView.contentView.bounds
+    if rect.minY >= visible.minY + 40, rect.maxY <= visible.maxY - 40 {
+      indicate()
+    } else {
+      scroll(to: { [weak self] in self?.locate(match) }, offset: visible.height / 3, highlight: false, completion: indicate)
+    }
+  }
+
+  /// The text changed while finding: the matches follow, without moving
+  /// the page.
+  @objc private func findTextChanged(_ notification: Notification) {
+    guard !findText.isEmpty, let text = notification.object as? NSTextView,
+          searchableEditors.contains(where: { $0.textView === text }) else { return }
+    let previous = findIndex.map { findMatches[$0] }
+    collectMatches(findText)
+    findIndex = findMatches.isEmpty ? nil : previous.flatMap(firstMatch(from:)) ?? 0
+    highlightMatches()
+    onFindResult?(findMatches.count, (findIndex ?? -1) + 1)
   }
 
   /// The page was laid out again: the highlight moves with its heading
@@ -826,6 +957,8 @@ final class JournalView: ColumnPageView {
     reload()
   }
 
+  override var searchableEditors: [MarkdownEditorView] { shownDays.compactMap { editors[$0] } }
+
   func focusToday() {
     guard let editor = editors[NoteStore.shared.today] else { return }
     editor.focus()
@@ -952,6 +1085,8 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
   }
 
   func focusEditor() { editor?.focus() }
+
+  override var searchableEditors: [MarkdownEditorView] { [editor].compactMap { $0 } }
 
   /// Scrolls to a heading (`[[Note#Heading]]`) or a block (`[[Note#^id]]`)
   /// of the note shown. False if it has none by that name.
@@ -1380,6 +1515,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// can't scroll it to the top; cleared when the reader scrolls.
   private var pinnedGroup: (index: Int, origin: CGFloat)?
   private let searchField = BorderlessSearchField()
+  /// Just its magnifier until the search is focused or filters the list.
+  private lazy var searchPill = SearchPill(field: searchField)
   private let countLabel = NSTextField.label("", size: 13, color: Theme.tertiaryText)
   private var items: [NotesListItem] = []
   /// Notes checked with their row's checkbox.
@@ -1427,7 +1564,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     searchField.isBezeled = false
     searchField.drawsBackground = false
     searchField.translatesAutoresizingMaskIntoConstraints = false
-    let searchPill = SearchPill(field: searchField)
+    searchField.onFocus = { [weak self] in self?.updateSearchPill() }
+    searchPill.onClickIcon = { [weak self] in self?.focusSearch() }
     let newButton = IconButton(symbol: "plus", tooltip: "New Note (⌥⌘N)", target: self, action: #selector(newNote))
 
     let titleGroup = NSStackView(views: [title, countLabel])
@@ -1451,7 +1589,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     controls.setViews([searchPill, newButton, trashSlot], in: .leading)
     // (The slot has the gap before the button.)
     controls.setCustomSpacing(0, after: newButton)
-    controls.spacing = 12
+    controls.spacing = 4  // like the trash button's gap
     controls.alignment = .centerY
     controls.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1509,7 +1647,6 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       header.widthAnchor.constraint(lessThanOrEqualToConstant: Theme.columnWidth + 100),
       header.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 24),
       preferred,
-      searchPill.widthAnchor.constraint(equalToConstant: 200),
       controls.trailingAnchor.constraint(equalTo: header.trailingAnchor),
       controls.centerYAnchor.constraint(equalTo: title.firstBaselineAnchor, constant: -((title.font?.capHeight ?? 21) / 2).rounded()),
       controls.leadingAnchor.constraint(greaterThanOrEqualTo: countLabel.trailingAnchor, constant: 12),
@@ -1666,11 +1803,24 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// Shows the notes matching `query` (a "#tag" from a note).
   func search(_ query: String) {
     searchField.stringValue = query
+    updateSearchPill()
     reload()
   }
 
   func focusSearch() {
     window?.makeFirstResponder(searchField)
+  }
+
+  /// Open while it's being typed in or has text.
+  private func updateSearchPill() {
+    let editing = (window?.firstResponder as? NSText)?.delegate === searchField
+    searchPill.setOpen(editing || !searchField.stringValue.isEmpty, animated: window?.isVisible == true)
+  }
+
+  func controlTextDidEndEditing(_ obj: Notification) {
+    guard obj.object as? NSSearchField === searchField else { return }
+    // The field editor is still its first responder until this returns.
+    DispatchQueue.main.async { [weak self] in self?.updateSearchPill() }
   }
 
   @objc private func notesChanged() {
@@ -1684,6 +1834,11 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
     if selector == #selector(NSResponder.insertNewline(_:)), let first = notes.first {
       navigator?.openNote(first)
+      return true
+    }
+    // Esc clears the search, then closes it.
+    if selector == #selector(NSResponder.cancelOperation(_:)), searchField.stringValue.isEmpty {
+      window?.makeFirstResponder(nil)
       return true
     }
     return false
@@ -1708,52 +1863,18 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   private func updateTrashButton() {
     let show = !checkedNotes.isEmpty
     if show { trashButton.isHidden = false }
-    let target: CGFloat = show ? 1 : 0
-    trashTimer?.invalidate()
-    trashTimer = nil
-    guard window?.isVisible == true, !Motion.reduceMotion else {
-      trashProgress = target
-      trashVelocity = 0
-      applyTrashProgress()
-      return
-    }
-    var last = CACurrentMediaTime()
-    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
-      MainActor.assumeIsolated {
-        guard let self else { return timer.invalidate() }
-        let now = CACurrentMediaTime()
-        var remaining = min(now - last, 1.0 / 30)
-        last = now
-        while remaining > 0 {
-          let step = min(remaining, 1.0 / 480)
-          let acceleration = -Self.springStiffness * (self.trashProgress - target) - Self.springDamping * self.trashVelocity
-          self.trashVelocity += acceleration * step
-          self.trashProgress += self.trashVelocity * step
-          remaining -= step
-        }
-        if abs(self.trashProgress - target) < 0.002 && abs(self.trashVelocity) < 0.02 {
-          self.trashProgress = target
-          self.trashVelocity = 0
-          timer.invalidate()
-          self.trashTimer = nil
-        }
-        self.applyTrashProgress()
-      }
-    }
-    RunLoop.main.add(timer, forMode: .common)
-    trashTimer = timer
+    trashSpring.move(to: show ? 1 : 0, animated: window?.isVisible == true)
   }
 
-  /// A soft spring: it settles with a touch of overshoot.
-  private static let springStiffness: CGFloat = 350
-  private static let springDamping: CGFloat = 23.8
   /// How far in the trash button is, from 0 (gone) to 1 (it overshoots a little).
-  private var trashProgress: CGFloat = 0
-  private var trashVelocity: CGFloat = 0
-  private var trashTimer: Timer?
+  private lazy var trashSpring: Spring = {
+    let spring = Spring(0)
+    spring.onChange = { [weak self] _ in self?.applyTrashProgress() }
+    return spring
+  }()
 
   private func applyTrashProgress() {
-    let progress = max(0, trashProgress)
+    let progress = max(0, trashSpring.value)
     trashSlotWidth.constant = (4 + 28) * progress
     layoutSubtreeIfNeeded()
     // After layout (AppKit resets the transform when it moves the button).
@@ -2470,6 +2591,14 @@ private final class NotesTableView: NSTableView {
     return found >= 0 ? found : row(at: point)
   }
 
+  /// Whether `point` is on the row's visible surface (where it highlights),
+  /// not in the gutters on its sides.
+  private func isOnSurface(_ point: NSPoint, row: Int) -> Bool {
+    guard row >= 0, let rowView = rowView(atRow: row, makeIfNecessary: false) as? RoundedRowView else { return row >= 0 }
+    let inset = rowView.inset + 4
+    return point.x >= rowView.frame.minX + inset && point.x <= rowView.frame.maxX - inset
+  }
+
   override func mouseDown(with event: NSEvent) {
     let start = convert(event.locationInWindow, from: nil)
     let row = rowShown(at: start)
@@ -2478,6 +2607,8 @@ private final class NotesTableView: NSTableView {
     guard row >= 0, !(hit is IconButton), !(hit is SelectionCheckbox), !(hit is NSTextView) else {
       return super.mouseDown(with: event)
     }
+    // The gutters neither open nor drag a note.
+    guard isOnSurface(start, row: row) else { return }
     var lifted = false
     while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp, .keyDown]) {
       switch next.type {
@@ -2506,8 +2637,9 @@ private final class NotesTableView: NSTableView {
 
   /// Without NSTableView's own handling, which outlines the clicked row.
   override func menu(for event: NSEvent) -> NSMenu? {
-    let row = row(at: convert(event.locationInWindow, from: nil))
-    return row >= 0 ? menuForRow?(row) : nil
+    let point = convert(event.locationInWindow, from: nil)
+    let row = row(at: point)
+    return row >= 0 && isOnSurface(point, row: row) ? menuForRow?(row) : nil
   }
 
   override func validateProposedFirstResponder(_ responder: NSResponder, for event: NSEvent?) -> Bool {
@@ -2526,6 +2658,14 @@ private final class BorderlessSearchField: NSSearchField {
     get { BorderlessSearchFieldCell.self }
     set {}
   }
+  var onFocus: (() -> Void)?
+
+  override func becomeFirstResponder() -> Bool {
+    guard super.becomeFirstResponder() else { return false }
+    // Once its field editor has taken over.
+    DispatchQueue.main.async { [weak self] in self?.onFocus?() }
+    return true
+  }
 }
 
 /// Without a bezel, the search cell edits across its full width, over the
@@ -2540,28 +2680,130 @@ private final class BorderlessSearchFieldCell: NSSearchFieldCell {
   }
 }
 
+/// The notes' search: its magnifier alone (like the + next to it) until
+/// it opens, growing to the left into a field on the trash button's spring.
 private final class SearchPill: NSView {
+  static let openWidth: CGFloat = 200
+  private let field: NSSearchField
+  private let icon = IconButton(symbol: "magnifyingglass", size: 12, tooltip: "Filter Notes (⌘F)", target: nil, action: nil)
+  private lazy var width = widthAnchor.constraint(equalToConstant: 28)
+  var onClickIcon: (() -> Void)?
+  private lazy var spring: Spring = {
+    let spring = Spring(0)
+    spring.onChange = { [weak self] _ in self?.applyProgress() }
+    return spring
+  }()
+
   init(field: NSSearchField) {
+    self.field = field
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
+    wantsLayer = true
+    layer?.masksToBounds = true
+    // The pill's own magnifier stays put on its left.
+    (field.cell as? NSSearchFieldCell)?.searchButtonCell = nil
+    icon.target = self
+    icon.action = #selector(iconClicked)
     addSubview(field)
+    addSubview(icon)
     NSLayoutConstraint.activate([
-      field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-      field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+      icon.leadingAnchor.constraint(equalTo: leadingAnchor),
+      icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+      field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
+      field.widthAnchor.constraint(equalToConstant: SearchPill.openWidth - 24 - 4),
       field.centerYAnchor.constraint(equalTo: centerYAnchor),
       heightAnchor.constraint(equalToConstant: 28),
+      width,
     ])
+    applyProgress()
   }
 
   required init?(coder: NSCoder) { fatalError() }
 
+  @objc private func iconClicked() { onClickIcon?() }
+
+  func setOpen(_ open: Bool, animated: Bool) {
+    // Closing, it would hit its smallest size at speed and stop dead.
+    spring.move(to: open ? 1 : 0, animated: animated, overshoot: open)
+  }
+
+  private func applyProgress() {
+    let progress = spring.value
+    width.constant = 28 + (SearchPill.openWidth - 28) * max(0, progress)
+    field.alphaValue = min(1, max(0, (progress - 0.3) / 0.7))
+    // Open, the magnifier is part of the field, not a button.
+    icon.isInteractive = progress < 0.5
+    needsDisplay = true
+    // It moves under a still pointer, which gets no enter or exit events.
+    layoutSubtreeIfNeeded()
+    icon.syncHoverWithPointer()
+  }
+
   override func draw(_ dirtyRect: NSRect) {
+    let alpha = min(1, max(0, spring.value))
+    guard alpha > 0, let context = NSGraphicsContext.current?.cgContext else { return }
+    context.setAlpha(alpha)
     let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
     let path = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
     Theme.searchFill.setFill()
     path.fill()
     Theme.searchStroke.setStroke()
     path.stroke()
+  }
+}
+
+/// A soft spring (it settles with a touch of overshoot) taking `value` to
+/// a target, frame by frame.
+@MainActor
+private final class Spring {
+  private static let stiffness: CGFloat = 350
+  private static let damping: CGFloat = 23.8
+  private(set) var value: CGFloat
+  private var velocity: CGFloat = 0
+  private var timer: Timer?
+  var onChange: ((CGFloat) -> Void)?
+
+  init(_ value: CGFloat) { self.value = value }
+
+  /// Without `overshoot`, it's stiffer and damped just enough to arrive
+  /// without passing the target (for what can't go past it, like a closing
+  /// field): as brisk, without the long ease into place.
+  func move(to target: CGFloat, animated: Bool, overshoot: Bool = true) {
+    let stiffness = overshoot ? Spring.stiffness : 900
+    let damping = overshoot ? Spring.damping : 2 * stiffness.squareRoot()
+    timer?.invalidate()
+    timer = nil
+    guard animated, !Motion.reduceMotion else {
+      value = target
+      velocity = 0
+      onChange?(value)
+      return
+    }
+    var last = CACurrentMediaTime()
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard let self else { return timer.invalidate() }
+        let now = CACurrentMediaTime()
+        var remaining = min(now - last, 1.0 / 30)
+        last = now
+        while remaining > 0 {
+          let step = min(remaining, 1.0 / 480)
+          let acceleration = -stiffness * (self.value - target) - damping * self.velocity
+          self.velocity += acceleration * step
+          self.value += self.velocity * step
+          remaining -= step
+        }
+        if abs(self.value - target) < 0.002 && abs(self.velocity) < 0.02 {
+          self.value = target
+          self.velocity = 0
+          timer.invalidate()
+          self.timer = nil
+        }
+        self.onChange?(self.value)
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    self.timer = timer
   }
 }
 

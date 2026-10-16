@@ -68,6 +68,13 @@ enum Theme {
   static let accentWash = dynamic(
     light: NSColor(srgbRed: 0.33, green: 0.35, blue: 0.95, alpha: 0.10),
     dark: NSColor(srgbRed: 0.55, green: 0.58, blue: 1.0, alpha: 0.18))
+  /// What ⌘F found in a note, and the match it's on.
+  static let findMatch = dynamic(
+    light: NSColor(srgbRed: 0.33, green: 0.35, blue: 0.95, alpha: 0.14),
+    dark: NSColor(srgbRed: 0.55, green: 0.58, blue: 1.0, alpha: 0.22))
+  static let findCurrent = dynamic(
+    light: NSColor(srgbRed: 0.33, green: 0.35, blue: 0.95, alpha: 0.38),
+    dark: NSColor(srgbRed: 0.55, green: 0.58, blue: 1.0, alpha: 0.5))
   /// `==highlighted==` text.
   static let highlight = dynamic(
     light: NSColor(srgbRed: 1.0, green: 0.85, blue: 0.2, alpha: 0.4),

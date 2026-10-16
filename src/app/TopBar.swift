@@ -196,6 +196,18 @@ final class IconButton: NSControl {
   override func mouseEntered(with event: NSEvent) { hovering = true }
   override func mouseExited(with event: NSEvent) { hovering = false }
 
+  // Hidden under the pointer (its page left, say), it gets no exit event;
+  // shown again, the pointer may be anywhere.
+  override func viewDidHide() {
+    super.viewDidHide()
+    hovering = false
+  }
+
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    syncHoverWithPointer()
+  }
+
   /// Tabs that move under a still pointer (scrolling the strip) get no
   /// enter/exit events: match the hover to where the pointer is now.
   func syncHoverWithPointer() {
@@ -1106,6 +1118,13 @@ final class FindBar: NSView, NSSearchFieldDelegate {
   private lazy var previousButton = IconButton(symbol: "chevron.up", size: 11, target: self, action: #selector(previous))
   private lazy var nextButton = IconButton(symbol: "chevron.down", size: 11, target: self, action: #selector(next))
   private lazy var doneButton = IconButton(symbol: "xmark", size: 10, target: self, action: #selector(done))
+  /// The pointer is over it: the window it floats in takes clicks only
+  /// then, and the page under the rest of it stays usable.
+  private(set) var isHovered = false {
+    didSet { if isHovered != oldValue { onHoverChange?(isHovered) } }
+  }
+  var onHoverChange: ((Bool) -> Void)?
+  private var hoverTimer: Timer?
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
@@ -1137,6 +1156,25 @@ final class FindBar: NSView, NSSearchFieldDelegate {
     NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill()
     Theme.separator.setStroke()
     NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 10, yRadius: 10).stroke()
+  }
+
+  // Polled: the window ignores the mouse while it isn't over the bar.
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    hoverTimer?.invalidate()
+    hoverTimer = nil
+    guard window != nil else {
+      isHovered = false
+      return
+    }
+    let timer = Timer(timeInterval: 1 / 20, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self, let window = self.window else { return }
+        self.isHovered = self.bounds.contains(self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    hoverTimer = timer
   }
 
   func setResult(count: Int, active: Int) {

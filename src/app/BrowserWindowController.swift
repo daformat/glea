@@ -514,6 +514,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private let toast = ToastView()
   private var errorView: NSView?
   private var findBar: FindBar?
+  /// The note or journal the find bar searches (none: the web page).
+  private weak var findPage: ColumnPageView?
+
+  /// The note or journal ⌘F can search here.
+  private var searchablePage: ColumnPageView? {
+    switch mode {
+    case .journal: return journalView
+    case .note: return noteView
+    case .notes, .web: return nil
+    }
+  }
   private var overlay: OverlayView?
   /// Incognito windows keep their tabs' cookies and storage in memory, and
   /// never record history or save their session.
@@ -998,7 +1009,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   /// Clicks go through the overlay window unless an overlay wants them.
   private func updateOverlayInteractivity() {
-    overlayWindow.ignoresMouseEvents = !overlayRoot.subviews.contains { $0 is OverlayView || $0 is FindBar } && !toast.isHovered
+    overlayWindow.ignoresMouseEvents = !overlayRoot.subviews.contains { $0 is OverlayView } && !toast.isHovered && findBar?.isHovered != true
   }
 
   // MARK: Modes
@@ -1031,6 +1042,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       MarkdownEditorView.flushAll()
       discardIfUntouched()
     }
+    // The find bar searched what's going away.
+    if newMode != mode || newMode != .web { closeFindBar() }
     let outgoing = container(for: mode)
     let incoming = container(for: newMode)
     mode = newMode
@@ -1061,7 +1074,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       }
       hasNotePlace = true
       lastNoteMode = newMode
-      closeFindBar()
     }
     updateErrorView()
     refreshTopBar()
@@ -1970,8 +1982,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private func closeFindBar() {
     guard let bar = findBar else { return }
     findBar = nil
+    bar.onHoverChange = nil
+    updateOverlayInteractivity()
     bar.animateOut(scale: 0.96, offsetY: 6, fade: 0.12, duration: 0.18) { bar.removeFromSuperview() }
-    activeTab?.browserView?.stopFinding()
+    if let page = findPage {
+      page.endFind(selecting: false)
+      page.onFindResult = nil
+      findPage = nil
+    } else {
+      activeTab?.browserView?.stopFinding()
+    }
   }
 
   // MARK: Option key (point-and-shoot)
@@ -2259,7 +2279,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   @objc func showAllNotes(_ sender: Any?) {
     setMode(.notes)
-    notesView.focusSearch()
   }
 
   @objc func newNote(_ sender: Any?) {
@@ -2350,22 +2369,53 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   @objc func findInPage(_ sender: Any?) {
-    guard mode == .web else { return }
+    // All Notes has its own filter.
+    if mode == .notes {
+      notesView.focusSearch()
+      return
+    }
+    let page = searchablePage
+    guard mode == .web || page != nil else { return }
     if let bar = findBar {
-      window?.makeFirstResponder(bar.field)
+      overlayWindow.makeKey()
+      overlayWindow.makeFirstResponder(bar.field)
+      bar.field.selectText(nil)
       return
     }
     let bar = FindBar()
-    bar.onSearch = { [weak self] text, forward, next in
-      if text.isEmpty {
-        self?.activeTab?.browserView?.stopFinding()
-      } else {
-        self?.activeTab?.browserView?.findText(text, forward: forward, findNext: next)
+    bar.onHoverChange = { [weak self] _ in self?.updateOverlayInteractivity() }
+    findPage = page
+    bar.field.placeholderString = page == nil ? "Find in page" : mode == .journal ? "Find in journal" : "Find in note"
+    if let page {
+      bar.onSearch = { [weak page, weak bar] text, forward, next in
+        guard let page else { return }
+        if text.isEmpty {
+          page.endFind(selecting: false)
+        } else {
+          let result = page.find(text, forward: forward, findNext: next)
+          bar?.setResult(count: result.count, active: result.active)
+        }
       }
-    }
-    bar.onClose = { [weak self] in
-      self?.closeFindBar()
-      self?.activeTab?.browserView?.focusPage()
+      page.onFindResult = { [weak bar] count, active in bar?.setResult(count: count, active: active) }
+      bar.onClose = { [weak self, weak page] in
+        // The cursor goes to the match found, like closing Safari's.
+        let selected = page?.endFind(selecting: true) == true
+        self?.closeFindBar()
+        self?.window?.makeKey()
+        if !selected { self?.window?.makeFirstResponder(page) }
+      }
+    } else {
+      bar.onSearch = { [weak self] text, forward, next in
+        if text.isEmpty {
+          self?.activeTab?.browserView?.stopFinding()
+        } else {
+          self?.activeTab?.browserView?.findText(text, forward: forward, findNext: next)
+        }
+      }
+      bar.onClose = { [weak self] in
+        self?.closeFindBar()
+        self?.activeTab?.browserView?.focusPage()
+      }
     }
     bar.translatesAutoresizingMaskIntoConstraints = false
     overlayRoot.addSubview(bar)
@@ -2375,7 +2425,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     ])
     findBar = bar
     raiseOverlayWindow()
-    overlayWindow.ignoresMouseEvents = false
     overlayWindow.makeKey()
     overlayWindow.makeFirstResponder(bar.field)
     // Drop in from just above.
@@ -2483,15 +2532,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       item.title = activeTab?.devTools?.isOpen == true ? "Hide Developer Tools" : "Show Developer Tools"
       return web
     case #selector(reload(_:)), #selector(stopLoading(_:)), #selector(zoomInPage(_:)), #selector(zoomOutPage(_:)),
-         #selector(actualSizePage(_:)), #selector(findInPage(_:)):
+         #selector(actualSizePage(_:)):
       return web
+    case #selector(findInPage(_:)):
+      item.title = mode == .web ? "Find in Page…" : "Find…"
+      return web || mode == .notes || searchablePage != nil
     case #selector(dockDeveloperTools(_:)):
       item.state = GleaBrowserView.preferredDevToolsDock.rawValue == item.tag ? .on : .off
       return true
     case #selector(collectPage(_:)):
       return web && activeTab?.url.hasPrefix("http") == true
     case #selector(findNextInPage(_:)), #selector(findPreviousInPage(_:)):
-      return web && findBar != nil
+      return (web || searchablePage != nil) && findBar != nil
     case #selector(goBack(_:)):
       return mode == .web ? web && activeTab?.canGoBack == true : canGoBackInNotes
     case #selector(goForward(_:)):
