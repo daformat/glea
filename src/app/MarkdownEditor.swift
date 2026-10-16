@@ -33,6 +33,8 @@ extension NSAttributedString.Key {
   static let gleaMath = NSAttributedString.Key("gleaMath")
   /// Inline code (`…`): its line keeps a line of text's height.
   static let gleaInlineCode = NSAttributedString.Key("gleaInlineCode")
+  /// A key (`<kbd>…</kbd>`), drawn on a keycap.
+  static let gleaKbd = NSAttributedString.Key("gleaKbd")
   /// MathBlock: a `$$…$$` block shown as its formula, on its first line (the
   /// others are folded away).
   static let gleaMathBlock = NSAttributedString.Key("gleaMathBlock")
@@ -169,6 +171,11 @@ struct MarkdownStyler {
   private static let quote = regex("^(\\s*>\\s?)+")
   private static let list = regex("^(\\s*)([-*+]|\\d+[.)])\\s+(\\[[ xX]\\]\\s+)?")
   private static let inlineCode = regex("`[^`\\n]+`")
+  /// `<kbd>⌘K</kbd>`, as in GitHub's Markdown.
+  private static let kbd = regex("<kbd>([^<\\n]+)</kbd>", .caseInsensitive)
+  /// Room on each side of a key, inside its keycap.
+  static let kbdPadding: CGFloat = 5
+  static let kbdFont = NSFont.systemFont(ofSize: 12.5, weight: .medium)
   /// `$…$`: no space just inside the dollars, none right before or after
   /// them a word or another dollar (so prices like "$5 and $10" stay text).
   private static let inlineMath = regex("(?<![\\\\$\\w])\\$(?=[^\\s$])([^$\\n]*?[^\\s\\\\$])\\$(?![\\w$])")
@@ -1288,6 +1295,10 @@ struct MarkdownStyler {
     paragraph.lineBreakMode = .byWordWrapping
     paragraph.lineSpacing = 2
     text.addAttribute(.paragraphStyle, value: paragraph, range: full)
+    // Drawn on its own, inline code has a plain background.
+    text.enumerateAttribute(.gleaInlineCode, in: full) { value, range, _ in
+      if value != nil { text.addAttribute(.backgroundColor, value: Theme.codeBackground, range: range) }
+    }
     text.enumerateAttribute(.link, in: full) { value, range, _ in
       guard let value else { return }
       text.removeAttribute(.link, range: range)
@@ -1317,10 +1328,31 @@ struct MarkdownStyler {
 
     for m in MarkdownStyler.inlineCode.matches(in: line, range: local) {
       construct = m.range
-      storage.addAttributes([.font: Theme.monoFont, .backgroundColor: Theme.codeBackground, .gleaInlineCode: true], range: abs(m.range))
+      // (Its background, rounded, is drawn by MarkdownLayoutManager.)
+      storage.addAttributes([.font: Theme.monoFont, .gleaInlineCode: true], range: abs(m.range))
       syntax(NSRange(location: m.range.location, length: 1))
       syntax(NSRange(location: m.range.upperBound - 1, length: 1))
       taken.append(m.range)
+    }
+
+    for m in MarkdownStyler.kbd.matches(in: line, range: local) where free(m.range) {
+      construct = m.range
+      taken.append(m.range)
+      let key = m.range(at: 1)
+      // (Its value: whether it has room around it, which it hasn't while its
+      // tags show.)
+      let editing = reveals(abs(m.range))
+      storage.addAttributes([.font: MarkdownStyler.kbdFont, .gleaKbd: NSNumber(value: !editing)], range: abs(key))
+      let open = NSRange(location: m.range.location, length: key.location - m.range.location)
+      syntax(open)
+      syntax(NSRange(location: key.upperBound, length: m.range.upperBound - key.upperBound))
+      guard !editing else { continue }
+      // Room for the keycap, inside and around it: after the hidden "<kbd>"
+      // and after the key.
+      for index in [abs(open).upperBound - 1, abs(key).upperBound - 1] {
+        let kern = (storage.attribute(.kern, at: index, effectiveRange: nil) as? NSNumber)?.doubleValue ?? 0
+        storage.addAttribute(.kern, value: kern + Double(MarkdownStyler.kbdPadding) * 2, range: NSRange(location: index, length: 1))
+      }
     }
 
     for m in MarkdownStyler.blockID.matches(in: line, range: local) where free(m.range) {
@@ -1714,6 +1746,43 @@ final class MarkdownLayoutManager: NSLayoutManager {
         text.draw(with: row.cellRect(column, in: cells), options: [.usesLineFragmentOrigin, .usesFontLeading])
       }
       NSGraphicsContext.restoreGraphicsState()
+    }
+
+    // Inline code, on a rounded background around its text (not its hidden
+    // backticks).
+    storage.enumerateAttribute(.gleaInlineCode, in: chars) { value, range, _ in
+      guard value != nil else { return }
+      let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+      guard glyphs.length > 0 else { return }
+      let font = Theme.monoFont
+      enumerateEnclosingRects(forGlyphRange: glyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0), in: container) { rect, _ in
+        guard rect.width > 1 else { return }
+        let glyph = self.glyphIndex(for: NSPoint(x: rect.midX, y: rect.midY), in: container)
+        let line = self.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let baseline = origin.y + line.minY + self.location(forGlyphAt: glyph).y
+        let box = NSRect(x: origin.x + rect.minX, y: baseline - font.ascender - 2, width: rect.width, height: font.ascender - font.descender + 4)
+        Theme.codeBackground.setFill()
+        NSBezierPath(roundedRect: box, xRadius: 2, yRadius: 2).fill()
+      }
+    }
+
+    // Keys, on keycaps.
+    storage.enumerateAttribute(.gleaKbd, in: chars) { value, range, _ in
+      guard value != nil else { return }
+      let glyphs = glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+      guard glyphs.length > 0 else { return }
+      let font = MarkdownStyler.kbdFont
+      let line = lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+      let baseline = origin.y + line.minY + location(forGlyphAt: glyphs.location).y
+      enumerateEnclosingRects(forGlyphRange: glyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0), in: container) { rect, _ in
+        guard rect.width > 0 else { return }
+        // Snug around the key while its tags show.
+        let roomy = (value as? NSNumber)?.boolValue == true
+        let cap = NSRect(x: origin.x + rect.minX - (roomy ? MarkdownStyler.kbdPadding : 1), y: baseline - font.ascender - 3,
+                         width: rect.width + (roomy ? 0 : 2), height: font.ascender - font.descender + 5)
+        Theme.codeBackground.setFill()
+        NSBezierPath(roundedRect: cap, xRadius: 5, yRadius: 5).fill()
+      }
     }
 
     // What ⌘F found, the current match stronger.

@@ -1517,6 +1517,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   private let searchField = BorderlessSearchField()
   /// Just its magnifier until the search is focused or filters the list.
   private lazy var searchPill = SearchPill(field: searchField)
+  /// Shown instead of the list while there are no notes at all.
+  private lazy var emptyState = EmptyNotesView { [weak self] in self?.newNote() }
   private let countLabel = NSTextField.label("", size: 13, color: Theme.tertiaryText)
   private var items: [NotesListItem] = []
   /// Notes checked with their row's checkbox.
@@ -1639,6 +1641,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     addSubview(header)
     addSubview(controls)
     addSubview(scroll)
+    emptyState.isHidden = true
+    addSubview(emptyState)
     let preferred = header.widthAnchor.constraint(equalTo: widthAnchor, constant: -112)
     preferred.priority = NSLayoutConstraint.Priority(490)  // below the window size (500)
     NSLayoutConstraint.activate([
@@ -1654,6 +1658,10 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
       scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
       scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
+      emptyState.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+      // A little above the middle of the space under the header looks centered.
+      emptyState.centerYAnchor.constraint(equalTo: scroll.centerYAnchor, constant: -40),
+      emptyState.widthAnchor.constraint(lessThanOrEqualTo: header.widthAnchor),
     ])
     toc.translatesAutoresizingMaskIntoConstraints = false
     toc.isHidden = true
@@ -1798,6 +1806,9 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       }
     }
     show(fresh)
+    let empty = store.notes.isEmpty && filter.isEmpty
+    emptyState.isHidden = !empty
+    scroll.isHidden = empty
   }
 
   /// Shows the notes matching `query` (a "#tag" from a note).
@@ -2678,6 +2689,34 @@ private final class BorderlessSearchFieldCell: NSSearchFieldCell {
   override func select(withFrame rect: NSRect, in controlView: NSView, editor textObj: NSText, delegate: Any?, start selStart: Int, length selLength: Int) {
     super.select(withFrame: searchTextRect(forBounds: rect), in: controlView, editor: textObj, delegate: delegate, start: selStart, length: selLength)
   }
+}
+
+/// What All Notes shows before there's a note: what goes here, and a
+/// button to write the first one.
+private final class EmptyNotesView: NSStackView {
+  init(onNewNote: @escaping () -> Void) {
+    let icon = NSImageView(image: Theme.symbol("note.text", size: 30, weight: .regular) ?? NSImage())
+    icon.contentTintColor = Theme.tertiaryText
+    let title = NSTextField.label("No notes yet", size: 17, weight: .semibold, color: Theme.text)
+    let blurb = NSTextField.label("Write down an idea, a plan, or anything worth keeping.", size: 13, color: Theme.secondaryText)
+    blurb.alignment = .center
+    blurb.lineBreakMode = .byWordWrapping
+    blurb.maximumNumberOfLines = 0
+    let button = Dialog.ClosureButton(title: "New Note", action: onNewNote)
+    button.bezelStyle = .rounded
+    button.controlSize = .large
+    button.toolTip = "New Note (⌥⌘N)"
+    super.init(frame: .zero)
+    setViews([icon, title, blurb, button], in: .center)
+    orientation = .vertical
+    alignment = .centerX
+    spacing = 6
+    setCustomSpacing(12, after: icon)
+    setCustomSpacing(20, after: blurb)
+    translatesAutoresizingMaskIntoConstraints = false
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
 }
 
 /// The notes' search: its magnifier alone (like the + next to it) until

@@ -104,7 +104,37 @@ final class NoteStore {
   private init() {
     root = NoteStore.configuredRoot()
     load()
+    welcomeIfNew()
   }
+
+  // MARK: Welcome
+
+  /// The first time Glea runs on an empty notes folder, yesterday's journal
+  /// shows the basics, so today stays blank to write in (like Beam). Never
+  /// again after that, nor in a folder that has anything in it.
+  private func welcomeIfNew() {
+    let key = "welcomed"
+    guard !AppDefaults.store.bool(forKey: key) else { return }
+    AppDefaults.store.set(true, forKey: key)
+    guard entries.isEmpty, let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) else { return }
+    // Quietly: this runs while `shared` is being made, and what would hear
+    // of it asks for `shared`. Nothing shows the notes yet anyway.
+    _ = write(.journal(yesterday), content: NoteStore.welcome)
+  }
+
+  static let welcome = """
+    This is your **journal**: a page for every day, with today on top. Jot down what's on your mind, take meeting notes, or keep what you find on the web.
+
+    ## Glea 101
+    - <kbd>⌘T</kbd> or <kbd>⌘K</kbd> to search the web and your notes, or go to an address
+    - Hold <kbd>⌥</kbd> and click anything on a page to collect it into today's journal
+    - <kbd>⌘D</kbd> to switch between the web and your notes
+    - [[Reading list]] is a link to a note: type `[[` and a name, then click the link to create it
+    - `/` for headings, lists, tasks, tables and more
+
+    Your notes are plain Markdown files on your Mac (File ▸ Show Notes Folder in Finder). For everything else, there's the [User Guide](https://glea.app/help/).
+
+    """
 
   static func configuredRoot() -> URL {
     if let env = ProcessInfo.processInfo.environment["GLEA_DATA_DIR"] {
@@ -475,15 +505,21 @@ final class NoteStore {
     if ref.kind == .journal && content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && entries[ref] == nil {
       return
     }
+    if write(ref, content: content) { postChange([ref.id]) }
+  }
+
+  /// Writes the file and keeps it, without telling anyone (see `save`).
+  private func write(_ ref: NoteRef, content: String) -> Bool {
     let url = fileURL(for: ref)
     do {
       try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
       try content.write(to: url, atomically: true, encoding: .utf8)
       entries[ref] = Entry(content: content, modified: Date(), folder: entries[ref]?.folder ?? "")
       if ref.kind == .note { aliasIndex = nil }
-      postChange([ref.id])
+      return true
     } catch {
       NSLog("Glea: failed to save \(url.path): \(error)")
+      return false
     }
   }
 
