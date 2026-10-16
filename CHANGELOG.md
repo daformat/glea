@@ -2,6 +2,19 @@
 
 What changed in each release of Glea.
 
+## 0.17.0 Beta — 2026-10-16
+
+- Find in your notes: <kbd>⌘F</kbd> searches the note you're reading, or
+  every day shown in the journal. It ignores case and accents, highlights
+  each match, and <kbd>⌘G</kbd> / <kbd>⇧⌘G</kbd> go to the next and
+  previous ones. You can keep writing while it's open; closing it puts the
+  cursor on the match.
+- In All Notes, <kbd>⌘F</kbd> goes to the search, which is just a
+  magnifier until you use it. <kbd>Esc</kbd> clears it, then closes it.
+- Clicking beside a note in All Notes no longer opens or drags it.
+- Find in Page no longer stops you clicking the page while it's open.
+- Buttons no longer stay highlighted after the page under them changes.
+
 ## 0.16.4 Beta — 2026-10-11
 
 - While an update downloads in the background, Glea ▸ Check for Updates…
