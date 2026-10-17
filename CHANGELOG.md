@@ -2,6 +2,21 @@
 
 What changed in each release of Glea.
 
+## 0.18.0 Beta — 2026-10-17
+
+- Peek: clicking a web link in a note or the journal opens the page in a
+  card over your notes, without a tab. Above it, *Open as Tab*
+  (<kbd>⌘</kbd><kbd>↩</kbd>) moves the page to the tab bar as it is;
+  *Collect Page* (<kbd>⌘</kbd><kbd>S</kbd>), *Copy Link* and *Close*
+  (<kbd>esc</kbd>, or a click outside) are beside it. Point and shoot works
+  in it, and what you collect offers the note you came from first.
+  <kbd>⌘</kbd>-click still opens a tab.
+- Link previews: rest the pointer on a web link in your notes to see the
+  page's picture, site, title and description.
+- Settings has a Notes pane: turn Peek or link previews off there. The
+  option to open your notes' links in another browser moved there too.
+- Pages no longer flash white while their window grows.
+
 ## 0.17.3 Beta — 2026-10-17
 
 - History › Show Web History (<kbd>⌘Y</kbd>) lists the pages you've visited,
