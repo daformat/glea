@@ -880,6 +880,11 @@ static std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>>& DownloadCallbacks
   NSColor* color = [NSColor colorWithSRGBRed:rgb[0] / 255 green:rgb[1] / 255 blue:rgb[2] / 255 alpha:1];
   if (_chromeWindow) {
     if (![_chromeWindow.backgroundColor isEqual:color]) _chromeWindow.backgroundColor = color;
+    // Chromium's view in that window keeps the color it was created with
+    // (white) where the page hasn't painted yet: the page's too.
+    if (_chromeView) {
+      _chromeView->SetBackgroundColor(CefColorSetARGB(255, (int)lround(rgb[0]), (int)lround(rgb[1]), (int)lround(rgb[2])));
+    }
   } else {
     _pageContainer.wantsLayer = YES;
     _pageContainer.layer.backgroundColor = color.CGColor;

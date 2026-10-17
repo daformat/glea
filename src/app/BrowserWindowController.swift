@@ -866,6 +866,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
 
   func windowWillClose(_ notification: Notification) {
+    if peek != nil { closePeek() }
     guard isIncognito || isExtra else { return }
     window?.removeChildWindow(overlayWindow)
     overlayWindow.orderOut(nil)
@@ -1036,6 +1037,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private var restoredNotesFocus = false
 
   func setMode(_ newMode: Mode) {
+    // Going elsewhere: the peek was over what's leaving.
+    if peek != nil, newMode != mode { closePeek() }
     let previousPlace = currentNotePlace
     if newMode == .web, mode != .web, let view = window?.firstResponder as? NSView, view.isDescendant(of: container(for: mode)) {
       notesFocusView = view
@@ -1226,8 +1229,20 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   func openTab(_ url: String, background: Bool = false) -> Tab {
     let tab = Tab(url: url, session: browsingSession)
     tab.owner = self
-    // After the current tab, but never among pinned tabs; inside a group it
-    // joins the group (opened from one of its pages).
+    insert(tab)
+    if background {
+      attach(tab)
+      refreshTopBar()
+    } else {
+      activate(tab)
+    }
+    scheduleSessionSave()
+    return tab
+  }
+
+  /// Puts a new tab after the current one, but never among pinned tabs;
+  /// inside a group it joins the group (opened from one of its pages).
+  private func insert(_ tab: Tab) {
     let pinnedCount = tabs.filter(\.isPinned).count
     if let active = activeTab, let index = tabs.firstIndex(where: { $0 === active }) {
       let at = max(index + 1, pinnedCount)
@@ -1237,14 +1252,6 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       tabs.append(tab)
     }
     normalizeTabOrder()
-    if background {
-      attach(tab)
-      refreshTopBar()
-    } else {
-      activate(tab)
-    }
-    scheduleSessionSave()
-    return tab
   }
 
   private func attach(_ tab: Tab) {
@@ -1539,12 +1546,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   // MARK: TabOwner
 
   func tabDidUpdate(_ tab: Tab) {
+    if tab === peekTab { updatePeekHeader() }
     refreshTopBar()
     if tab === activeTab { updateErrorView() }
     scheduleSessionSave()
   }
 
   func tab(_ tab: Tab, requestsNewTab url: String, background: Bool) {
+    // A page the peek opens in front leaves the notes for the web.
+    if tab === peekTab, !background { closePeek() }
     openTab(url, background: background)
   }
 
@@ -1553,7 +1563,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       NSLog("Glea test result: \(payload["value"] ?? "")")
       return
     }
-    guard tab === activeTab, mode == .web else { return }
+    guard tab === frontTab else { return }
     if name == "captureArea" {
       captureArea(payload, in: tab)
       return
@@ -1670,8 +1680,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let answers = keys.map { Self.mediaAnswers[$0] }
     if answers.contains(false) { return completion(false) }
     if answers.allSatisfy({ $0 == true }) { return completion(true) }
-    guard let window, tabs.contains(where: { $0 === tab }) else { return completion(false) }
-    if activeTab !== tab || mode != .web || isShowingNewTab { activate(tab) }
+    guard let window, tab === peekTab || tabs.contains(where: { $0 === tab }) else { return completion(false) }
+    if tab !== peekTab, activeTab !== tab || mode != .web || isShowingNewTab { activate(tab) }
     let site = URL(string: origin)?.host ?? origin
     let alert = NSAlert()
     alert.messageText = "Allow “\(site)” to use your \(devices.joined(separator: " and "))?"
@@ -1980,7 +1990,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       // Window coordinates are bottom-up; the overlay is flipped.
       anchor = NSRect(x: rect.minX, y: root.bounds.height - rect.maxY, width: rect.width, height: rect.height)
     }
-    let panel = CapturePanel(capture: capture, anchor: anchor, lastTarget: lastCaptureTarget)
+    // From the peek: the note it was opened from comes first.
+    let preferred = tab.flatMap { $0 === peekTab ? peekSource : nil }
+    let panel = CapturePanel(capture: capture, anchor: anchor, lastTarget: lastCaptureTarget, preferred: preferred)
     panel.onDismiss = { [weak self] in
       self?.releasePendingCapture()
       self?.dismissOverlay()
@@ -2039,7 +2051,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let optionOnly = BrowserWindowController.isPointAndShoot(flags) && NSEvent.pressedMouseButtons == 0
     pendingPointAndShoot?.cancel()
     pendingPointAndShoot = nil
-    guard mode == .web, let view = activeTab?.browserView else { return }
+    guard let view = frontTab?.browserView else { return }
     guard optionOnly else {
       // Turning it off must always get through.
       view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(false)")
@@ -2049,11 +2061,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     // Turning it on needs the page in front, and Option held on its own for a
     // moment: ⌥ on the way to ⌥⌘→ (switch tabs) never starts a capture.
     // The page has keyboard focus in its own window (Chrome style) or in ours.
-    let focused = window?.isKeyWindow == true || activeTab?.browserView?.chromeWindow?.isKeyWindow == true
+    let focused = window?.isKeyWindow == true || view.chromeWindow?.isKeyWindow == true
     let testing = ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] != nil
     guard (NSApp.isActive && focused) || testing, overlay == nil, !isShowingNewTab else { return }
     let work = DispatchWorkItem { [weak self, weak view] in
-      guard let self, let view, self.activeTab?.browserView === view else { return }
+      guard let self, let view, self.frontTab?.browserView === view else { return }
       guard BrowserWindowController.isPointAndShoot(NSEvent.modifierFlags)
               || ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] != nil else { return }
       // Where the pointer is, in page (CSS) pixels, for pages that haven't seen it move.
@@ -2069,6 +2081,129 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
     pendingPointAndShoot = work
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+  }
+
+  // MARK: Peek
+
+  /// A web link from the notes, previewed over them (see `PeekView`).
+  private var peek: PeekView?
+  /// The peek's page: a tab kept out of the tab bar.
+  private var peekTab: Tab?
+  /// The note the peek was opened from, offered first for its captures.
+  private var peekSource: NoteRef?
+  private var peekKeys: Any?
+  private weak var peekReturnFocus: NSResponder?
+
+  /// The page in front: the peek's, or on the web the current tab's.
+  private var frontTab: Tab? { peekTab ?? (mode == .web ? activeTab : nil) }
+
+  private func showPeek(_ url: URL) {
+    LinkPreviewController.shared.hide()
+    if let tab = peekTab {
+      tab.load(url.absoluteString)
+      return
+    }
+    guard let window else { return }
+    let tab = Tab(url: url.absoluteString, session: browsingSession)
+    tab.owner = self
+    let page = tab.ensureBrowserView()
+    page.chromeCornerRadius = PeekView.pageCornerRadius
+    let peek = PeekView(frame: root.bounds)
+    peek.onClose = { [weak self] in self?.closePeek() }
+    peek.onOpenAsTab = { [weak self] in self?.openPeekAsTab() }
+    peek.onCollect = { [weak self] in self?.collectPage(nil) }
+    peek.onCopyLink = { [weak self, weak tab] in
+      guard let self, let tab else { return }
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(tab.url, forType: .string)
+      self.toast.show("Link copied")
+    }
+    // The note's caret and format bar go while the page is in front.
+    peekReturnFocus = window.firstResponder
+    window.makeFirstResponder(nil)
+    root.addSubview(peek)
+    page.frame = peek.pageHost.bounds
+    page.autoresizingMask = [.width, .height]
+    // Loading while the card springs out; shown once it's in place.
+    page.isHidden = true
+    peek.pageHost.addSubview(page)
+    self.peek = peek
+    peekTab = tab
+    switch mode {
+    case .note(let ref): peekSource = ref
+    case .journal: peekSource = NoteStore.shared.today
+    case .notes, .web: peekSource = nil
+    }
+    updatePeekHeader()
+    let click = peek.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    peek.animateIn(from: peek.bounds.contains(click) ? click : nil) { [weak self, weak tab] in
+      guard let self, let tab, tab === self.peekTab, let page = tab.browserView else { return }
+      page.isHidden = false
+      if let pageWindow = page.chromeWindow, !Motion.reduceMotion {
+        pageWindow.alphaValue = 0
+        Motion.animate(0.14, timing: Motion.easeOut) { pageWindow.animator().alphaValue = 1 }
+      }
+      page.focusPage()
+    }
+    watchPeekKeys()
+  }
+
+  func closePeekForTesting() { closePeek() }
+  func openPeekAsTabForTesting() { openPeekAsTab() }
+  var peekURLForTesting: String? { peekTab?.url }
+
+  private func updatePeekHeader() {
+    guard let peek, let tab = peekTab else { return }
+    peek.setPage(title: tab.title, host: tab.host, favicon: tab.favicon)
+  }
+
+  private func closePeek() {
+    guard let peek, let tab = peekTab else { return }
+    endPeek()
+    if captureTab === tab { releasePendingCapture() }
+    tab.browserView?.isHidden = true
+    peek.animateOut { tab.close() }
+    window?.makeKey()
+    if let focus = peekReturnFocus { window?.makeFirstResponder(focus) }
+  }
+
+  /// The peek's page, as it is, becomes a tab after the current one.
+  private func openPeekAsTab() {
+    guard let peek, let tab = peekTab, let page = tab.browserView else { return }
+    endPeek()
+    page.removeFromSuperview()
+    page.chromeCornerRadius = TabLayout.isVertical ? TabLayout.cardRadius : 0
+    peek.removeFromSuperview()
+    insert(tab)
+    activate(tab)
+    scheduleSessionSave()
+  }
+
+  private func endPeek() {
+    peek = nil
+    peekTab = nil
+    peekSource = nil
+    if let peekKeys { NSEvent.removeMonitor(peekKeys) }
+    peekKeys = nil
+  }
+
+  /// Esc closes the peek and ⌘↩ opens it as a tab, from the page too (its
+  /// own window, a child of this one).
+  private func watchPeekKeys() {
+    peekKeys = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+      guard let self, self.peek != nil, self.overlay == nil, let window = self.window,
+            let source = event.window, source === window || source.parent === window else { return event }
+      let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+      if event.keyCode == 53, flags.isEmpty {
+        self.closePeek()
+        return nil
+      }
+      if event.keyCode == 36 || event.keyCode == 76, flags == .command {
+        self.openPeekAsTab()
+        return nil
+      }
+      return event
+    }
   }
 
   // MARK: NoteNavigator
@@ -2106,9 +2241,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       setMode(.notes)
       notesView.search("#" + tag)
     } else if url.scheme == "http" || url.scheme == "https" {
-      // (Or in another browser: Settings ▸ Browser.)
+      // (Or in another browser: Settings ▸ Notes.)
       let background = NSApp.currentEvent?.modifierFlags.contains(.command) == true
       if LinkOpening.openElsewhere(url, background: background) { return }
+      // From the notes: previewed over them (⌘: in a background tab), unless
+      // turned off in Settings.
+      if mode != .web, !background, NoteLinks.peek { return showPeek(url) }
       openTab(url.absoluteString, background: background)
     } else {
       NSWorkspace.shared.open(url)
@@ -2207,7 +2345,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   /// The page being read in this window, for the daily summary: none in the
   /// notes, in incognito, or on the start page.
   var pageInFront: (url: String, title: String)? {
-    guard mode == .web, !isIncognito, !isShowingNewTab, let tab = activeTab, tab.url.hasPrefix("http") else { return nil }
+    guard !isIncognito, let tab = frontTab, peekTab != nil || !isShowingNewTab, tab.url.hasPrefix("http") else { return nil }
     return (tab.url, tab.title)
   }
 
@@ -2226,6 +2364,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   @objc func closeCurrentTab(_ sender: Any?) {
     if overlay != nil {
       dismissOverlay()
+    } else if peek != nil {
+      closePeek()
     } else if mode == .web, isShowingNewTab, !tabs.isEmpty {
       leaveNewTab()
     } else if mode == .web, let tab = activeTab {
@@ -2361,7 +2501,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   @objc func collectPage(_ sender: Any?) {
-    guard mode == .web, let tab = activeTab, tab.url.hasPrefix("http") else { return }
+    guard let tab = frontTab, tab.url.hasPrefix("http") else { return }
     let capture = Capture(kind: .page, markdown: "", text: "", pageURL: tab.url, pageTitle: tab.title)
     showCapturePanel(capture, anchorInWindow: nil, from: tab)
   }
@@ -2570,7 +2710,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       item.state = GleaBrowserView.preferredDevToolsDock.rawValue == item.tag ? .on : .off
       return true
     case #selector(collectPage(_:)):
-      return web && activeTab?.url.hasPrefix("http") == true
+      return (web || peekTab != nil) && frontTab?.url.hasPrefix("http") == true
     case #selector(findNextInPage(_:)), #selector(findPreviousInPage(_:)):
       return (web || searchablePage != nil) && findBar != nil
     case #selector(goBack(_:)):

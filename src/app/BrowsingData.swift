@@ -242,10 +242,15 @@ struct Session: Codable {
 final class ImageCache {
   static let shared = ImageCache()
   static let didLoad = Notification.Name("GleaImageDidLoad")
+  /// An image finished loading, or failed to (the URL is the object).
+  static let didSettle = Notification.Name("GleaImageDidSettle")
 
   private var images: [URL: NSImage] = [:]
   private var loading: Set<URL> = []
   private var failed: Set<URL> = []
+
+  /// Whether the image is loaded, or known not to load.
+  func isSettled(_ url: URL) -> Bool { images[url] != nil || failed.contains(url) }
 
   /// Returns the image if cached; otherwise starts loading it and posts
   /// `ImageCache.didLoad` when it arrives.
@@ -271,6 +276,7 @@ final class ImageCache {
         } else {
           self.failed.insert(url)
         }
+        NotificationCenter.default.post(name: ImageCache.didSettle, object: url)
       }
     }.resume()
     return nil

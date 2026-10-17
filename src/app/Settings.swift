@@ -16,6 +16,22 @@ enum AppDefaults {
     ? UserDefaults(suiteName: "app.glea.test-copy") ?? .standard : .standard
 }
 
+/// How web links in the notes (and the journal) behave here: previewed in a
+/// peek when clicked, and in a card while the pointer rests on them. Both on
+/// unless turned off.
+@MainActor
+enum NoteLinks {
+  static var peek: Bool {
+    get { AppDefaults.store.object(forKey: "notesLinkPeek") as? Bool ?? true }
+    set { AppDefaults.store.set(newValue, forKey: "notesLinkPeek") }
+  }
+
+  static var previews: Bool {
+    get { AppDefaults.store.object(forKey: "notesLinkPreviews") as? Bool ?? true }
+    set { AppDefaults.store.set(newValue, forKey: "notesLinkPreviews") }
+  }
+}
+
 /// Where links clicked in the notes (and the journal) open: in a tab here, or
 /// in another browser. Glea opens web links itself, so it can be the system's
 /// default browser: the browser is picked among the others.
@@ -89,6 +105,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
   /// The panes, in header order.
   private static let panes: [(label: String, symbol: String)] = [
     ("Browser", "globe"),
+    ("Notes", "doc.text"),
   ]
 
   private var window: NSWindow?
@@ -101,6 +118,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
   /// Held: a switch's target is weak.
   private var verticalTabsRow: ToggleRow?
   private var linksRow: ToggleRow?
+  private var peekRow: ToggleRow?
+  private var previewsRow: ToggleRow?
   private let enginePopup = NSPopUpButton()
   private let browserPopup = NSPopUpButton()
   /// The browsers listed in `browserPopup`, in its order.
@@ -119,6 +138,12 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     window.makeFirstResponder(nil)
   }
 
+  /// For automated checks: the window, on pane `index`.
+  func showForTesting(pane index: Int) {
+    show()
+    show(pane: index)
+  }
+
   /// Torn down rather than hidden: the next open reads the settings as they
   /// stand.
   func windowWillClose(_ notification: Notification) {
@@ -129,6 +154,8 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     buttons = []
     verticalTabsRow = nil
     linksRow = nil
+    peekRow = nil
+    previewsRow = nil
     browsers = []
     if let tabLayoutObserver { NotificationCenter.default.removeObserver(tabLayoutObserver) }
     tabLayoutObserver = nil
@@ -157,7 +184,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
       MainActor.assumeIsolated { self?.verticalTabsRow?.isOn = TabLayout.isVertical }
     }
 
-    stacks = [buildBrowserStack()]
+    stacks = [buildBrowserStack(), buildNotesStack()]
     buttons = Self.panes.enumerated().map { index, pane in
       PaneButton(label: pane.label, symbol: pane.symbol) { [weak self] in self?.show(pane: index) }
     }
@@ -252,12 +279,37 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     enginePopup.action = #selector(chooseEngine)
     section("Search", "What the address field searches when you type something that isn't an address.",
             Self.labeled("Search engine", enginePopup))
+    return stack
+  }
+
+  private func buildNotesStack() -> NSStackView {
+    let (stack, section) = Self.makeStack()
+
+    let peek = ToggleRow("Preview links in a peek",
+                         detail: "A click opens the page over your notes, without a tab. ⌘‑click still opens a tab.",
+                         value: NoteLinks.peek, width: Self.contentWidth) { NoteLinks.peek = $0 }
+    peek.control.isEnabled = !LinkOpening.opensElsewhere
+    peekRow = peek
+    let previews = ToggleRow("Show link previews",
+                             detail: "Resting the pointer on a link shows its page's picture, title and description.",
+                             value: NoteLinks.previews, width: Self.contentWidth) { on in
+      NoteLinks.previews = on
+      if !on { LinkPreviewController.shared.hide() }
+    }
+    previewsRow = previews
+    let webLinks = NSStackView(views: [peek.view, previews.view])
+    webLinks.orientation = .vertical
+    webLinks.alignment = .leading
+    webLinks.spacing = 10
+    section("Web links", "What clicking or pointing at a web link in your notes and journal does.", webLinks)
 
     let links = ToggleRow("Open links in another browser",
                           detail: "Links you click in your notes and journal open there, not in a tab here.",
                           value: LinkOpening.opensElsewhere, width: Self.contentWidth) { [weak self] on in
       LinkOpening.opensElsewhere = on
       self?.browserPopup.isEnabled = on && self?.browsers.isEmpty == false
+      // Opened elsewhere, a link can't be peeked at here.
+      self?.peekRow?.control.isEnabled = !on
     }
     linksRow = links
     browserPopup.target = self
@@ -267,7 +319,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     content.orientation = .vertical
     content.alignment = .leading
     content.spacing = 10
-    section("Links", "Glea opens web links in a tab. Your notes' links can open in the browser you use otherwise.", content)
+    section("Another browser", "Your notes' links can open in the browser you use otherwise, rather than here.", content)
     return stack
   }
 

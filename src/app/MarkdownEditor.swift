@@ -2611,6 +2611,7 @@ final class MarkdownTextView: NSTextView {
   }
 
   override func mouseDown(with event: NSEvent) {
+    LinkPreviewController.shared.hide()
     if handleTableClick(event) || handleMathClick(event) { return }
     if let layoutManager, let textContainer, let storage = textStorage, storage.length > 0 {
       let point = convert(event.locationInWindow, from: nil)
@@ -2689,11 +2690,35 @@ final class MarkdownTextView: NSTextView {
 
   private static let headingPrefix = try! NSRegularExpression(pattern: "^#{1,6} ")
 
+  // MARK: Link previews
+
+  /// The web link under `point` (in this view), and where its text is on
+  /// that line (a link can wrap), in this view's coordinates.
+  func webLink(at point: NSPoint) -> (url: URL, rect: NSRect)? {
+    guard let layoutManager, let textContainer, let storage = textStorage, storage.length > 0 else { return nil }
+    let origin = textContainerOrigin
+    let p = NSPoint(x: point.x - origin.x, y: point.y - origin.y)
+    let glyph = layoutManager.glyphIndex(for: p, in: textContainer)
+    guard layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer).insetBy(dx: -1, dy: -1).contains(p) else { return nil }
+    let index = layoutManager.characterIndexForGlyph(at: glyph)
+    guard index < storage.length else { return nil }
+    var range = NSRange()
+    guard let value = storage.attribute(.link, at: index, effectiveRange: &range),
+          let url = (value as? URL) ?? (value as? String).flatMap(URL.init(string:)),
+          url.scheme == "http" || url.scheme == "https" else { return nil }
+    var line = NSRange()
+    layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: &line)
+    let glyphs = NSIntersectionRange(layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil), line)
+    let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: textContainer).offsetBy(dx: origin.x, dy: origin.y)
+    return (url, rect)
+  }
+
   // MARK: Searching the web
 
   /// ⌘↩ searches the web for the word at the cursor (or the selection),
   /// ⌥⌘↩ for the sentence; the searched text becomes a link to the search.
   override func keyDown(with event: NSEvent) {
+    LinkPreviewController.shared.hide()
     if event.keyCode == 36 || event.keyCode == 76, !hasMarkedText() {
       let flags = event.modifierFlags.intersection([.command, .option, .shift, .control])
       if flags == .command || flags == [.command, .option], searchWeb(sentence: flags.contains(.option)) { return }
@@ -3197,6 +3222,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       hoverAreaHost = host
     }
     if window == nil {
+      LinkPreviewController.shared.hover(nil, rect: .zero, in: self, owner: self)
       // Gone from the page in the same frame as the rest of the note (another
       // replacing it): an embed leaving the window goes blank at once, before
       // the window shows what's there instead.
@@ -3258,15 +3284,45 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   @objc private func pageScrolled() {
     formatBar.reposition(animated: false)
     // Scrolled under a still pointer.
-    if let window, hoverArea != nil { updateTableHover(window.mouseLocationOutsideOfEventStream) }
+    if let window, hoverArea != nil {
+      updateTableHover(window.mouseLocationOutsideOfEventStream)
+      updateLinkHover(window.mouseLocationOutsideOfEventStream)
+    }
   }
 
   private var hoverArea: NSTrackingArea?
   private weak var hoverAreaHost: NSView?
 
-  override func mouseMoved(with event: NSEvent) { updateTableHover(event.locationInWindow) }
-  override func mouseEntered(with event: NSEvent) { updateTableHover(event.locationInWindow) }
-  override func mouseExited(with event: NSEvent) { updateTableHover(nil) }
+  override func mouseMoved(with event: NSEvent) {
+    updateTableHover(event.locationInWindow)
+    updateLinkHover(event.locationInWindow)
+  }
+  override func mouseEntered(with event: NSEvent) {
+    updateTableHover(event.locationInWindow)
+    updateLinkHover(event.locationInWindow)
+  }
+  override func mouseExited(with event: NSEvent) {
+    updateTableHover(nil)
+    updateLinkHover(nil)
+  }
+
+  /// For automated checks: the pointer at `point` (window coordinates), or gone.
+  func debugHoverLink(_ point: NSPoint?) { updateLinkHover(point) }
+
+  /// For automated checks: the web link at `point` (window coordinates).
+  func debugWebLink(at point: NSPoint) -> URL? { textView.webLink(at: textView.convert(point, from: nil))?.url }
+
+  /// The web link under the pointer gets a preview card after a moment
+  /// (none while something covers the text, like a peek or an embed).
+  private func updateLinkHover(_ point: NSPoint?) {
+    var found: (url: URL, rect: NSRect)?
+    if let point, NSApp.isActive || LinkPreviewController.testing, NSEvent.pressedMouseButtons == 0, let content = window?.contentView,
+       let hit = content.hitTest(content.convert(point, from: nil)), hit === textView {
+      found = textView.webLink(at: textView.convert(point, from: nil))
+    }
+    LinkPreviewController.shared.hover(found?.url, rect: found.map { textView.convert($0.rect, to: nil) } ?? .zero,
+                                       in: self, owner: self)
+  }
 
   var content: String { textView.string }
 

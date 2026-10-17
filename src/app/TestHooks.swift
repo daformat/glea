@@ -366,6 +366,21 @@ enum TestHooks {
     case "extensions-menu":
       // Opens the puzzle menu as if its button was clicked.
       controller.topBar.clickExtensionsButtonForTesting()
+    case "link-hover", "link-click":
+      // link-hover:x,y (window points from the top left; "-": away) rests the
+      // pointer there for link previews; link-click:x,y clicks the link there.
+      let xy = argument.split(separator: ",").compactMap { Double($0) }
+      let editors = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.filter { !$0.isHiddenOrHasHiddenAncestor }
+      let point = xy.count == 2 ? controller.window.map { NSPoint(x: xy[0], y: $0.frame.height - xy[1]) } : nil
+      if parts[0] == "link-hover" {
+        for editor in editors { editor.debugHoverLink(point) }
+      } else if let point, let url = editors.lazy.compactMap({ $0.debugWebLink(at: point) }).first {
+        controller.openLink(url)
+      }
+      NSLog("Glea %@ %@ -> peek %@", parts[0], argument, controller.peekURLForTesting ?? "none")
+    case "settings": SettingsWindow.shared.showForTesting(pane: Int(argument) ?? 0)
+    case "peek-close": controller.closePeekForTesting()
+    case "peek-tab": controller.openPeekAsTabForTesting()
     case "hittest":
       // hittest:x,y (window points from the top left): which view gets a click there.
       let xy = argument.split(separator: ",").compactMap { Double($0) }
@@ -386,6 +401,25 @@ enum TestHooks {
       let v = argument.split(separator: ",").compactMap { Double($0) }
       if v.count == 4, let window = controller.window, let screen = window.screen ?? NSScreen.main {
         window.setFrame(NSRect(x: v[0], y: screen.frame.maxY - v[1] - v[3], width: v[2], height: v[3]), display: true)
+      }
+    case "window-grow":
+      // window-grow:<points>,<steps>: grows the window by that much in total,
+      // a step per frame, like dragging its corner.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      if v.count == 2, let window = controller.window {
+        var step = 0
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 60, repeats: true) { timer in
+          MainActor.assumeIsolated {
+            var frame = window.frame
+            let delta = v[0] / v[1]
+            frame.size.width += delta
+            frame.size.height += delta
+            frame.origin.y -= delta
+            window.setFrame(frame, display: true)
+            step += 1
+            if Double(step) >= v[1] { timer.invalidate() }
+          }
+        }
       }
     case "window-size":
       // window-size:<width>,<height>

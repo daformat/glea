@@ -926,9 +926,12 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
   private let preview: NSTextField
   private let anchor: NSRect
   private let lastTarget: NoteRef?
+  /// Listed first and selected (a peek's note), before today's journal.
+  private let preferred: NoteRef?
 
   /// `anchor` is the captured element's rect in this view's coordinates.
-  init(capture: Capture, anchor: NSRect, lastTarget: NoteRef?) {
+  init(capture: Capture, anchor: NSRect, lastTarget: NoteRef?, preferred: NoteRef? = nil) {
+    self.preferred = preferred
     self.anchor = anchor
     self.lastTarget = lastTarget
     let text = capture.kind == .page ? capture.pageTitle : (capture.text.isEmpty ? capture.markdown : capture.text)
@@ -1034,6 +1037,10 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
     if q.isEmpty {
       if let lastTarget, lastTarget != store.today, store.exists(lastTarget) { refs.append(lastTarget) }
       refs.insert(store.today, at: 0)
+      if let preferred, preferred == store.today || store.exists(preferred) {
+        refs.removeAll { $0 == preferred }
+        refs.insert(preferred, at: 0)
+      }
       refs += store.notes.filter { !refs.contains($0) }.prefix(4)
     } else {
       refs = store.search(q, limit: 5).map(\.ref)
