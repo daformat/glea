@@ -5,9 +5,9 @@ What changed in each release of Glea.
 ## 0.18.0 Beta — 2026-10-17
 
 - Peek: clicking a web link in a note or the journal opens the page in a
-  card over your notes, without a tab. Above it, *Open as Tab*
+  card over your notes, without a tab. Above it, Open as Tab
   (<kbd>⌘</kbd><kbd>↩</kbd>) moves the page to the tab bar as it is;
-  *Collect Page* (<kbd>⌘</kbd><kbd>S</kbd>), *Copy Link* and *Close*
+  Collect Page (<kbd>⌘</kbd><kbd>S</kbd>), Copy Link and Close
   (<kbd>esc</kbd>, or a click outside) are beside it. Point and shoot works
   in it, and what you collect offers the note you came from first.
   <kbd>⌘</kbd>-click still opens a tab.
