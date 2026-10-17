@@ -32,6 +32,7 @@
 - (void)requestInspectAt:(CefPoint)point;
 - (void)detachedDevToolsClosed;
 - (void)devToolsMessageReceived:(NSString*)json;
+- (void)pageBackgroundReported:(NSString*)json;
 @property(nonatomic, readonly) BOOL isChromeHosted;
 /// The URL `servedHTML` answers (the initial one).
 @property(nonatomic, readonly, copy) NSString* servedURL;
@@ -147,6 +148,10 @@ class BrowserClient : public CefClient,
     CefRefPtr<CefListValue> args = message->GetArgumentList();
     if (args->GetSize() < 2) return true;
     GleaBrowserView* view = View(browser);
+    if (args->GetString(0) == "background") {
+      [view pageBackgroundReported:ToNS(args->GetString(1))];
+      return true;
+    }
     if ([view.delegate respondsToSelector:@selector(browserView:didReceiveMessage:payload:)]) {
       [view.delegate browserView:view
                didReceiveMessage:ToNS(args->GetString(0))
@@ -796,6 +801,31 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
                                                 (int)(color.blueComponent * 255));
   }
   return settings;
+}
+
+/// The page's own background (from the renderer's background script), behind
+/// it: what shows where the window is larger than the page last painted, as
+/// it grows. Views given a background of their own keep it.
+- (void)pageBackgroundReported:(NSString*)json {
+  if (self.pageBackgroundColor) return;
+  NSData* data = [json dataUsingEncoding:NSUTF8StringEncoding];
+  NSDictionary* payload = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+  NSString* css = [payload isKindOfClass:NSDictionary.class] ? payload[@"color"] : nil;
+  if (![css isKindOfClass:NSString.class]) return;
+  // "rgb(r, g, b)" or "rgba(r, g, b, a)": the alpha is dropped.
+  NSScanner* scanner = [NSScanner scannerWithString:css];
+  scanner.charactersToBeSkipped = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789."] invertedSet];
+  double rgb[3];
+  for (double& component : rgb) {
+    if (![scanner scanDouble:&component]) return;
+  }
+  NSColor* color = [NSColor colorWithSRGBRed:rgb[0] / 255 green:rgb[1] / 255 blue:rgb[2] / 255 alpha:1];
+  if (_chromeWindow) {
+    if (![_chromeWindow.backgroundColor isEqual:color]) _chromeWindow.backgroundColor = color;
+  } else {
+    _pageContainer.wantsLayer = YES;
+    _pageContainer.layer.backgroundColor = color.CGColor;
+  }
 }
 
 - (void)createChromeBrowser {

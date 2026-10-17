@@ -87,6 +87,58 @@ const char kAudibleScript[] = R"JS((() => {
   });
 })();)JS";
 
+// Tells the app the colour behind a web page (the root's background, else the
+// body's, else the canvas), posting "background" when it changes: the page's
+// window is filled with it, so growing the window never flashes another
+// colour before Chromium paints the page at its new size.
+const char kBackgroundScript[] = R"JS((() => {
+  if (window.__gleaBackground) return;
+  window.__gleaBackground = true;
+  const native = window.__gleaNative;
+  if (!native) return;
+  const opaque = (c) => c && c !== 'transparent' && !/^rgba\(.*,\s*0\)$/.test(c);
+  function color() {
+    const root = document.documentElement;
+    if (!root) return '';
+    const style = getComputedStyle(root);
+    if (opaque(style.backgroundColor)) return style.backgroundColor;
+    const body = document.body && getComputedStyle(document.body).backgroundColor;
+    if (opaque(body)) return body;
+    // Chromium's canvas: dark when the page opts in and the system is dark.
+    const scheme = style.colorScheme || '';
+    const dark = scheme.includes('dark') && (!scheme.includes('light') || matchMedia('(prefers-color-scheme: dark)').matches);
+    return dark ? 'rgb(18, 18, 18)' : 'rgb(255, 255, 255)';
+  }
+  let sent = '';
+  let timer = 0;
+  function check() {
+    timer = 0;
+    const now = color();
+    if (!now || now === sent) return;
+    sent = now;
+    native.post('background', JSON.stringify({ color: now }));
+  }
+  const schedule = () => { if (!timer) timer = setTimeout(check, 100); };
+  // Theme switches change the root's or the body's class, style or data.
+  const observer = new MutationObserver(schedule);
+  let body = null;
+  function observe() {
+    const root = document.documentElement;
+    if (!root) return;
+    observer.observe(root, { attributes: true });
+    if (document.body && document.body !== body) {
+      body = document.body;
+      observer.observe(body, { attributes: true });
+    }
+    schedule();
+  }
+  document.addEventListener('DOMContentLoaded', observe);
+  window.addEventListener('load', observe);
+  window.addEventListener('pageshow', schedule);
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', schedule);
+  observe();
+})();)JS";
+
 class PostHandler : public CefV8Handler {
  public:
   bool Execute(const CefString& name,
@@ -150,6 +202,9 @@ class RendererApp : public CefApp, public CefRenderProcessHandler {
     auto it = scripts_.find(browser->GetIdentifier());
     std::string url = frame->GetURL().ToString();
     bool web = url.rfind("http", 0) == 0 || url.rfind("file:", 0) == 0 || url.rfind("chrome-error:", 0) == 0;
+    // Chrome's own pages (history, extensions...) are filled with their
+    // background too.
+    bool painted = web || url.rfind("chrome://", 0) == 0;
     // Every web frame says whether it plays sound; subframes (embedded
     // players) only that.
     bool audibleWatched = url.rfind("http", 0) == 0 || url.rfind("file:", 0) == 0;
@@ -170,11 +225,12 @@ class RendererApp : public CefApp, public CefRenderProcessHandler {
       LOG(WARNING) << "glea: context created for " << frame->GetURL().ToString()
                    << " script=" << (it != scripts_.end());
     }
-    if (script.empty() && !audibleWatched) return;
+    if (script.empty() && !audibleWatched && !painted) return;
 
     InstallNative(context);
     if (!script.empty()) Evaluate(context, script);
     if (audibleWatched) Evaluate(context, kAudibleScript);
+    if (painted) Evaluate(context, kBackgroundScript);
   }
 
   /// `__gleaNative.post(name, json)`, for the scripts.
