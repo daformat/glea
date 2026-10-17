@@ -30,6 +30,7 @@ set(GLEA_APP "${CMAKE_CURRENT_BINARY_DIR}/Glea.app")
 set(BRIDGE_INCLUDE "${CMAKE_CURRENT_SOURCE_DIR}/src/bridge/include")
 
 add_library(glea_bridge STATIC
+  src/bridge/branding.mm
   src/bridge/glea_browser_view.mm
   src/bridge/glea_main.mm
   src/bridge/chrome_harness.mm
@@ -55,12 +56,13 @@ foreach(_suffix_list ${CEF_HELPER_APP_SUFFIXES})
   set(_plist "${CMAKE_CURRENT_BINARY_DIR}/helper-Info${_target_suffix}.plist")
   configure_file(src/mac/helper-Info.plist.in ${_plist} @ONLY)
 
-  add_executable(${_target} MACOSX_BUNDLE src/bridge/helper_main.mm)
+  add_executable(${_target} MACOSX_BUNDLE src/bridge/helper_main.mm src/bridge/branding.mm)
   SET_EXECUTABLE_TARGET_PROPERTIES(${_target})
   target_include_directories(${_target} PRIVATE src/bridge)
   target_compile_options(${_target} PRIVATE -Wno-error)
   add_dependencies(${_target} libcef_dll_wrapper)
-  target_link_libraries(${_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+  target_compile_options(${_target} PRIVATE -fobjc-arc)
+  target_link_libraries(${_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS} "-framework ImageIO")
   set_target_properties(${_target} PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST ${_plist}
     OUTPUT_NAME ${HELPER_NAME}
@@ -141,7 +143,7 @@ target_compile_options(Glea PRIVATE
   "$<$<COMPILE_LANGUAGE:Swift>:SHELL:-F ${SPARKLE_DIR}>"
   "$<$<COMPILE_LANGUAGE:Swift>:-O>"
 )
-target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CEF_STANDARD_LIBS})
+target_link_libraries(Glea PRIVATE glea_bridge SwiftMath libcef_dll_wrapper ${CEF_STANDARD_LIBS} "-framework ImageIO")
 # (swiftc links: linker flags go through -Xlinker.)
 target_link_options(Glea PRIVATE "SHELL:-F ${SPARKLE_DIR}" "SHELL:-framework Sparkle"
   "SHELL:-Xlinker -rpath -Xlinker @executable_path/../Frameworks")

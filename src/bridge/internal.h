@@ -6,6 +6,7 @@
 #include <functional>
 
 #include "include/cef_client.h"
+#include "include/cef_resource_bundle_handler.h"
 
 #ifdef __OBJC__
 #import <Cocoa/Cocoa.h>
@@ -42,6 +43,9 @@ CefRefPtr<CefWindow> ChromeWindowFor(NSWindow* window);
 
 // Closes every Chromium-created window.
 void CloseAllWindows();
+
+// Glea's name and icon in Chromium's strings and logos (branding.mm).
+CefRefPtr<CefResourceBundleHandler> Branding();
 
 // Client for browser windows Chrome creates through its own UI.
 CefRefPtr<CefClient> ChromeUIClient();

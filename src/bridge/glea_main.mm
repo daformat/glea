@@ -43,6 +43,7 @@ namespace {
 class BrowserApp : public CefApp, public CefBrowserProcessHandler {
  public:
   CefRefPtr<CefBrowserProcessHandler> GetBrowserProcessHandler() override { return this; }
+  CefRefPtr<CefResourceBundleHandler> GetResourceBundleHandler() override { return glea::Branding(); }
 
   // Tabs opened by Chrome ("new tab" command) carry no per-browser data, so
   // renderers get the tab content script at launch (they can't read files).

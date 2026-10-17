@@ -139,6 +139,65 @@ const char kBackgroundScript[] = R"JS((() => {
   observe();
 })();)JS";
 
+// Chromium's pages draw its logo as an icon too ("About" in chrome://settings'
+// menu): Glea's mark instead, wherever an iconset has it.
+const char kBrandingScript[] = R"JS((() => {
+  // Glea's icon: its rounded square, with the mark cut out of it. (Built
+  // node by node: these pages refuse innerHTML, Trusted Types.)
+  const svg = (name, attributes) => {
+    const element = document.createElementNS('http://www.w3.org/2000/svg', name);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+    return element;
+  };
+  const mark = () => {
+    const cutout = svg('mask', { id: 'glea-mark-cutout' });
+    cutout.append(
+        svg('rect', { width: '24', height: '24', fill: 'white' }),
+        svg('path', {
+          fill: 'none', stroke: 'black', 'stroke-width': '1.6', 'stroke-linecap': 'round',
+          d: 'M10.4 6H8.6A2.6 2.6 0 0 0 6 8.6v1.8M13.6 6h1.8A2.6 2.6 0 0 1 18 8.6v1.8' +
+              'M18 13.6v1.8a2.6 2.6 0 0 1-2.6 2.6h-1.8M10.4 18H8.6A2.6 2.6 0 0 1 6 15.4v-1.8',
+        }));
+    return [cutout, svg('rect', { x: '2', y: '2', width: '20', height: '20', rx: '4.6', mask: 'url(#glea-mark-cutout)' })];
+  };
+  // Icons drawn before their iconset changed are drawn again.
+  const redraw = (root) => {
+    for (const element of root.querySelectorAll('*')) {
+      if (element.localName === 'cr-icon' && String(element.icon).endsWith(':chrome-product')) {
+        const name = element.icon;
+        element.icon = '';
+        Promise.resolve(element.updateComplete).then(() => { element.icon = name; });
+      }
+      if (element.shadowRoot) redraw(element.shadowRoot);
+    }
+  };
+  let changed = false;
+  const rebrand = () => {
+    for (const icon of document.querySelectorAll('cr-iconset g#chrome-product, iron-iconset-svg g#chrome-product')) {
+      if (icon.dataset.glea) continue;
+      icon.dataset.glea = '1';
+      icon.removeAttribute('viewBox');
+      icon.replaceChildren(...mark());
+      changed = true;
+    }
+  };
+  // chrome://settings/help: Chromium's updater doesn't update Glea (Glea
+  // does): never show what it says.
+  if (location.host === 'settings') {
+    customElements.whenDefined('settings-about-page').then(() => {
+      const page = customElements.get('settings-about-page').prototype;
+      if (typeof page.updateShowUpdateStatus_ !== 'function') return;
+      page.updateShowUpdateStatus_ = function () { this.showUpdateStatus_ = false; };
+    });
+  }
+  // Iconsets are added to the document as the page's modules load.
+  new MutationObserver(rebrand).observe(document, { childList: true, subtree: true });
+  rebrand();
+  for (const delay of [0, 500, 2000]) {
+    window.addEventListener('load', () => setTimeout(() => { if (changed) redraw(document); }, delay));
+  }
+})();)JS";
+
 class PostHandler : public CefV8Handler {
  public:
   bool Execute(const CefString& name,
@@ -184,6 +243,8 @@ const CefString& TabScript() {
 class RendererApp : public CefApp, public CefRenderProcessHandler {
  public:
   CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return this; }
+  // Chromium's pages built in the renderer (error pages) say Glea too.
+  CefRefPtr<CefResourceBundleHandler> GetResourceBundleHandler() override { return glea::Branding(); }
 
   void OnBrowserCreated(CefRefPtr<CefBrowser> browser,
                         CefRefPtr<CefDictionaryValue> extra_info) override {
@@ -231,6 +292,7 @@ class RendererApp : public CefApp, public CefRenderProcessHandler {
     if (!script.empty()) Evaluate(context, script);
     if (audibleWatched) Evaluate(context, kAudibleScript);
     if (painted) Evaluate(context, kBackgroundScript);
+    if (url.rfind("chrome://", 0) == 0) Evaluate(context, kBrandingScript);
   }
 
   /// `__gleaNative.post(name, json)`, for the scripts.
