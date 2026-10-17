@@ -2,6 +2,18 @@
 
 What changed in each release of Glea.
 
+## 0.17.2 Beta — 2026-10-17
+
+- A downloads button: it appears once you download something, and its
+  ring fills as files download. Its list shows each download's progress,
+  lets you pause, resume or cancel it, and open it or show it in Finder.
+  A new download flies to the button, also in the sidebar.
+- Resizing a window no longer shows white bands beside the page: the page's
+  own color fills the gap until it catches up.
+- Chromium's own pages (settings, extensions, history…) say Glea, with
+  Glea's icon, and About shows Glea's version.
+- Pinned extensions are spaced like the other buttons.
+
 ## 0.17.1 Beta — 2026-10-16
 
 - A new journal starts with Glea 101 on the day before today: the few
