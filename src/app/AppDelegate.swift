@@ -244,6 +244,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     view.addItem(withTitle: "Zoom Out", action: #selector(BrowserWindowController.zoomOutPage(_:)), keyEquivalent: "-")
     view.addItem(withTitle: "Actual Size", action: #selector(BrowserWindowController.actualSizePage(_:)), keyEquivalent: "0")
     view.addItem(.separator())
+    view.addItem(withTitle: "Browser Settings", action: #selector(BrowserWindowController.showBrowserSettings(_:)), keyEquivalent: "")
     let devTools = NSMenu(title: "Developer Tools")
     item(devTools, "Show Developer Tools", #selector(BrowserWindowController.showDeveloperTools(_:)), "i", [.command, .option])
     devTools.addItem(.separator())
@@ -257,6 +258,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let history = submenu(main, "History")
     history.addItem(withTitle: "Back", action: #selector(BrowserWindowController.goBack(_:)), keyEquivalent: "[")
     history.addItem(withTitle: "Forward", action: #selector(BrowserWindowController.goForward(_:)), keyEquivalent: "]")
+    history.addItem(.separator())
+    // Chrome's shortcut.
+    history.addItem(withTitle: "Show Web History", action: #selector(BrowserWindowController.showWebHistory(_:)), keyEquivalent: "y")
 
     let window = submenu(main, "Window")
     window.addItem(withTitle: "Extensions", action: #selector(BrowserWindowController.showExtensionsPage(_:)), keyEquivalent: "")

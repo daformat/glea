@@ -1878,6 +1878,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   @objc func showExtensionsPage(_ sender: Any?) { openTab("chrome://extensions") }
+  @objc func showWebHistory(_ sender: Any?) { openTab("chrome://history") }
+  @objc func showBrowserSettings(_ sender: Any?) { openTab("chrome://settings") }
 
   private lazy var knownExtensionIDs = Set(ExtensionStore.installed().map(\.id))
 

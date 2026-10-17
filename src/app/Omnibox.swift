@@ -758,6 +758,9 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
         let engine = SearchEngine.current
         items.append(PickerItem(icon: "magnifyingglass", title: q, subtitle: "Search \(engine.name)\(newTab)", action: .open(url: engine.searchURL(q))))
       }
+      for page in BrowserPage.matching(q).prefix(2) {
+        items.append(PickerItem(icon: page.icon, title: page.title, subtitle: "\(openHint) · \(page.url)", action: .open(url: page.url)))
+      }
       for result in store.search(q, limit: 5) {
         let isJournal = result.ref.kind == .journal
         items.append(PickerItem(icon: isJournal ? "calendar" : "doc.text", title: result.ref.displayTitle,
@@ -1077,6 +1080,35 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
       return true
     default:
       return false
+    }
+  }
+}
+
+/// Chromium's pages worth finding (most also in the menus: History, View,
+/// Window), suggested in the omnibox by name.
+struct BrowserPage {
+  let title: String
+  let url: String
+  let icon: String
+  /// Other words for it.
+  let keywords: [String]
+
+  static let all = [
+    BrowserPage(title: "Web History", url: "chrome://history", icon: "clock.arrow.circlepath", keywords: ["visited", "browsing"]),
+    BrowserPage(title: "Browser Settings", url: "chrome://settings", icon: "gearshape",
+                keywords: ["preferences", "privacy", "cookies", "autofill", "search engine"]),
+    BrowserPage(title: "Password Manager", url: "chrome://password-manager", icon: "key", keywords: ["passwords", "logins", "passkeys"]),
+    BrowserPage(title: "Extensions", url: "chrome://extensions", icon: "puzzlepiece.extension", keywords: ["add-ons", "plugins"]),
+  ]
+
+  /// Those with a word (of the name or keywords) starting with `query`, from
+  /// two letters typed.
+  static func matching(_ query: String) -> [BrowserPage] {
+    let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+    guard q.count >= 2 else { return [] }
+    return all.filter { page in
+      let names = [page.title.lowercased()] + page.keywords
+      return names.contains { name in name.hasPrefix(q) || name.split(separator: " ").contains { $0.hasPrefix(q) } }
     }
   }
 }
