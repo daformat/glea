@@ -2,6 +2,13 @@
 
 What changed in each release of Glea.
 
+## 0.17.3 Beta — 2026-10-17
+
+- History › Show Web History (<kbd>⌘Y</kbd>) lists the pages you've visited,
+  and View › Browser Settings opens the browser's settings.
+- Type "history", "settings", "extensions" or "passwords" in the omnibox
+  to go to those pages, and to the Password Manager.
+
 ## 0.17.2 Beta — 2026-10-17
 
 - A downloads button: it appears once you download something, and its
