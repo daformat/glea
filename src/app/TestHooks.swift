@@ -120,6 +120,7 @@ enum TestHooks {
     case "option": controller.modifierFlagsChanged(argument == "down" ? .option : [])
     case "collect": controller.collectPage(nil)
     case "find": controller.findInPage(nil)
+    case "downloads-menu": controller.topBar.clickDownloadsButtonForTesting()
     case "hover-tab":
       // hover-tab:<index> (or -1 to stop): the tab as if the pointer were over it.
       if let i = Int(argument) {

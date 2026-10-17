@@ -108,7 +108,8 @@ enum ExtensionPins {
 /// Where the extensions menu or a popup goes (flipped coordinates): under
 /// its button, right-aligned with it; above it when there's no room below
 /// (the sidebar's buttons are at the window's bottom).
-private func extensionCardOrigin(size: NSSize, anchor: NSRect, in bounds: NSRect) -> NSPoint {
+/// Where a toolbar button's card goes: under it (above when there's no room).
+func extensionCardOrigin(size: NSSize, anchor: NSRect, in bounds: NSRect) -> NSPoint {
   let x = min(max(12, anchor.maxX - size.width), bounds.width - size.width - 12)
   let below = anchor.maxY + 6
   let fitsBelow = below + size.height <= bounds.height - 12

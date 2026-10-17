@@ -71,7 +71,8 @@ extension TabGroupPalette {
 
 /// A menu item that runs a closure.
 final class ClosureMenuItem: NSMenuItem {
-  private let handler: () -> Void
+  /// What choosing it does (a menu kept open can change it).
+  var handler: () -> Void
 
   init(title: String, action handler: @escaping () -> Void) {
     self.handler = handler

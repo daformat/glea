@@ -33,6 +33,14 @@
 - (void)detachedDevToolsClosed;
 - (void)devToolsMessageReceived:(NSString*)json;
 - (void)pageBackgroundReported:(NSString*)json;
+- (void)hideDownloadStartedAnimation;
+@end
+
+@interface GleaDownload ()
++ (void)update:(CefRefPtr<CefDownloadItem>)item callback:(CefRefPtr<CefDownloadItemCallback>)callback;
+@end
+
+@interface GleaBrowserView ()
 @property(nonatomic, readonly) BOOL isChromeHosted;
 /// The URL `servedHTML` answers (the initial one).
 @property(nonatomic, readonly, copy) NSString* servedURL;
@@ -450,12 +458,14 @@ class BrowserClient : public CefClient,
       path = [downloads stringByAppendingPathComponent:candidate];
     }
     callback->Continue(ToCef(path), false);
+    [View(browser) hideDownloadStartedAnimation];
     return true;
   }
 
   void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
                          CefRefPtr<CefDownloadItem> download_item,
                          CefRefPtr<CefDownloadItemCallback> callback) override {
+    [GleaDownload update:download_item callback:callback];
     if (!download_item->IsComplete()) return;
     NSString* path = ToNS(download_item->GetFullPath());
     [[NSDistributedNotificationCenter defaultCenter]
@@ -677,7 +687,7 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
   GleaBrowsingSession* session = [super new];
   // No cache path: Chromium keeps this context's storage in memory only.
   CefRequestContextSettings settings;
-  session->_context = CefRequestContext::CreateContext(settings, nullptr);
+  session->_context = CefRequestContext::CreateContext(settings, glea::ProfilePrefs());
   return session;
 }
 
@@ -691,9 +701,57 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
     CefRequestContextSettings settings;
     CefString(&settings.cache_path) = path.UTF8String;
     settings.persist_session_cookies = true;
-    session->_context = CefRequestContext::CreateContext(settings, nullptr);
+    session->_context = CefRequestContext::CreateContext(settings, glea::ProfilePrefs());
   }
   return session;
+}
+
+@end
+
+NSNotificationName const GleaDownloadDidUpdateNotification = @"GleaDownloadDidUpdate";
+
+@implementation GleaDownload
+
+/// What cancels each download still in progress.
+static std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>>& DownloadCallbacks() {
+  static std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>> callbacks;
+  return callbacks;
+}
+
++ (void)update:(CefRefPtr<CefDownloadItem>)item callback:(CefRefPtr<CefDownloadItemCallback>)callback {
+  // (Before the path is chosen there's nothing to show yet.)
+  NSString* path = ToNS(item->GetFullPath());
+  if (path.length == 0) return;
+  GleaDownload* download = [[GleaDownload alloc] init];
+  download->_identifier = item->GetId();
+  download->_path = path;
+  download->_receivedBytes = item->GetReceivedBytes();
+  download->_totalBytes = item->GetTotalBytes() > 0 ? item->GetTotalBytes() : -1;
+  download->_complete = item->IsComplete();
+  download->_failed = item->IsCanceled() || item->IsInterrupted();
+  download->_paused = item->IsPaused();
+  download->_speed = item->GetCurrentSpeed();
+  if (download->_complete || download->_failed) {
+    DownloadCallbacks().erase(download->_identifier);
+  } else {
+    DownloadCallbacks()[download->_identifier] = callback;
+  }
+  [[NSNotificationCenter defaultCenter] postNotificationName:GleaDownloadDidUpdateNotification object:download];
+}
+
++ (void)cancelDownloadWithIdentifier:(uint32_t)identifier {
+  auto it = DownloadCallbacks().find(identifier);
+  if (it != DownloadCallbacks().end()) it->second->Cancel();
+}
+
++ (void)pauseDownloadWithIdentifier:(uint32_t)identifier {
+  auto it = DownloadCallbacks().find(identifier);
+  if (it != DownloadCallbacks().end()) it->second->Pause();
+}
+
++ (void)resumeDownloadWithIdentifier:(uint32_t)identifier {
+  auto it = DownloadCallbacks().find(identifier);
+  if (it != DownloadCallbacks().end()) it->second->Resume();
 }
 
 @end
@@ -826,6 +884,28 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
     _pageContainer.wantsLayer = YES;
     _pageContainer.layer.backgroundColor = color.CGColor;
   }
+}
+
+/// Chrome's "download started" animation flies to its toolbar's downloads
+/// button, which Glea hides (Glea has its own, see the app's Downloads): a
+/// click-through popup it opens over the page as the download starts. Hide
+/// such popups for a moment then.
+- (void)hideDownloadStartedAnimation {
+  NSWindow* page = _chromeWindow.window;
+  if (!page) return;
+  void (^hide)(void) = ^{
+    for (NSWindow* child in page.childWindows) {
+      if (child.ignoresMouseEvents && child.isVisible) [child orderOut:nil];
+    }
+  };
+  hide();
+  __block int ticks = 0;
+  [NSTimer scheduledTimerWithTimeInterval:1.0 / 60
+                                  repeats:YES
+                                    block:^(NSTimer* timer) {
+                                      hide();
+                                      if (++ticks >= 120) [timer invalidate];
+                                    }];
 }
 
 - (void)createChromeBrowser {

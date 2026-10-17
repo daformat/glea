@@ -139,13 +139,28 @@ struct PickerItem {
   var shortcut: String? = nil
   /// A divider above the row (Beam's, before "Create Note").
   var dividerAbove = false
+  /// A bar under the text: how far it is (a download's progress, 0...1).
+  var progress: Double? = nil
+  /// Buttons at the end of the row, always shown (a download's).
+  var buttons: [PickerButton] = []
+  /// Taller than the list's rows (one with a progress bar).
+  var height: CGFloat? = nil
+}
+
+/// One of a row's own buttons: clicking it doesn't choose the row.
+struct PickerButton {
+  let symbol: String
+  let tooltip: String
+  let action: () -> Void
 }
 
 /// Search field + result list used by the omnibox and the capture panel.
 final class PickerList: NSView, NSTableViewDataSource, NSTableViewDelegate {
   var items: [PickerItem] = [] {
     didSet {
+      // Heights change with the items (a download's bar comes and goes).
       tableView.reloadData()
+      tableView.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: 0..<items.count))
       if !items.isEmpty { select(min(max(selectedIndex, 0), items.count - 1)) }
     }
   }
@@ -278,6 +293,15 @@ final class PickerList: NSView, NSTableViewDataSource, NSTableViewDelegate {
 
   func numberOfRows(in tableView: NSTableView) -> Int { items.count }
 
+  func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+    items.indices.contains(row) ? items[row].height ?? rowHeight : rowHeight
+  }
+
+  /// The rows' heights, together (the first `limit` of them).
+  func contentHeight(limit: Int = .max) -> CGFloat {
+    items.prefix(limit).reduce(0) { $0 + ($1.height ?? rowHeight) }
+  }
+
   func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
     let cell = PickerCell()
     cell.configure(items[row], compact: rowHeight < 40)
@@ -334,6 +358,28 @@ private final class PickerCell: NSView {
     divider.translatesAutoresizingMaskIntoConstraints = false
     divider.isHidden = true
     addSubview(divider)
+    buttonStack.orientation = .horizontal
+    buttonStack.spacing = 0
+    buttonStack.translatesAutoresizingMaskIntoConstraints = false
+    buttonStack.setContentHuggingPriority(.required, for: .horizontal)
+    addSubview(buttonStack)
+    progressBar.wantsLayer = true
+    progressBar.layer?.cornerRadius = 1
+    progressBar.layer?.addSublayer(progressFill)
+    progressFill.cornerRadius = 1
+    progressBar.translatesAutoresizingMaskIntoConstraints = false
+    progressBar.isHidden = true
+    addSubview(progressBar)
+    NSLayoutConstraint.activate([
+      buttonStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+      buttonStack.centerYAnchor.constraint(equalTo: centerYAnchor),
+      subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: buttonStack.leadingAnchor, constant: -8),
+      titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: buttonStack.leadingAnchor, constant: -8),
+      progressBar.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+      progressBar.trailingAnchor.constraint(equalTo: buttonStack.leadingAnchor, constant: -8),
+      progressBar.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 5),
+      progressBar.heightAnchor.constraint(equalToConstant: 2),
+    ])
     NSLayoutConstraint.activate([
       shortcutLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
       shortcutLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -356,9 +402,8 @@ private final class PickerCell: NSView {
       icon.widthAnchor.constraint(equalToConstant: 16),
       icon.heightAnchor.constraint(equalToConstant: 16),
       titleLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-      titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-      subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
-      subtitleLabel.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
+      titleCenter,
+      // (Under a progress bar the subtitle has its own line: see configure.)
       subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16),
     ])
   }
@@ -371,6 +416,36 @@ private final class PickerCell: NSView {
   private let shortcutLabel = NSTextField.label("", size: 12, color: Theme.tertiaryText)
   private let divider = NSBox()
   private var pinned: Bool?
+  /// The text sits higher over a progress bar.
+  private lazy var titleCenter = titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor)
+  /// The subtitle after the title, or (under a progress bar) below it.
+  private lazy var inlineSubtitle = [
+    subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 10),
+    subtitleLabel.firstBaselineAnchor.constraint(equalTo: titleLabel.firstBaselineAnchor),
+  ]
+  private lazy var subtitleBelow = [
+    subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+    subtitleLabel.topAnchor.constraint(equalTo: progressBar.bottomAnchor, constant: 4),
+  ]
+  private let buttonStack = NSStackView()
+  private var buttonActions: [() -> Void] = []
+  private let progressBar = NSView()
+  private let progressFill = CALayer()
+  private var progress: Double?
+
+  @objc private func buttonClicked(_ sender: NSButton) {
+    if buttonActions.indices.contains(sender.tag) { buttonActions[sender.tag]() }
+  }
+
+  override func layout() {
+    super.layout()
+    guard let progress else { return }
+    Motion.withoutAnimation {
+      progressBar.layer?.backgroundColor = resolvedCGColor(Theme.secondaryText.withAlphaComponent(0.2))
+      progressFill.backgroundColor = resolvedCGColor(Theme.accent)
+      progressFill.frame = NSRect(x: 0, y: 0, width: progressBar.bounds.width * min(max(progress, 0), 1), height: 2)
+    }
+  }
 
   @objc private func togglePin() { onTogglePin?() }
 
@@ -393,6 +468,31 @@ private final class PickerCell: NSView {
     titleLabel.stringValue = item.title
     titleLabel.font = .systemFont(ofSize: compact ? 13 : 14, weight: .regular)
     subtitleLabel.stringValue = item.subtitle
+    progress = item.progress
+    progressBar.isHidden = item.progress == nil
+    let below = item.progress != nil
+    titleCenter.constant = below ? -12 : 0
+    NSLayoutConstraint.deactivate(below ? inlineSubtitle : subtitleBelow)
+    NSLayoutConstraint.activate(below ? subtitleBelow : inlineSubtitle)
+    subtitleLabel.font = .systemFont(ofSize: below ? 11 : 12)
+    buttonActions = item.buttons.map(\.action)
+    buttonStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+    for (index, spec) in item.buttons.enumerated() {
+      let button = NSButton()
+      button.isBordered = false
+      button.imagePosition = .imageOnly
+      button.image = Theme.symbol(spec.symbol, size: 12)
+      button.contentTintColor = Theme.secondaryText
+      button.toolTip = spec.tooltip
+      button.setAccessibilityLabel(spec.tooltip)
+      button.tag = index
+      button.target = self
+      button.action = #selector(buttonClicked(_:))
+      button.translatesAutoresizingMaskIntoConstraints = false
+      NSLayoutConstraint.activate([button.widthAnchor.constraint(equalToConstant: 26), button.heightAnchor.constraint(equalToConstant: 24)])
+      buttonStack.addArrangedSubview(button)
+    }
+    needsLayout = true
   }
 }
 

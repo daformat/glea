@@ -16,6 +16,7 @@ protocol TopBarDelegate: AnyObject {
   func topBarNewNote()
   func topBarToggleMode()
   func topBarShowExtensions(from anchor: NSRect)
+  func topBarShowDownloads(from anchor: NSRect)
   /// A pinned extension's button: open its popup under it.
   func topBarOpenExtension(_ id: String, from anchor: NSRect)
   func topBarUnpinExtension(_ id: String)
@@ -468,6 +469,17 @@ final class TopBarView: NSView {
     delegate?.topBarOpenExtension(entry.id, from: sender.convert(sender.bounds, to: self))
   }
   private lazy var searchButton = IconButton(symbol: "magnifyingglass", size: 13, tooltip: "Search (⌘T)", target: self, action: #selector(search))
+  /// This session's downloads (see Downloads), once there are any: lists
+  /// them. While they run its circle is a ring filling up.
+  private lazy var downloadsButton = IconButton(symbol: "arrow.down.circle", size: 13, tooltip: "Downloads", target: self,
+                                                action: #selector(showDownloads))
+  private let downloadsTrack = CAShapeLayer()
+  private let downloadsRing = CAShapeLayer()
+  /// The button has its place (in the notes too, hidden: the tabs keep
+  /// their layout).
+  private var hasDownloads: Bool { !Downloads.shared.items.isEmpty }
+  /// It had its place at the last update (hidden only for the notes).
+  private var wasPlaced = false
   /// Notes only: a new note.
   private lazy var newNoteButton = IconButton.newNote(target: self, action: #selector(newNote))
   /// In the notes: sound plays somewhere in the app (a tab, a note's
@@ -533,6 +545,28 @@ final class TopBarView: NSView {
       addSubview(view)
     }
     soundButton.isHidden = true
+    downloadsButton.translatesAutoresizingMaskIntoConstraints = true
+    // Its circle sits low next to the other icons.
+    downloadsButton.iconDrop = -1
+    downloadsButton.isHidden = true
+    addSubview(downloadsButton)
+    for ring in [downloadsTrack, downloadsRing] {
+      ring.fillColor = nil
+      ring.lineWidth = 1.5
+      ring.lineCap = .round
+      ring.isHidden = true
+      downloadsButton.layer?.addSublayer(ring)
+    }
+    Downloads.start()
+    NotificationCenter.default.addObserver(forName: Downloads.didChange, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.updateDownloads() }
+    }
+    NotificationCenter.default.addObserver(forName: Downloads.didFinish, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self, !self.downloadsButton.isHidden else { return }
+        self.downloadsButton.popIn()
+      }
+    }
     NotificationCenter.default.addObserver(forName: SoundMonitor.didChange, object: nil, queue: .main) { [weak self] _ in
       MainActor.assumeIsolated { self?.updateSoundButton() }
     }
@@ -622,6 +656,8 @@ final class TopBarView: NSView {
     separatorLayer.backgroundColor = resolvedCGColor(Theme.separator)
     cardOutline.borderColor = resolvedCGColor(Theme.separator)
     progressLayer.backgroundColor = resolvedCGColor(Theme.accent)
+    downloadsTrack.strokeColor = resolvedCGColor(Theme.secondaryText.withAlphaComponent(0.3))
+    downloadsRing.strokeColor = resolvedCGColor(Theme.accent)
   }
 
   func update(section: Section, tabs: [TabInfo], groups: [GroupInfo], activeID: ObjectIdentifier?, canGoBack: Bool, canGoForward: Bool,
@@ -653,6 +689,7 @@ final class TopBarView: NSView {
       setVisible(notesOnlyViews, !isWeb, animated: animated && !layoutChanged)
     }
     updateSoundButton()
+    updateDownloads()
     layoutItems(animated: animated, added: isWeb ? added : [], reveal: reveal)
     updateProgress()
   }
@@ -721,14 +758,21 @@ final class TopBarView: NSView {
                                    width: size.width, height: size.height), animated: false)
       buttonsLeft = incognitoBadge.frame.minX
     }
-    place(extensionsButton, NSRect(x: searchButton.frame.minX - 4 - 28, y: buttonY, width: 28, height: 28), animated: false)
+    // The web's: downloads, then the extensions.
+    var webLeft = searchButton.frame.minX
+    if hasDownloads {
+      place(downloadsButton, NSRect(x: webLeft - 4 - 28, y: buttonY, width: 28, height: 28), animated: animated)
+      webLeft = downloadsButton.frame.minX
+    }
+    place(extensionsButton, NSRect(x: webLeft - 4 - 28, y: buttonY, width: 28, height: 28), animated: animated)
     // Pinned extensions, right to left from the puzzle button.
     var extensionX = extensionsButton.frame.minX
     for entry in extensionButtons.reversed() {
-      extensionX -= 2 + 28
+      extensionX -= 4 + 28
       place(entry.button, NSRect(x: extensionX, y: buttonY, width: 28, height: 28), animated: animated)
     }
-    var rightEdge = (isWeb && showsExtensions ? extensionX : buttonsLeft) - 12
+    let webButtonsLeft = showsExtensions ? extensionX : min(buttonsLeft, webLeft)
+    var rightEdge = (isWeb ? webButtonsLeft : buttonsLeft) - 12
     if !updatePill.isHidden {
       let size = updatePill.fittingSize
       place(updatePill, NSRect(x: rightEdge + 6 - size.width, y: ((h - size.height) / 2).rounded(),
@@ -757,7 +801,7 @@ final class TopBarView: NSView {
     x += 10
     // Tabs keep their web layout in notes mode (where the extensions are
     // hidden), so switching modes doesn't resize them.
-    var tabsRightEdge = (showsExtensions ? extensionX : buttonsLeft) - 12
+    var tabsRightEdge = (showsExtensions ? extensionX : min(buttonsLeft, webLeft)) - 12
     if !updatePill.isHidden { tabsRightEdge = min(tabsRightEdge, updatePill.frame.minX - 12) }
     tabsView.layoutTabs(from: x, to: tabsRightEdge, animated: animated, added: added, reveal: reveal)
   }
@@ -785,6 +829,11 @@ final class TopBarView: NSView {
     let bottomY = (bottom - 28) / 2
     place(modeButton, NSRect(x: w - 10 - 28, y: bottomY, width: 28, height: 28), animated: false)
     place(searchButton, NSRect(x: modeButton.frame.minX - 4 - 28, y: bottomY, width: 28, height: 28), animated: false)
+    var right = searchButton.frame.minX
+    if hasDownloads {
+      place(downloadsButton, NSRect(x: right - 4 - 28, y: bottomY, width: 28, height: 28), animated: animated)
+      right = downloadsButton.frame.minX
+    }
     var left: CGFloat = 10
     if isIncognito {
       let size = incognitoBadge.fittingSize
@@ -795,10 +844,10 @@ final class TopBarView: NSView {
     place(extensionsButton, NSRect(x: left, y: bottomY, width: 28, height: 28), animated: false)
     // The pinned extensions after it, scrolling (fading at the ends) when
     // they don't all fit before search, like the bar's tabs.
-    let stripX = extensionsButton.frame.maxX + 2
+    let stripX = extensionsButton.frame.maxX + 4
     extensionStrip.isHidden = extensionButtons.isEmpty
-    extensionStrip.frame = NSRect(x: stripX, y: bottomY - 2, width: max(0, searchButton.frame.minX - 4 - stripX), height: 32)
-    extensionStrip.contentLength = CGFloat(extensionButtons.count) * 30 - 2
+    extensionStrip.frame = NSRect(x: stripX, y: bottomY - 2, width: max(0, right - 4 - stripX), height: 32)
+    extensionStrip.contentLength = CGFloat(extensionButtons.count) * 32 - 4
     for entry in extensionButtons where entry.button.superview !== extensionStrip {
       extensionStrip.addSubview(entry.button)
       entry.button.frame = .zero
@@ -820,7 +869,7 @@ final class TopBarView: NSView {
   /// The sidebar's pinned extensions, in their strip as it's scrolled.
   private func layoutExtensionStrip(animated: Bool) {
     for (i, entry) in extensionButtons.enumerated() where entry.button.superview === extensionStrip {
-      place(entry.button, NSRect(x: CGFloat(i) * 30 - extensionStrip.scrollOffset, y: 2, width: 28, height: 28),
+      place(entry.button, NSRect(x: CGFloat(i) * 32 - extensionStrip.scrollOffset, y: 2, width: 28, height: 28),
             animated: animated && entry.button.frame != .zero)
     }
   }
@@ -876,6 +925,52 @@ final class TopBarView: NSView {
     layoutItems(animated: false, added: [])
   }
   @objc private func showExtensions() { delegate?.topBarShowExtensions(from: extensionsButton.frame) }
+
+  @objc private func showDownloads() { delegate?.topBarShowDownloads(from: downloadsButton.frame) }
+
+  /// Shown in the web once there are downloads; the ring while they run
+  /// (turning while their size is unknown).
+  private func updateDownloads() {
+    let downloads = Downloads.shared
+    let show = isWeb && hasDownloads
+    if show == downloadsButton.isHidden {
+      downloadsButton.isHidden = !show
+      downloadsButton.alphaValue = show ? 1 : 0
+      // No frame yet: the layout puts it in place (it pops in there rather
+      // than springing from the bar's corner), the others make room.
+      if show, !wasPlaced { downloadsButton.frame = .zero }
+      layoutItems(animated: window != nil, added: [])
+      if show, window != nil { downloadsButton.popIn() }
+    }
+    wasPlaced = hasDownloads
+    let running = downloads.isDownloading
+    downloadsButton.setSymbol(running ? "arrow.down" : "arrow.down.circle", size: running ? 10 : 13, animated: window != nil)
+    Motion.withoutAnimation {
+      let bounds = downloadsButton.bounds
+      let path = CGMutablePath()
+      // From the top, clockwise (the button isn't flipped), around the arrow.
+      path.addArc(center: CGPoint(x: bounds.midX, y: bounds.midY - downloadsButton.iconDrop), radius: 7, startAngle: .pi / 2, endAngle: .pi / 2 - 2 * .pi,
+                  clockwise: true)
+      for ring in [downloadsTrack, downloadsRing] {
+        ring.frame = bounds
+        ring.path = path
+        ring.isHidden = !running
+      }
+    }
+    guard running else { return downloadsRing.removeAnimation(forKey: "spin") }
+    if let progress = downloads.progress {
+      downloadsRing.removeAnimation(forKey: "spin")
+      downloadsRing.strokeEnd = max(0.03, progress)
+    } else if downloadsRing.animation(forKey: "spin") == nil {
+      Motion.withoutAnimation { downloadsRing.strokeEnd = 0.25 }
+      let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+      spin.fromValue = 0
+      spin.toValue = -2 * CGFloat.pi
+      spin.duration = 1
+      spin.repeatCount = .infinity
+      downloadsRing.add(spin, forKey: "spin")
+    }
+  }
   @objc private func toggleMode() { delegate?.topBarToggleMode() }
 
   /// ⌥ pressed or released mid-drag.
@@ -883,6 +978,15 @@ final class TopBarView: NSView {
 
   /// Test hooks: the puzzle button, as if clicked.
   func clickExtensionsButtonForTesting() { showExtensions() }
+
+  /// Where a starting download flies (in this view), when shown.
+  var downloadsButtonFrame: NSRect? { downloadsButton.isHidden ? nil : downloadsButton.frame }
+
+  /// A download reached the button.
+  func popDownloadsButton() { downloadsButton.popIn() }
+
+  /// Test hooks: the downloads button, as if clicked (its menu stays open).
+  func clickDownloadsButtonForTesting() { showDownloads() }
 
   /// Test hooks: the tab at `index` as if hovered.
   func simulateHover(tabAt index: Int, _ on: Bool) { tabsView.simulateHover(tabAt: index, on) }

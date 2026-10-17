@@ -1,6 +1,7 @@
 #import "GleaBridge.h"
 
 #include "include/cef_app.h"
+#include "include/cef_request_context.h"
 #include "include/cef_application_mac.h"
 #include "include/wrapper/cef_library_loader.h"
 #include "internal.h"
@@ -62,6 +63,7 @@ class BrowserApp : public CefApp, public CefBrowserProcessHandler {
 
   // Chrome-style browsers can only be created once the context is ready.
   void OnContextInitialized() override {
+    glea::ApplyProfilePrefs(CefRequestContext::GetGlobalContext());
     if (NSString* harness = NSProcessInfo.processInfo.environment[@"GLEA_CHROME_HARNESS"]) GleaRunChromeHarness(harness);
   }
 

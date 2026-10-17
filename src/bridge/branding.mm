@@ -11,6 +11,7 @@
 #include <string>
 
 #include "include/cef_id_mappers.h"
+#include "include/cef_request_context.h"
 #include "include/cef_resource_bundle.h"
 #include "include/cef_resource_bundle_handler.h"
 #include "internal.h"
@@ -231,7 +232,36 @@ class BrandingHandler : public CefResourceBundleHandler {
 
 }  // namespace
 
+namespace {
+
+class ProfilePrefsHandler : public CefRequestContextHandler {
+ public:
+  void OnRequestContextInitialized(CefRefPtr<CefRequestContext> context) override { glea::ApplyProfilePrefs(context); }
+
+ private:
+  IMPLEMENT_REFCOUNTING(ProfilePrefsHandler);
+};
+
+}  // namespace
+
 namespace glea {
+
+void ApplyProfilePrefs(CefRefPtr<CefRequestContext> context) {
+  if (!context) return;
+  // Glea lists downloads itself (its downloads button): Chrome's bubble,
+  // which pops up as one finishes, never shows.
+  CefRefPtr<CefValue> off = CefValue::Create();
+  off->SetBool(false);
+  CefString error;
+  if (context->CanSetPreference("download_bubble.partial_view_enabled")) {
+    context->SetPreference("download_bubble.partial_view_enabled", off, error);
+  }
+}
+
+CefRefPtr<CefRequestContextHandler> ProfilePrefs() {
+  static CefRefPtr<CefRequestContextHandler> handler = new ProfilePrefsHandler;
+  return handler;
+}
 
 CefRefPtr<CefResourceBundleHandler> Branding() {
   static CefRefPtr<CefResourceBundleHandler> handler = new BrandingHandler;

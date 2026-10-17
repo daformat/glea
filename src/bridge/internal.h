@@ -6,6 +6,7 @@
 #include <functional>
 
 #include "include/cef_client.h"
+#include "include/cef_request_context_handler.h"
 #include "include/cef_resource_bundle_handler.h"
 
 #ifdef __OBJC__
@@ -43,6 +44,12 @@ CefRefPtr<CefWindow> ChromeWindowFor(NSWindow* window);
 
 // Closes every Chromium-created window.
 void CloseAllWindows();
+
+// Sets Glea's preferences on each profile (request context) once it's
+// ready: pass it when creating one (branding.mm). The global one gets them
+// from ApplyProfilePrefs.
+CefRefPtr<CefRequestContextHandler> ProfilePrefs();
+void ApplyProfilePrefs(CefRefPtr<CefRequestContext> context);
 
 // Glea's name and icon in Chromium's strings and logos (branding.mm).
 CefRefPtr<CefResourceBundleHandler> Branding();

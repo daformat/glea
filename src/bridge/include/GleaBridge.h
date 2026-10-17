@@ -137,6 +137,29 @@ NS_SWIFT_UI_ACTOR
 - (void)browserView:(GleaBrowserView*)view requestsInspectElementAt:(NSPoint)point;
 @end
 
+/// A download, as it goes: posted (the object) with
+/// GleaDownloadDidUpdateNotification, on the main thread, at each step.
+@interface GleaDownload : NSObject
+@property(nonatomic, readonly) uint32_t identifier;
+/// Where it's written (in ~/Downloads).
+@property(nonatomic, readonly, copy) NSString* path;
+@property(nonatomic, readonly) int64_t receivedBytes;
+/// -1 while unknown.
+@property(nonatomic, readonly) int64_t totalBytes;
+@property(nonatomic, readonly) BOOL complete;
+/// Canceled, or stopped by an error.
+@property(nonatomic, readonly) BOOL failed;
+@property(nonatomic, readonly) BOOL paused;
+/// Bytes per second, now.
+@property(nonatomic, readonly) int64_t speed;
+/// Stops a download still in progress.
++ (void)cancelDownloadWithIdentifier:(uint32_t)identifier;
++ (void)pauseDownloadWithIdentifier:(uint32_t)identifier;
++ (void)resumeDownloadWithIdentifier:(uint32_t)identifier;
+@end
+
+extern NSNotificationName const GleaDownloadDidUpdateNotification;
+
 /// An NSView hosting one Chromium browser (one tab).
 NS_SWIFT_UI_ACTOR
 @interface GleaBrowserView : NSView

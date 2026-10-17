@@ -664,6 +664,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
     toast.translatesAutoresizingMaskIntoConstraints = false
     toast.onHoverChange = { [weak self] _ in self?.updateOverlayInteractivity() }
+    NotificationCenter.default.addObserver(forName: Downloads.didStart, object: nil, queue: .main) { [weak self] _ in
+      MainActor.assumeIsolated { self?.showDownloadFlight() }
+    }
     overlayRoot.addSubview(toast)
     NSLayoutConstraint.activate([
       toast.centerXAnchor.constraint(equalTo: overlayRoot.centerXAnchor),
@@ -1635,6 +1638,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if tab === activeTab { findBar?.setResult(count: count, active: active) }
   }
 
+  /// A download started from this window: it flies from the page to the
+  /// downloads button (Chrome's own animation is hidden: it aims at a
+  /// toolbar Glea doesn't show).
+  private func showDownloadFlight() {
+    guard let window, window.isKeyWindow || window.isMainWindow || NSApp.keyWindow == overlayWindow,
+          let button = topBar.downloadsButtonFrame else { return }
+    let target = topBar.convert(button, to: nil)
+    let page = activeTab?.browserView.map { $0.convert($0.bounds, to: nil) } ?? window.contentLayoutRect
+    raiseOverlayWindow()
+    overlayRoot.wantsLayer = true
+    DownloadFlight.run(in: overlayRoot, from: NSPoint(x: page.midX, y: page.midY), to: target) { [weak self] in
+      self?.topBar.popDownloadsButton()
+    }
+  }
+
   func tab(_ tab: Tab, didDownload path: String) {
     toast.show("Downloaded \((path as NSString).lastPathComponent)")
   }
@@ -1804,6 +1822,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
         self.openTab(target)
       }
     }
+    present(menu)
+    menu.window?.makeFirstResponder(menu)
+    menu.animateAppear()
+  }
+
+  func topBarShowDownloads(from anchor: NSRect) {
+    guard let menuAnchor = overlayAnchor(forTopBarRect: anchor) else { return }
+    let menu = DownloadsMenu(anchor: menuAnchor)
+    menu.onDismiss = { [weak self] in self?.dismissOverlay() }
     present(menu)
     menu.window?.makeFirstResponder(menu)
     menu.animateAppear()
