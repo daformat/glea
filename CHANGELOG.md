@@ -2,6 +2,11 @@
 
 What changed in each release of Glea.
 
+## 0.20.2 Beta — 2026-10-18
+
+- A note scrolled to its end stays there when you tick a checkbox or
+  type, instead of jumping up a moment later.
+
 ## 0.20.1 Beta — 2026-10-18
 
 - Dragging a tab to the end of the tab bar scrolls the other tabs
