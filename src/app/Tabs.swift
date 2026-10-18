@@ -329,8 +329,11 @@ final class TabStripView: NSView {
   var onScroll: (() -> Void)?
   var axis = TabAxis.horizontal {
     didSet {
-      fade.startPoint = axis == .horizontal ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 0.5, y: 0)
-      fade.endPoint = axis == .horizontal ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0.5, y: 1)
+      // (At once: implicitly animated, the fade swept across the tabs.)
+      Motion.withoutAnimation {
+        fade.startPoint = axis == .horizontal ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 0.5, y: 0)
+        fade.endPoint = axis == .horizontal ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0.5, y: 1)
+      }
       clampOffset()
       updateFade()
     }
