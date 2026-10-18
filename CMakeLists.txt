@@ -128,6 +128,7 @@ add_custom_command(TARGET GleaClipper POST_BUILD
 file(GLOB GLEA_SWIFT_SOURCES CONFIGURE_DEPENDS src/app/*.swift)
 set(GLEA_RESOURCES
   src/resources/content-script.js
+  third_party/pele/pele.js  # Mermaid diagrams (see Mermaid.swift)
   src/resources/AppIcon.icns  # src/mac/AppIcon-artwork.png wrapped by src/mac/wrap-icon.swift
 )
 

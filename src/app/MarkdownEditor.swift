@@ -41,6 +41,12 @@ extension NSAttributedString.Key {
   /// MathBlock: the formula of a `$$…$$` block being edited, drawn under its
   /// source (set on its last line).
   static let gleaMathPreview = NSAttributedString.Key("gleaMathPreview")
+  /// MermaidBlock: a ```mermaid block shown as its diagram, on its first
+  /// line (the others are folded away).
+  static let gleaMermaid = NSAttributedString.Key("gleaMermaid")
+  /// MermaidBlock: the diagram (or why it can't be drawn) under a ```mermaid
+  /// block's source, while it's edited (set on its closing fence).
+  static let gleaMermaidPreview = NSAttributedString.Key("gleaMermaidPreview")
   /// Set on the content of a collapsed section: it takes no space.
   static let gleaFolded = NSAttributedString.Key("gleaFolded")
   /// The line break after a collapsed section's content. It still breaks the
@@ -365,6 +371,16 @@ struct MarkdownStyler {
         index = block.lines.upperBound
         continue
       }
+      if !inFence, isFence, let block = codeBlocks.first(where: { $0.block.location == enclosing.location }),
+         Mermaid.isDiagram(language: block.language), let close = (index + 1..<lines.count).first(where: { fenceLines[$0] }) {
+        let blockLines = Array(lines[index...close])
+        if blockLines.contains(where: { inTarget($0.enclosing) }) {
+          styleMermaidBlock(storage, lines: blockLines, content: block.content,
+                            indent: CGFloat(depths[index]) * MarkdownStyler.sectionIndent)
+        }
+        index = close + 1
+        continue
+      }
       if !inFence, let block = tableAt[index] {
         let blockLines = Array(lines[block])
         if blockLines.contains(where: { inTarget($0.enclosing) }) {
@@ -525,6 +541,58 @@ struct MarkdownStyler {
       if NSMaxRange(last.enclosing) > NSMaxRange(last.line) {
         storage.addAttribute(.gleaFoldEnd, value: true, range: NSRange(location: NSMaxRange(last.line), length: 1))
       }
+    }
+  }
+
+  /// A ```mermaid block: its diagram on its first line (the fence hidden,
+  /// the line as tall as the diagram) and its other lines folded away. While
+  /// the cursor is in it, its source as code with the diagram under it,
+  /// following the typing (or why it can't be drawn).
+  private func styleMermaidBlock(_ storage: NSTextStorage, lines: [(line: NSRange, enclosing: NSRange)], content: NSRange, indent: CGFloat) {
+    guard let first = lines.first, let last = lines.last, lines.count >= 2 else { return }
+    let block = NSRange(location: first.line.location, length: NSMaxRange(last.line) - first.line.location)
+    let source = (storage.string as NSString).substring(with: content)
+    let shows = (selection.map { $0.length > 0 ? NSIntersectionRange($0, block).length > 0
+                                               : $0.location >= block.location && $0.location <= NSMaxRange(block) } ?? false)
+    let empty = source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let available = width - indent - 4
+    let rendered = empty ? nil : Mermaid.render(source, maxWidth: available)
+    guard !shows, case .success(let diagram) = rendered else {
+      for (offset, line) in lines.enumerated() {
+        let isFence = offset == 0 || offset == lines.count - 1
+        styleLine(storage, line: (storage.string as NSString).substring(with: line.line), lineRange: line.line, enclosing: line.enclosing,
+                  inFence: !isFence, isFence: isFence, sectionIndent: indent)
+      }
+      guard let rendered else { return }
+      let preview: MermaidBlock
+      switch rendered {
+      case .success(let diagram): preview = MermaidBlock(diagram: diagram, error: nil, indent: indent, source: source, sourceStart: content.location)
+      case .failure(let error): preview = MermaidBlock(diagram: nil, error: error.message, indent: indent + 12, source: source, sourceStart: content.location)
+      }
+      let below = (storage.attribute(.paragraphStyle, at: last.enclosing.location, effectiveRange: nil) as? NSParagraphStyle)?
+        .mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
+      below.paragraphSpacing = MarkdownStyler.paragraphSpacing + ceil(preview.previewSize(width: available - 12).height) + 20
+      storage.addAttribute(.paragraphStyle, value: below, range: last.enclosing)
+      storage.addAttribute(.gleaMermaidPreview, value: preview, range: last.line)
+      return
+    }
+    let paragraph = NSMutableParagraphStyle()
+    paragraph.lineSpacing = MarkdownStyler.lineSpacing
+    paragraph.paragraphSpacing = MarkdownStyler.paragraphSpacing
+    paragraph.firstLineHeadIndent = indent
+    paragraph.headIndent = indent
+    storage.addAttributes([.paragraphStyle: paragraph, .gleaSectionIndent: NSNumber(value: Double(indent))],
+                          range: NSRange(location: first.enclosing.location, length: NSMaxRange(last.enclosing) - first.enclosing.location))
+    hide(storage, first.line)
+    let tall = paragraph.mutableCopy() as! NSMutableParagraphStyle
+    tall.minimumLineHeight = ceil(diagram.size.height) + 16
+    storage.addAttribute(.paragraphStyle, value: tall, range: first.enclosing)
+    storage.addAttribute(.gleaMermaid, value: MermaidBlock(diagram: diagram, error: nil, indent: indent, source: source, sourceStart: content.location),
+                         range: first.line)
+    let fold = NSRange(location: lines[1].enclosing.location, length: NSMaxRange(last.line) - lines[1].enclosing.location)
+    storage.addAttribute(.gleaFolded, value: true, range: fold)
+    if NSMaxRange(last.enclosing) > NSMaxRange(last.line) {
+      storage.addAttribute(.gleaFoldEnd, value: true, range: NSRange(location: NSMaxRange(last.line), length: 1))
     }
   }
 
@@ -1616,6 +1684,15 @@ final class MarkdownLayoutManager: NSLayoutManager {
             if key == .gleaCode {
               rect.origin.x = origin.x + indent
               rect.size.width = container.size.width - indent
+              // A diagram's preview goes under the block, not in it.
+              var fence = NSRange()
+              if storage.attribute(.gleaMermaidPreview, at: max(run.location, NSMaxRange(run) - 1), longestEffectiveRange: &fence, in: run) != nil
+                  || (NSMaxRange(run) >= 2 && storage.attribute(.gleaMermaidPreview, at: max(run.location, NSMaxRange(run) - 2),
+                                                                 longestEffectiveRange: &fence, in: run) != nil) {
+                let glyphs = glyphRange(forCharacterRange: fence, actualCharacterRange: nil)
+                let used = lineFragmentUsedRect(forGlyphAt: max(glyphs.location, NSMaxRange(glyphs) - 1), effectiveRange: nil)
+                rect.size.height = origin.y + used.maxY - rect.minY
+              }
               Theme.codeBackground.setFill()
               NSBezierPath(roundedRect: rect.insetBy(dx: 0, dy: -2), xRadius: 6, yRadius: 6).fill()
             } else {
@@ -1832,6 +1909,24 @@ final class MarkdownLayoutManager: NSLayoutManager {
       let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.maxY + 10,
                         width: size.width, height: size.height)
       block.render.image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+    }
+
+    // Diagrams: in place of their hidden block, or under its source.
+    storage.enumerateAttribute(.gleaMermaid, in: chars) { value, range, _ in
+      guard let block = value as? MermaidBlock, let diagram = block.diagram else { return }
+      var line = range
+      _ = storage.attribute(.gleaMermaid, at: range.location, longestEffectiveRange: &line, in: NSRange(location: 0, length: storage.length))
+      let used = lineFragmentUsedRect(forGlyphAt: glyphIndexForCharacter(at: line.location), effectiveRange: nil)
+      diagram.draw(at: NSPoint(x: origin.x + block.indent, y: origin.y + used.minY + (used.height - diagram.size.height) / 2))
+    }
+    storage.enumerateAttribute(.gleaMermaidPreview, in: chars) { value, range, _ in
+      guard let block = value as? MermaidBlock else { return }
+      var line = range
+      _ = storage.attribute(.gleaMermaidPreview, at: range.location, longestEffectiveRange: &line, in: NSRange(location: 0, length: storage.length))
+      let glyphs = glyphRange(forCharacterRange: line, actualCharacterRange: nil)
+      let used = lineFragmentUsedRect(forGlyphAt: max(glyphs.location, NSMaxRange(glyphs) - 1), effectiveRange: nil)
+      block.drawPreview(at: NSPoint(x: origin.x + block.indent, y: origin.y + used.maxY + 12),
+                        width: container.size.width - block.indent - 4)
     }
 
     storage.enumerateAttribute(.gleaImage, in: chars) { value, range, _ in
@@ -2290,6 +2385,16 @@ final class MarkdownTextView: NSTextView {
         return placeCursorInMath(MathRender.sourceLocation(of: min(offset, (piece.latex as NSString).length), in: piece.latex,
                                                            source: s, contentStart: piece.sourceStart))
       }
+      if let block = storage.attribute(.gleaMermaid, at: candidate, longestEffectiveRange: &span, in: all) as? MermaidBlock,
+         let diagram = block.diagram {
+        let used = layoutManager.lineFragmentUsedRect(forGlyphAt: layoutManager.glyphIndexForCharacter(at: span.location), effectiveRange: nil)
+        let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.minY + (used.height - diagram.size.height) / 2,
+                          width: diagram.size.width, height: diagram.size.height)
+        // Its source shows, the cursor where it was clicked in it.
+        if rect.insetBy(dx: -2, dy: -4).contains(point) {
+          return placeCursorInMath(block.sourceLocation(at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY)))
+        }
+      }
       if let block = storage.attribute(.gleaMathBlock, at: candidate, longestEffectiveRange: &span, in: all) as? MathBlock {
         let used = layoutManager.lineFragmentUsedRect(forGlyphAt: layoutManager.glyphIndexForCharacter(at: span.location), effectiveRange: nil)
         let size = block.render.size
@@ -2300,8 +2405,19 @@ final class MarkdownTextView: NSTextView {
       }
     }
     // The formula under a block's source, while it's edited (the click is
-    // below the source's last line).
+    // below the source's last line). The same for a diagram.
     var found: Bool?
+    storage.enumerateAttribute(.gleaMermaidPreview, in: all) { value, range, stop in
+      guard let block = value as? MermaidBlock, let diagram = block.diagram else { return }
+      let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
+      let used = layoutManager.lineFragmentUsedRect(forGlyphAt: max(glyphs.location, NSMaxRange(glyphs) - 1), effectiveRange: nil)
+      let rect = NSRect(x: origin.x + block.indent, y: origin.y + used.maxY + 12, width: diagram.size.width, height: diagram.size.height)
+      if rect.insetBy(dx: -2, dy: -4).contains(point) {
+        found = placeCursorInMath(block.sourceLocation(at: NSPoint(x: point.x - rect.minX, y: point.y - rect.minY)))
+        stop.pointee = true
+      }
+    }
+    if let found { return found }
     storage.enumerateAttribute(.gleaMathPreview, in: all) { value, range, stop in
       guard let block = value as? MathBlock else { return }
       let glyphs = layoutManager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -3997,6 +4113,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
       var center = textView.textContainerOrigin.y + baseline - font.capHeight / 2
       // A typeset formula block: level with the middle of the formula.
       if line.length > 0, storage.attribute(.gleaMathBlock, at: line.location, effectiveRange: nil) != nil { center = rect.midY }
+      // A diagram: the same.
+      if line.length > 0, storage.attribute(.gleaMermaid, at: line.location, effectiveRange: nil) != nil { center = rect.midY }
       // A wrapped table: level with its header's first line, drawn at the
       // top of its row (the row's own text, shrunk to nothing, sits at the
       // bottom).

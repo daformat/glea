@@ -375,6 +375,19 @@ enum TestHooks {
       // queue the mouse-up before delivering the mouse-down.
       if let up = mouse(.leftMouseUp) { NSApp.postEvent(up, atStart: false) }
       if let down = mouse(.leftMouseDown) { window.sendEvent(down) }
+    case "click-window":
+      // click-window:<x>,<y> clicks at a point of the window, in points from
+      // its top left (as in a screenshot of it).
+      guard let window = controller.window else { break }
+      let n = argument.split(separator: ",").compactMap { Double($0) }
+      guard n.count == 2 else { break }
+      let point = NSPoint(x: n[0], y: window.frame.height - n[1])
+      func mouse(_ type: NSEvent.EventType) -> NSEvent? {
+        NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+      }
+      if let up = mouse(.leftMouseUp) { NSApp.postEvent(up, atStart: false) }
+      if let down = mouse(.leftMouseDown) { window.sendEvent(down) }
     case "drag-file":
       // Runs AppKit's full drop sequence on the editor with a Finder-like
       // file pasteboard, and logs what each step answered.

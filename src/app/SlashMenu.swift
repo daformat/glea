@@ -38,6 +38,8 @@ struct SlashItem {
     calloutItem("Example", "example", [], "list.bullet.rectangle"),
     SlashItem(title: "Code Block", keywords: ["code", "snippet", "fence"], symbol: "chevron.left.forwardslash.chevron.right",
               hint: "```", apply: { $0.insertCodeBlock() }),
+    SlashItem(title: "Diagram", keywords: ["mermaid", "flowchart", "chart", "graph", "sequence", "gantt"], symbol: "point.3.connected.trianglepath.dotted",
+              hint: "mermaid", apply: { $0.insertCodeBlock(language: "mermaid") }),
     SlashItem(title: "Math Block", keywords: ["equation", "latex", "formula", "tex"], symbol: "function", hint: "$$",
               apply: { $0.insertMathBlock() }),
     SlashItem(title: "Inline Math", keywords: ["equation", "latex", "formula", "tex"], symbol: "x.squareroot", hint: "$ $",
@@ -276,15 +278,15 @@ extension MarkdownTextView {
   }
 
   /// A fenced code block at the cursor, with the cursor inside it.
-  func insertCodeBlock() {
+  func insertCodeBlock(language: String = "") {
     let s = string as NSString
     let location = selectedRange().location
     let lineStart = s.lineRange(for: NSRange(location: location, length: 0)).location
     let before = location == lineStart ? "" : "\n"
     let after = location < s.length && s.character(at: location) != 0x0A ? "\n" : ""
-    let block = before + "```\n\n```" + after
+    let block = before + "```" + language + "\n\n```" + after
     replace(NSRange(location: location, length: 0), with: block,
-            select: NSRange(location: location + (before as NSString).length + 4, length: 0))
+            select: NSRange(location: location + (before as NSString).length + 4 + (language as NSString).length, length: 0))
   }
 
   /// A horizontal rule on its own line, below a blank line (otherwise the

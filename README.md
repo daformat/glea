@@ -231,6 +231,8 @@ Glea's design is inspired by [Beam](https://github.com/beamlegacy/beam): its jou
 
 Math is typeset by [SwiftMath](https://github.com/mgriebling/SwiftMath) (MIT License, © 2023 Computer Inspirations), vendored in `third_party/SwiftMath`, with the Latin Modern Math font (GUST Font License).
 
+Mermaid diagrams are drawn by [Pele](https://pele.run) (MIT License, © 2026 kepano), vendored in `third_party/pele` (its `dist/pele.global.js`, 1.6.0).
+
 ## License
 
 Glea is source available under the [PolyForm Strict License 1.0.0](LICENSE.md): you may read, build and use it for noncommercial purposes, but not change or redistribute it. Third-party code in `third_party/` keeps its own license. For commercial use, contact the author.
