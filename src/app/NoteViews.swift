@@ -1033,6 +1033,8 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
                                        target: nil, action: #selector(BrowserWindowController.deleteNote(_:)))
   private var editor: MarkdownEditorView?
   private let backlinks = NSStackView()
+  /// What the linked references show (their note, then each source and its lines).
+  private var shownBacklinks: [String]?
   /// Unlinked references: a header, then the mentions in a clip that
   /// folds like a note section.
   private let unlinked = NSStackView()
@@ -1228,9 +1230,14 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
   }
 
   private func refreshBacklinks() {
+    let links = ref.map { NoteStore.shared.backlinks(to: $0) } ?? []
+    // Rebuilt only when they change: rebuilding shortens the page for a
+    // moment, which pulled a page scrolled to its end up at every save.
+    let shown = [ref.map { "\($0.kind.rawValue)/\($0.name)" } ?? ""]
+      + links.flatMap { ["\($0.ref.kind.rawValue)/\($0.ref.name)"] + $0.lines }
+    guard shown != shownBacklinks else { return }
+    shownBacklinks = shown
     for view in backlinks.arrangedSubviews { view.removeFromSuperview() }
-    guard let ref else { return }
-    let links = NoteStore.shared.backlinks(to: ref)
     guard !links.isEmpty else { return }
 
     let header = NSTextField.label("\(links.count) linked reference\(links.count == 1 ? "" : "s")".uppercased(), size: 11, weight: .semibold, color: Theme.tertiaryText)
