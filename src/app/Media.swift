@@ -693,9 +693,9 @@ enum LocalImageLoader {
 
 // MARK: - Loading order
 
-/// Media blocks load what's on screen first. Blocks on or near the visible
-/// part of their page start right away; the others wait their turn, a few at
-/// a time, nearest first (and move up as the page scrolls).
+/// Media blocks load once they're within two screens of the visible part of
+/// their page, nearest first; the others wait until the page scrolls near
+/// them (a long journal doesn't load all its embeds at once).
 @MainActor
 final class MediaLoadQueue {
   static let shared = MediaLoadQueue()
@@ -705,7 +705,6 @@ final class MediaLoadQueue {
   /// gives its turn up after a while).
   private var active: [ObjectIdentifier: CFTimeInterval] = [:]
   private var scheduled = false
-  private static let offscreenAtOnce = 2
   private static let patience: CFTimeInterval = 6
 
   func request(_ block: MediaBlockView) {
@@ -740,7 +739,7 @@ final class MediaLoadQueue {
         waiting.remove(block)
         continue
       }
-      if distance > 0 && active.count >= Self.offscreenAtOnce { break }
+      if distance > 0 { break }
       waiting.remove(block)
       active[ObjectIdentifier(block)] = now
       block.startQueuedLoad()
@@ -936,6 +935,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   private var resizeObserver: NSObjectProtocol?
   private var scrollObserver: NSObjectProtocol?
+  private var pageObserver: NSObjectProtocol?
   private var activeObservers: [NSObjectProtocol] = []
 
   /// For automated checks: the toggle shown, its label animating in or out
@@ -1071,6 +1071,12 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     }
   }
 
+  /// Its page shown again (the journal after the web): it may load now.
+  override func viewDidUnhide() {
+    super.viewDidUnhide()
+    if waitingToLoad { MediaLoadQueue.shared.schedule() }
+  }
+
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     guardFocus()
@@ -1110,6 +1116,15 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
           self?.syncHoverWithPointer()
           MediaLoadQueue.shared.schedule()
         }
+      }
+    }
+    // The page grew or shrank above it: it may be near the screen now.
+    if let pageObserver { NotificationCenter.default.removeObserver(pageObserver) }
+    pageObserver = nil
+    if window != nil, let page = enclosingScrollView?.documentView {
+      page.postsFrameChangedNotifications = true
+      pageObserver = NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification, object: page, queue: .main) { [weak self] _ in
+        MainActor.assumeIsolated { if self?.waitingToLoad == true { MediaLoadQueue.shared.schedule() } }
       }
     }
     if window != nil {
@@ -1304,12 +1319,12 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     performLoad()
   }
 
-  /// How far it is from the visible part of its page: 0 on screen or close
-  /// to it.
+  /// How far it is from the visible part of its page: 0 on screen or within
+  /// two screens of it.
   var distanceFromView: CGFloat {
     guard !isHiddenOrHasHiddenAncestor, frame.minX > -50_000 else { return .greatestFiniteMagnitude }
     guard let clip = enclosingScrollView?.contentView else { return 0 }
-    let visible = clip.convert(clip.bounds, to: nil).insetBy(dx: 0, dy: -clip.bounds.height / 2)
+    let visible = clip.convert(clip.bounds, to: nil).insetBy(dx: 0, dy: -clip.bounds.height * 2)
     let rect = convert(bounds, to: nil)
     if rect.maxY >= visible.minY && rect.minY <= visible.maxY { return 0 }
     return rect.minY > visible.maxY ? rect.minY - visible.maxY : visible.minY - rect.maxY

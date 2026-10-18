@@ -135,6 +135,9 @@ bool IsQuitting() {
   if (g_quitting) return;
   g_quitting = YES;
   if (g_will_quit_handler) g_will_quit_handler();
+  // The windows go as they are: their pages close behind them, instead of
+  // emptying on screen while the browsers shut down.
+  for (NSWindow* window in NSApp.windows) [window orderOut:nil];
 
   glea::CloseAllBrowsers([] {
     glea::CloseAllWindows();
