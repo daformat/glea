@@ -2,6 +2,13 @@
 
 What changed in each release of Glea.
 
+## 0.20.1 Beta — 2026-10-18
+
+- Dragging a tab to the end of the tab bar scrolls the other tabs
+  smoothly, instead of their titles and icons flickering away.
+- The copy link and close buttons no longer stay highlighted after
+  dragging a tab.
+
 ## 0.20.0 Beta — 2026-10-18
 
 - Mermaid diagrams: a code block marked `mermaid` shows as its diagram
