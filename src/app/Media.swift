@@ -139,6 +139,14 @@ struct EmbedProvider {
       sizing: .aspect(4 / 3)),
   ]
 
+  /// Any page, shown as it is: only for `![[https://…]]` (a link on its
+  /// own line stays a link unless a service above plays it).
+  static let webPage = EmbedProvider(
+    name: "Web page", symbol: "globe",
+    pattern: re("^https?://\\S+$"),
+    sizing: .aspect(4 / 3),
+    player: { url, _ in url })
+
   static func match(_ url: String) -> (EmbedProvider, [String])? {
     let range = NSRange(url.startIndex..., in: url)
     for provider in all {
@@ -173,13 +181,27 @@ final class MediaDescriptor: NSObject {
   let indent: CGFloat
   /// The width it's asked to show at (`![[image.png|300]]`).
   let preferredWidth: CGFloat?
+  /// The height a web page is asked to show at (`![[https://…|600x400]]`,
+  /// or `|x400` at full width).
+  let preferredHeight: CGFloat?
 
-  init(key: String, kind: Kind, title: String?, indent: CGFloat, preferredWidth: CGFloat? = nil) {
+  init(key: String, kind: Kind, title: String?, indent: CGFloat, preferredWidth: CGFloat? = nil, preferredHeight: CGFloat? = nil) {
     self.key = key
     self.kind = kind
     self.title = title
     self.indent = indent
     self.preferredWidth = preferredWidth
+    self.preferredHeight = preferredHeight
+  }
+
+  /// A size as written after "|": "300", "300x200" or "x200".
+  static let sizePattern = "\\d+(?:x\\d+)?|x\\d+"
+
+  /// The width and height in a size written as `sizePattern`.
+  static func size(_ written: Substring) -> (width: CGFloat?, height: CGFloat?) {
+    let parts = written.split(separator: "x", omittingEmptySubsequences: false)
+    func number(_ part: Substring?) -> CGFloat? { part.flatMap { Double($0) }.map { CGFloat($0) } }
+    return (number(parts.first), number(parts.count > 1 ? parts[1] : nil))
   }
 
   var isLocal: Bool {
@@ -249,7 +271,7 @@ final class MediaDescriptor: NSObject {
       let source = ns.substring(with: m.range(at: 2))
       guard let url = resolve(source) else { return nil }
       // (`![alt|300](…)` sets its width, like Obsidian.)
-      let (alt, width) = splitWidth(ns.substring(with: m.range(at: 1)))
+      let (alt, width, height) = splitWidth(ns.substring(with: m.range(at: 1)))
       let title = m.range(at: 3).location != NSNotFound ? ns.substring(with: m.range(at: 3)) : (alt.isEmpty ? nil : alt)
       let key = "\(source)#\(occurrence)"
       if isPlayable(url) {
@@ -258,7 +280,8 @@ final class MediaDescriptor: NSObject {
       if isPDF(url) { return MediaDescriptor(key: key, kind: .document(url), title: title, indent: indent, preferredWidth: width) }
       // An embed link written as an image.
       if let (provider, groups) = EmbedProvider.match(source) {
-        return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: title, indent: indent)
+        return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: title, indent: indent,
+                               preferredWidth: width, preferredHeight: height)
       }
       return MediaDescriptor(key: key, kind: .image(url), title: title, indent: indent, preferredWidth: width)
     }
@@ -283,26 +306,28 @@ final class MediaDescriptor: NSObject {
     return nil
   }
 
-  /// "alt|300" (or "alt|300x200"): the alt text, and the width.
-  private static func splitWidth(_ alt: String) -> (String, CGFloat?) {
-    guard let bar = alt.range(of: "\\|\\d+(x\\d+)?$", options: .regularExpression) else { return (alt, nil) }
-    let number = alt[alt.index(after: bar.lowerBound)...].split(separator: "x")[0]
-    return (String(alt[..<bar.lowerBound]), Double(number).map { CGFloat($0) })
+  /// "alt|300" (or "alt|300x200", "alt|x200"): the alt text, the width
+  /// and the height.
+  private static func splitWidth(_ alt: String) -> (String, CGFloat?, CGFloat?) {
+    guard let bar = alt.range(of: "\\|(\(sizePattern))$", options: .regularExpression) else { return (alt, nil, nil) }
+    let size = Self.size(alt[alt.index(after: bar.lowerBound)...])
+    return (String(alt[..<bar.lowerBound]), size.width, size.height)
   }
 
-  private static let sizedWikiLine = try! NSRegularExpression(pattern: "^!\\[\\[([^\\]\\n|]+)(?:\\|(\\d+(?:x\\d+)?)?)?\\]\\]$")
+  private static let sizedWikiLine = try! NSRegularExpression(pattern: "^!\\[\\[([^\\]\\n|]+)(?:\\|(\(sizePattern))?)?\\]\\]$")
   private static let sizedImageLine = try! NSRegularExpression(pattern: "^!\\[([^\\]\\n]*)\\]\\((.+)\\)$")
 
   /// The media line `content` showing its media `width` points wide (nil:
-  /// as wide as it goes), in the notation that holds a size: `![[file|300]]`
-  /// stays a wiki embed, and the rest becomes `![alt|300](source)`. Nil if
-  /// it can't hold one (a wiki embed with a caption).
-  static func line(_ content: String, sizedTo width: Int?) -> String? {
+  /// as wide as it goes) and `height` tall (nil: its own height), in the
+  /// notation that holds a size: `![[file|300]]` stays a wiki embed, and the
+  /// rest becomes `![alt|300](source)`. Nil if it can't hold one (a wiki
+  /// embed with a caption).
+  static func line(_ content: String, sizedTo width: Int?, height: Int? = nil) -> String? {
     let leading = String(content.prefix { $0 == " " || $0 == "\t" })
     let text = content.trimmingCharacters(in: .whitespaces)
     let ns = text as NSString
     let full = NSRange(location: 0, length: ns.length)
-    let size = width.map { "|\($0)" } ?? ""
+    let size = height.map { "|\(width.map(String.init) ?? "")x\($0)" } ?? width.map { "|\($0)" } ?? ""
     if text.hasPrefix("![[") {
       guard let m = sizedWikiLine.firstMatch(in: text, range: full) else { return nil }
       return leading + "![[\(ns.substring(with: m.range(at: 1)))\(size)]]"
@@ -328,15 +353,28 @@ final class MediaDescriptor: NSObject {
     // Without its size or caption: resizing keeps the block (it takes the
     // new description, see MediaBlockView.adopt).
     let key = "![[\(written)]]#\(occurrence)"
+    let option = option?.trimmingCharacters(in: .whitespaces)
+    let size = option.flatMap { $0.range(of: "^(\(sizePattern))$", options: .regularExpression) != nil ? Self.size(Substring($0)) : nil }
+    let width = size?.width
+    let caption = size == nil && option?.isEmpty == false ? option : nil
+    // A web address: what a link on its own line would show, or the page.
+    let address = written.trimmingCharacters(in: .whitespaces)
+    if address.range(of: "^https?://\\S+$", options: [.regularExpression, .caseInsensitive]) != nil,
+       let url = URL(string: address) {
+      if isPlayable(url) { return MediaDescriptor(key: key, kind: .video(url), title: caption, indent: indent, preferredWidth: width) }
+      if isPDF(url) { return MediaDescriptor(key: key, kind: .document(url), title: caption, indent: indent, preferredWidth: width) }
+      if imageExtensions.contains(url.pathExtension.lowercased()) {
+        return MediaDescriptor(key: key, kind: .image(url), title: caption, indent: indent, preferredWidth: width)
+      }
+      let (provider, groups) = EmbedProvider.match(address) ?? (EmbedProvider.webPage, [address])
+      return MediaDescriptor(key: key, kind: .embed(url, provider, groups), title: caption, indent: indent,
+                             preferredWidth: width, preferredHeight: size?.height)
+    }
     let ext = (target.name as NSString).pathExtension.lowercased()
     guard !ext.isEmpty, ext != "md" else {
       guard !target.name.isEmpty || target.anchor != nil else { return nil }
       return MediaDescriptor(key: key, kind: .note(target), title: nil, indent: indent)
     }
-    let option = option?.trimmingCharacters(in: .whitespaces)
-    let width = option.flatMap { $0.range(of: "^\\d+(x\\d+)?$", options: .regularExpression) != nil
-      ? Double($0.split(separator: "x")[0]).map { CGFloat($0) } : nil }
-    let caption = width == nil && option?.isEmpty == false ? option : nil
     // Not in the folder: an image still shows where it would be, missing.
     let url = NoteStore.shared.attachment(named: target.name)
       ?? NoteStore.shared.assetsDirectory.appendingPathComponent(target.name)
@@ -483,9 +521,12 @@ enum EmbedService {
         body { font: 14px -apple-system, sans-serif; }
         body > * { margin: 0 auto !important; }
         .twitter-tweet, .bluesky-embed, .reddit-embed-bq { margin: 0 auto !important; }
-        /* Tweets are rounded cards on an opaque white iframe backdrop, which
-           shows in their corners: clip the iframe to the card. */
-        .twitter-tweet iframe { border-radius: 12px; }
+        /* Tweets are rounded cards in an iframe a little taller than them
+           (more so while they reflow). Chromium paints an opaque backdrop
+           behind a frame whose color scheme differs from its page's: the
+           tweet's page is light, so the frame says light too, and what the
+           card doesn't cover shows this page's (the note's) color. */
+        .twitter-tweet iframe { border-radius: 12px; color-scheme: light; }
       </style></head><body>\(html)</body></html>
       """
     return page
@@ -729,7 +770,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   var onHeightChange: ((_ animatedFrom: CGFloat?) -> Void)?
   var onOpenURL: ((URL) -> Void)?
   /// Dragged to a new width (nil: as wide as it goes), to write in its line.
-  var onResize: ((Int?) -> Void)?
+  /// Dragged to a new height too (a web page; nil: its own height).
+  var onResize: ((_ width: Int?, _ height: Int?) -> Void)?
   /// Whether its line can hold a width (see `MediaDescriptor.line(_:sizedTo:)`).
   var canResize = false { didSet { updateHandle(animated: false) } }
 
@@ -762,11 +804,23 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   private let toggle = MediaToggleButton()
   /// Right of the media, halfway down: drags its width (images, videos, PDFs).
   private let handle = MediaResizeHandle()
+  /// Below a web page, centered: drags its height. Out of the block's
+  /// bounds, so it's the block's sibling (hover only works within a view's
+  /// superview), placed from `heightHandleRect`.
+  private let heightHandle = MediaResizeHandle(vertical: true)
+  private var heightHandleRect = NSRect.zero
+  /// Between the media and the bottom of its height handle: hovered there,
+  /// the block counts as hovered (a sibling too, for the same reason).
+  private let belowHover = HoverStripView()
+  private var belowRect = NSRect.zero
   /// Its handle is being dragged: the text below follows at once.
-  var isResizing: Bool { handle.isDragging }
+  var isResizing: Bool { handle.isDragging || heightHandle.isDragging }
   /// The width while dragging, and until its line says the same.
   private var draggedWidth: CGFloat?
   private var dragStartWidth: CGFloat = 0
+  /// The same for the height.
+  private var draggedHeight: CGFloat?
+  private var dragStartHeight: CGFloat = 0
   /// Over the media while its line is in the note's selection.
   private let selectionTint = PassthroughView()
   private var tracking: NSTrackingArea?
@@ -850,12 +904,27 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       self.relayout(animated: false)
     }
     handle.onDragEnded = { [weak self] in
-      guard let self, let width = self.draggedWidth else { return }
-      let rounded = Int(width.rounded())
-      self.onResize?(CGFloat(rounded) >= self.maximumWidth - 0.5 ? nil : rounded)
-      self.updateHandle(animated: true)
+      guard let self else { return }
+      guard self.draggedWidth != nil else { return }
+      self.resized()
     }
     addSubview(handle)
+    heightHandle.onDragBegan = { [weak self] in
+      guard let self else { return }
+      self.dragStartHeight = self.wrapperFrame.height
+    }
+    heightHandle.onDrag = { [weak self] dy in
+      guard let self else { return }
+      self.draggedHeight = min(max(MediaBlockView.minimumHeight, self.dragStartHeight + dy), MediaBlockView.maximumHeight)
+      self.relayout(animated: false)
+    }
+    heightHandle.onDragEnded = { [weak self] in
+      guard let self else { return }
+      guard self.draggedHeight != nil else { return }
+      self.resized()
+    }
+    heightHandle.onPointerChange = { [weak self] _ in self?.updateHandle(animated: true) }
+    belowHover.onChange = { [weak self] in self?.syncHoverWithPointer() }
 
     configureIcon()
     updateTitle()
@@ -871,6 +940,35 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   /// For automated checks: the toggle shown, its label animating in or out
   /// (logging what's on screen every 50ms).
+  /// For automated checks: the height handle's center in the window, and
+  /// whether it's showing and the pointer is on it.
+  var debugPageEdges: String { "top=\(pageEdges.top) bottom=\(pageEdges.bottom)" }
+
+  var debugHeightHandle: (center: NSPoint, pointerOn: Bool) {
+    (heightHandle.convert(NSPoint(x: heightHandle.bounds.midX, y: heightHandle.bounds.midY), to: nil), heightHandle.isPointerOn)
+  }
+
+  /// For automated checks: drags the height handle by `dy` with mouse
+  /// events, a step every 30 ms.
+  func debugDragHeight(by dy: CGFloat, steps: Int) {
+    guard let window else { return }
+    let start = heightHandle.convert(NSPoint(x: heightHandle.bounds.midX, y: heightHandle.bounds.midY), to: nil)
+    func event(_ type: NSEvent.EventType, _ y: CGFloat) -> NSEvent {
+      NSEvent.mouseEvent(with: type, location: NSPoint(x: start.x, y: start.y - y), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                         windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+    }
+    heightHandle.mouseDown(with: event(.leftMouseDown, 0))
+    let count = max(1, steps)
+    for step in 1...count {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.03 * Double(step)) { [weak self] in
+        guard let self else { return }
+        let y = dy * CGFloat(step) / CGFloat(count)
+        self.heightHandle.mouseDragged(with: event(.leftMouseDragged, y))
+        if step == count { self.heightHandle.mouseUp(with: event(.leftMouseUp, y)) }
+      }
+    }
+  }
+
   func debugToggleLabel(_ shows: Bool) {
     toggle.alphaValue = 1
     // (No relayout after: the page's own width would decide again.)
@@ -943,16 +1041,26 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   /// For automated checks: hit tests as if for a scroll.
   static var debugScrollHitTest = false
 
-  /// A PDF scrolls its pages once clicked, until a click anywhere else;
-  /// before that, and always with the pointer outside it, the wheel
-  /// scrolls the note.
+  /// A PDF or a web page scrolls itself once clicked, until a click
+  /// anywhere else; before that, and always with the pointer outside it,
+  /// the wheel scrolls the note.
   private var scrollsItself = false
   private var clickMonitor: Any?
+
+  /// Whether it has more than it shows (other embeds are sized to their
+  /// content).
+  private var scrollsOnceClicked: Bool {
+    switch descriptor.kind {
+    case .document: return true
+    case .embed(_, let provider, _): return provider.name == EmbedProvider.webPage.name
+    default: return false
+    }
+  }
 
   private func watchClicks() {
     if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
     clickMonitor = nil
-    guard window != nil, case .document = descriptor.kind else { return }
+    guard window != nil, scrollsOnceClicked else { return }
     clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
       MainActor.assumeIsolated {
         guard let self else { return }
@@ -981,7 +1089,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     if window != nil {
       activeObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil,
                                                                     queue: .main) { [weak self] _ in
-        MainActor.assumeIsolated { self?.hovering = false }
+        MainActor.assumeIsolated {
+          self?.hovering = false
+          self?.handle.syncPointer(active: false)
+          self?.heightHandle.syncPointer(active: false)
+        }
       })
       activeObservers.append(NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil,
                                                                     queue: .main) { [weak self] _ in
@@ -1100,6 +1212,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     if let titleText, !titleText.isEmpty { return titleText }
     switch descriptor.kind {
     case .embed(let url, let provider, _):
+      if provider.name == EmbedProvider.webPage.name {
+        return url.host?.replacingOccurrences(of: "www.", with: "") ?? url.absoluteString
+      }
       if resolution == nil && !loaded { return "Loading \(provider.name)…" }
       // No title from the service (e.g. Instagram): name the service.
       let kind = url.path.contains("/reel/") ? "reel" : url.path.contains("/status") || url.path.contains("/post/") ? "post" : ""
@@ -1198,6 +1313,59 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     let rect = convert(bounds, to: nil)
     if rect.maxY >= visible.minY && rect.minY <= visible.maxY { return 0 }
     return rect.minY > visible.maxY ? rect.minY - visible.maxY : visible.minY - rect.maxY
+  }
+
+  /// Fetches what it prints as (see `loadForPrinting`), then calls `done`.
+  func prepareForPrinting(_ done: @escaping () -> Void) {
+    switch descriptor.kind {
+    case .image(let url) where !url.isFileURL:
+      Self.fetchImage(url, done)
+    case .embed(let url, _, _), .video(let url) where !url.isFileURL:
+      LinkMetadataStore.shared.metadata(for: url) { metadata in
+        guard let image = metadata.image else { return done() }
+        Self.fetchImage(image, done)
+      }
+    default:
+      done()
+    }
+  }
+
+  private static func fetchImage(_ url: URL, _ done: @escaping () -> Void) {
+    guard ImageCache.shared.image(for: url) == nil, !ImageCache.shared.isSettled(url) else { return done() }
+    var observer: NSObjectProtocol?
+    observer = NotificationCenter.default.addObserver(forName: ImageCache.didSettle, object: url, queue: .main) { _ in
+      if let observer { NotificationCenter.default.removeObserver(observer) }
+      done()
+    }
+  }
+
+  /// Loads it now for printing, out of any window (where blocks wait to
+  /// load): pictures, local PDFs and notes as they show; videos and web
+  /// embeds as a still (a local video's first frame, or the page's preview
+  /// image). Remote ones once `prepareForPrinting` has fetched them; what
+  /// has no still keeps its row.
+  func loadForPrinting() {
+    guard content == nil else { return }
+    switch descriptor.kind {
+    case .image(let url):
+      if let image = ImageCache.shared.image(for: url) { showImage(image, immediately: true) }
+    case .video(let url) where url.isFileURL:
+      let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+      generator.appliesPreferredTrackTransform = true
+      if let frame = try? generator.copyCGImage(at: .zero, actualTime: nil) {
+        showImage(NSImage(cgImage: frame, size: .zero), immediately: true)
+      }
+    case .embed(let url, _, _), .video(let url):
+      if let still = LinkMetadataStore.shared.cached(url)?.image, let image = ImageCache.shared.image(for: still) {
+        showImage(image, immediately: true)
+      }
+    case .document(let url) where url.isFileURL:
+      performLoad()
+    case .note:
+      performLoad()
+    default:
+      break
+    }
   }
 
   private func performLoad() {
@@ -1319,7 +1487,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
             DispatchQueue.main.async { if let picture { self?.showImage(picture, immediately: false) } }
           }.resume()
         case .page(let page):
-          self.showBrowser(page.absoluteString, script: nil)
+          let isWebPage = provider.name == EmbedProvider.webPage.name
+          self.showBrowser(page.absoluteString, script: isWebPage ? MediaBlockView.scrollEdgeReporter : nil)
         case .html(let html):
           self.contentDark = self.isDark
           self.showBrowser(EmbedService.hostURL, served: EmbedService.hostPage(html, dark: self.isDark),
@@ -1479,6 +1648,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   func browserView(_ view: GleaBrowserView, didReceiveMessage name: String, payload json: String) {
+    if name == "scrollEdges" {
+      guard view === content, let payload = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Bool] else { return }
+      pageEdges = (payload["top"] ?? true, payload["bottom"] ?? false)
+      return
+    }
     if name == "audible" {
       guard view === content,
             let payload = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any],
@@ -1540,12 +1714,28 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     relayout(animated: true)
   }
 
+  /// A handle let go: the size it shows now goes in its line.
+  private func resized() {
+    let width = (draggedWidth ?? descriptor.preferredWidth).map { Int($0.rounded()) }
+    let height = heightResizable ? (draggedHeight ?? descriptor.preferredHeight).map { Int($0.rounded()) } : nil
+    onResize?(width.flatMap { CGFloat($0) >= maximumWidth - 0.5 ? nil : $0 }, height)
+    // (The pointer may have left the block during the drag.)
+    syncHoverWithPointer()
+    updateHandle(animated: true)
+  }
+
   // MARK: Layout
 
   /// Its line was rewritten: a new size or caption shows in place.
   func adopt(_ newDescriptor: MediaDescriptor) {
     let resized = newDescriptor.preferredWidth != descriptor.preferredWidth
+      || newDescriptor.preferredHeight != descriptor.preferredHeight
     descriptor = newDescriptor
+    // Written after a drag of its height: it's already that tall.
+    if let dragged = draggedHeight, !heightHandle.isDragging {
+      draggedHeight = nil
+      if abs(dragged - (newDescriptor.preferredHeight ?? 0)) > 0.5 { relayout(animated: true) }
+    }
     if titleText != newDescriptor.title {
       titleText = newDescriptor.title
       updateTitle()
@@ -1560,6 +1750,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   static let minimumWidth: CGFloat = 48
+  static let minimumHeight: CGFloat = 120
+  static let maximumHeight: CGFloat = 2000
 
   /// As wide as it can show: the column, or for an image or a video its own
   /// size (and no taller than the limit).
@@ -1567,20 +1759,33 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     max(MediaBlockView.minimumWidth, mediaSize(maxWidth: availableWidth).width)
   }
 
-  /// Images, videos and PDFs, once shown and open.
-  private var resizable: Bool {
-    guard canResize, loaded, !collapsed else { return false }
+  /// Images, videos, PDFs and embeds, once shown and open.
+  private var resizable: Bool { hasHandles && !collapsed }
+
+  /// Whether it has handles, shown or not: they stay while it collapses,
+  /// fading as they follow the media.
+  private var hasHandles: Bool {
+    guard canResize, loaded else { return false }
     switch descriptor.kind {
-    case .image, .document: return true
+    case .image, .document, .embed: return true
     case .video: return !descriptor.isAudio
-    case .embed, .note: return false
+    case .note: return false
     }
   }
 
+  /// A web page in its height too (other embeds have their own).
+  private var hasHeightHandle: Bool {
+    guard hasHandles, case .embed(_, let provider, _) = descriptor.kind else { return false }
+    return provider.name == EmbedProvider.webPage.name
+  }
+  private var heightResizable: Bool { hasHeightHandle && !collapsed }
+
   private func updateHandle(animated: Bool) {
-    let shown = resizable && (hovering || handle.isDragging)
-    handle.isHidden = !resizable
-    handle.setShown(shown, animated: animated)
+    let dragging = handle.isDragging || heightHandle.isDragging
+    handle.isHidden = !hasHandles
+    handle.setShown(resizable && (hovering || dragging), animated: animated)
+    heightHandle.isHidden = !hasHeightHandle
+    heightHandle.setShown(heightResizable && (hovering || dragging || heightHandle.isPointerOn), animated: animated)
   }
 
   /// A picture or video at most `maxWidth` wide and 520 tall.
@@ -1602,7 +1807,12 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   private func targetMediaSize() -> NSSize {
-    mediaSize(maxWidth: min(availableWidth, draggedWidth ?? descriptor.preferredWidth ?? availableWidth))
+    var size = mediaSize(maxWidth: min(availableWidth, draggedWidth ?? descriptor.preferredWidth ?? availableWidth))
+    if case .embed(_, let provider, _) = descriptor.kind, provider.name == EmbedProvider.webPage.name,
+       let height = draggedHeight ?? descriptor.preferredHeight {
+      size.height = min(max(MediaBlockView.minimumHeight, height), MediaBlockView.maximumHeight)
+    }
+    return size
   }
 
   private func mediaSize(maxWidth: CGFloat) -> NSSize {
@@ -1656,6 +1866,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     let animatable: [(CALayer?, String)] = [
       (wrapper.layer, "position"), (wrapper.layer, "bounds"), (wrapper.layer, "opacity"), (content?.layer, "transform"),
       (row.layer, "opacity"), (placeholder.layer, "position"), (placeholder.layer, "bounds"),
+      (handle.layer, "position"), (heightHandle.layer, "position"),
     ]
     // A resize under way turns from where things are on screen.
     let from = animatable.map { layer, key in (layer?.presentation() ?? layer)?.value(forKeyPath: key) }
@@ -1684,6 +1895,14 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       let handleHeight = max(24, handle.barLength)
       handle.frame = NSRect(x: rect.maxX + 5 - MediaResizeHandle.width / 2, y: rect.midY - handleHeight / 2,
                             width: MediaResizeHandle.width, height: handleHeight)
+      heightHandle.barLength = max(0, min(MediaResizeHandle.height, rect.width - 4))
+      let handleWidth = max(24, heightHandle.barLength)
+      // As far below the media as the other is right of it.
+      heightHandleRect = NSRect(x: rect.midX - handleWidth / 2, y: rect.maxY + 5 - MediaResizeHandle.width / 2,
+                                width: handleWidth, height: MediaResizeHandle.width)
+      belowRect = hasHeightHandle && !collapsed
+        ? NSRect(x: rect.minX, y: rect.maxY, width: rect.width, height: max(0, heightHandleRect.maxY - rect.maxY)) : .zero
+      placeHeightHandle()
       // The collapsed row shows as the media leaves.
       row.alphaValue = collapsed ? 1 : 0
     }
@@ -1728,12 +1947,14 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     blockHeight = height
     needsLayout = true
     if abs(height - old) > 0.25 { onHeightChange?(animated ? old : nil) }
+    // Its handles and the strip below may have moved from under the pointer.
+    scheduleHoverSync()
   }
 
   /// Shows its new size at once: it changed out of sight, and the page
   /// scrolls to keep what's in view in place instead.
   func skipResizeAnimation() {
-    for layer in [wrapper.layer, content?.layer, row.layer, placeholder.layer] {
+    for layer in [wrapper.layer, content?.layer, row.layer, placeholder.layer, handle.layer, heightHandle.layer] {
       for key in ["position", "bounds", "opacity", "transform"] { layer?.removeAnimation(forKey: "glea.block.\(key)") }
     }
   }
@@ -1779,17 +2000,38 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     tracking = area
   }
 
+  /// The height handle goes where the block goes.
+  override func viewDidMoveToSuperview() {
+    super.viewDidMoveToSuperview()
+    if let superview {
+      superview.addSubview(belowHover, positioned: .above, relativeTo: self)
+      superview.addSubview(heightHandle, positioned: .above, relativeTo: belowHover)
+      placeHeightHandle()
+    } else {
+      belowHover.removeFromSuperview()
+      heightHandle.removeFromSuperview()
+    }
+  }
+
+  private func placeHeightHandle() {
+    guard let superview, heightHandle.superview === superview else { return }
+    heightHandle.frame = superview.convert(heightHandleRect, from: self)
+    belowHover.frame = superview.convert(belowRect, from: self)
+  }
+
   // Moved or resized (embeds loading, the page reflowing) under a still
   // pointer: no enter or exit events, so check where it is.
   override func setFrameSize(_ newSize: NSSize) {
     super.setFrameSize(newSize)
     updateTrackingAreas()
     scheduleHoverSync()
+    placeHeightHandle()
   }
 
   override func setFrameOrigin(_ newOrigin: NSPoint) {
     super.setFrameOrigin(newOrigin)
     scheduleHoverSync()
+    placeHeightHandle()
   }
 
   private var hoverSyncPending = false
@@ -1816,24 +2058,78 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     }
   }
 
-  override func mouseEntered(with event: NSEvent) { hovering = true }
-  override func mouseExited(with event: NSEvent) { hovering = false }
+  // (Leaving onto the strip below it, it's still hovered.)
+  override func mouseEntered(with event: NSEvent) { syncHoverWithPointer() }
+  override func mouseExited(with event: NSEvent) { syncHoverWithPointer() }
 
   /// The page scrolled under a still pointer (no enter or exit events):
   /// match the hover to where the pointer is now.
   private func syncHoverWithPointer() {
+    // (Its handles too: they track the pointer on their own.)
+    handle.syncPointer()
+    heightHandle.syncPointer()
     guard let window, !isHiddenOrHasHiddenAncestor else {
       hovering = false
       return
     }
     let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
     // (The visible rect isn't clipped to the bounds: views don't clip.)
-    hovering = bounds.intersection(visibleRect).contains(point)
+    hovering = bounds.intersection(visibleRect).contains(point) || belowRect.contains(point)
+  }
+
+  // A web page scrolls like a PDF (see PDFEmbedView.scrollWheel): a gesture
+  // toward an end it's already at goes to the note, decided as it begins
+  // (a wheel's clicks are each their own gesture).
+
+  /// Posts "scrollEdges" ({top, bottom}) as the page, or the element in it
+  /// last scrolled, reaches or leaves its ends. Its ends don't bounce: what's
+  /// past them is the note's.
+  static let scrollEdgeReporter = """
+    (() => {
+      if (window !== window.top || window.__gleaScrollEdges) return;
+      window.__gleaScrollEdges = true;
+      const native = window.__gleaNative;
+      if (!native) return;
+      let scroller = null, last = '';
+      const report = () => {
+        const e = scroller && scroller.isConnected ? scroller : (document.scrollingElement || document.documentElement);
+        if (!e) return;
+        const state = JSON.stringify({ top: e.scrollTop <= 0, bottom: e.scrollTop + e.clientHeight >= e.scrollHeight - 1 });
+        if (state !== last) { last = state; native.post('scrollEdges', state); }
+      };
+      addEventListener('scroll', event => {
+        const target = event.target;
+        scroller = target === document || target === document.documentElement || target === document.body ? null : target;
+        report();
+      }, { capture: true, passive: true });
+      addEventListener('resize', report);
+      addEventListener('load', report);
+      document.addEventListener('DOMContentLoaded', () => {
+        document.documentElement.style.overscrollBehavior = 'none';
+        report();
+      });
+    })();
+    """
+
+  /// Where the page is: at its top, at its bottom (until it says).
+  private var pageEdges = (top: true, bottom: false)
+  private var pagePasses: Bool?
+
+  /// Whether the scroll event being hit-tested goes to the note.
+  private func pagePassesGesture() -> Bool {
+    guard content is GleaBrowserView, let event = NSApp.currentEvent, event.type == .scrollWheel else { return false }
+    let gesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+    if !gesture || event.phase.contains(.began) || event.phase.contains(.mayBegin) { pagePasses = nil }
+    if pagePasses == nil, event.scrollingDeltaY != 0 {
+      // (A positive delta moves toward the top.)
+      pagePasses = event.scrollingDeltaY > 0 ? pageEdges.top : pageEdges.bottom
+    }
+    return pagePasses == true
   }
 
   /// The note scrolls when the wheel is over an embed (embeds are sized to
-  /// their content, so they have nothing to scroll themselves; a PDF does,
-  /// once clicked: see `scrollsItself`).
+  /// their content, so they have nothing to scroll themselves; a PDF or a
+  /// web page does, once clicked: see `scrollsItself`).
   override func scrollWheel(with event: NSEvent) {
     enclosingScrollView?.scrollWheel(with: event)
   }
@@ -1842,11 +2138,11 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     let local = convert(point, from: superview)
     if MediaBlockView.hitTestingScroll {
       guard bounds.contains(local) else { return nil }
-      if scrollsItself, !collapsed, wrapperFrame.contains(local) { return super.hitTest(point) ?? self }
+      if scrollsItself, !collapsed, wrapperFrame.contains(local), !pagePassesGesture() { return super.hitTest(point) ?? self }
       return self
     }
     // Only the visible parts take clicks; the rest belongs to the text.
-    if !handle.isHidden, handle.frame.contains(local) { return handle }
+    if resizable, handle.frame.contains(local) { return handle }
     if toggle.alphaValue > 0.1, toggle.frame.contains(local) { return toggle.hitTest(convert(local, to: toggle.superview)) ?? toggle }
     if collapsed { return NSRect(x: 0, y: 0, width: 26 + rowTitle.frame.width, height: MediaBlockView.rowHeight).contains(local) ? super.hitTest(point) : nil }
     return wrapperFrame.contains(local) ? super.hitTest(point) : nil
@@ -1855,13 +2151,39 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
 /// A media block's resize handle (as in Beam): a short rounded bar right of
 /// the media, shown while the block is hovered, thicker and darker while the
-/// pointer is on it. Dragging it sideways changes the media's width.
+/// pointer is on it. Dragging it sideways changes the media's width; a
+/// vertical one lies below the media and changes its height.
+/// Says when the pointer enters or leaves it; clicks go through.
+final class HoverStripView: NSView {
+  var onChange: (() -> Void)?
+  private var tracking: NSTrackingArea?
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp], owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  override func setFrameSize(_ newSize: NSSize) {
+    super.setFrameSize(newSize)
+    updateTrackingAreas()
+  }
+
+  override func mouseEntered(with event: NSEvent) { onChange?() }
+  override func mouseExited(with event: NSEvent) { onChange?() }
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 final class MediaResizeHandle: NSView {
+  /// Its thickness, and the bar's longest length.
   static let width: CGFloat = 12
   static let height: CGFloat = 44
 
+  let vertical: Bool
   var onDragBegan: (() -> Void)?
-  /// How far the pointer moved sideways since the press.
+  /// How far the pointer moved since the press: right, or down.
   var onDrag: ((CGFloat) -> Void)?
   var onDragEnded: (() -> Void)?
   private(set) var isDragging = false
@@ -1869,29 +2191,69 @@ final class MediaResizeHandle: NSView {
   /// How long the bar is drawn, centered in the handle.
   var barLength: CGFloat = height { didSet { if barLength != oldValue { needsLayout = true } } }
   private let bar = CAShapeLayer()
-  private var pointerOn = false { didSet { updateBar() } }
-  private var pressX: CGFloat = 0
+  private var pointerOn = false {
+    didSet {
+      updateBar()
+      if pointerOn != oldValue { onPointerChange?(pointerOn) }
+    }
+  }
+  var isPointerOn: Bool { pointerOn }
+  var onPointerChange: ((Bool) -> Void)?
+  private var pressPoint = NSPoint.zero
+  private var cursor: NSCursor { vertical ? .resizeUpDown : .resizeLeftRight }
 
-  override init(frame frameRect: NSRect) {
-    super.init(frame: frameRect)
+  init(vertical: Bool = false) {
+    self.vertical = vertical
+    super.init(frame: .zero)
     wantsLayer = true
     bar.lineCap = .round
     bar.fillColor = nil
     bar.opacity = 0
     layer?.addSublayer(bar)
-    HoverView.track(self) { [weak self] on in
-      guard let self else { return }
-      self.pointerOn = on
-      self.updateCursor()
-    }
     updateBar()
+  }
+
+  private var tracking: NSTrackingArea?
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp], owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  override func setFrameSize(_ newSize: NSSize) {
+    super.setFrameSize(newSize)
+    updateTrackingAreas()
+  }
+
+  /// Whether the pointer is on it, from where it is now: moved from under a
+  /// still pointer (or the app in the background), no exit event comes.
+  func syncPointer(active: Bool = true) {
+    guard !isDragging else { return }
+    guard active, NSApp.isActive, let window, !isHiddenOrHasHiddenAncestor else {
+      pointerOn = false
+      return
+    }
+    pointerOn = bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+  }
+
+  override func mouseEntered(with event: NSEvent) {
+    pointerOn = true
+    updateCursor()
+  }
+
+  override func mouseExited(with event: NSEvent) {
+    pointerOn = false
+    updateCursor()
   }
 
   /// Cursor rects only follow the pointer moving: scrolled away from under a
   /// still pointer (or onto it), the cursor would keep its old shape.
   private func updateCursor() {
     guard !isDragging, let window else { return }
-    if pointerOn { return NSCursor.resizeLeftRight.set() }
+    if pointerOn { return cursor.set() }
     let hit = window.contentView?.hitTest(window.mouseLocationOutsideOfEventStream)
     (hit is NSTextView ? NSCursor.iBeam : NSCursor.arrow).set()
   }
@@ -1901,9 +2263,15 @@ final class MediaResizeHandle: NSView {
   override func layout() {
     super.layout()
     let path = CGMutablePath()
-    let length = min(barLength, bounds.height)
-    path.move(to: CGPoint(x: bounds.midX, y: (bounds.height - length) / 2))
-    path.addLine(to: CGPoint(x: bounds.midX, y: (bounds.height + length) / 2))
+    if vertical {
+      let length = min(barLength, bounds.width)
+      path.move(to: CGPoint(x: (bounds.width - length) / 2, y: bounds.midY))
+      path.addLine(to: CGPoint(x: (bounds.width + length) / 2, y: bounds.midY))
+    } else {
+      let length = min(barLength, bounds.height)
+      path.move(to: CGPoint(x: bounds.midX, y: (bounds.height - length) / 2))
+      path.addLine(to: CGPoint(x: bounds.midX, y: (bounds.height + length) / 2))
+    }
     Motion.withoutAnimation {
       bar.frame = bounds
       bar.path = path
@@ -1931,24 +2299,27 @@ final class MediaResizeHandle: NSView {
   }
 
   override func resetCursorRects() {
-    addCursorRect(bounds, cursor: .resizeLeftRight)
+    addCursorRect(bounds, cursor: cursor)
   }
 
   override func mouseDown(with event: NSEvent) {
-    pressX = event.locationInWindow.x
+    pressPoint = event.locationInWindow
     isDragging = true
     updateBar()
     onDragBegan?()
   }
 
   override func mouseDragged(with event: NSEvent) {
-    NSCursor.resizeLeftRight.set()
-    onDrag?(event.locationInWindow.x - pressX)
+    cursor.set()
+    onDrag?(vertical ? pressPoint.y - event.locationInWindow.y : event.locationInWindow.x - pressPoint.x)
   }
 
   override func mouseUp(with event: NSEvent) {
     guard isDragging else { return }
     isDragging = false
+    // No enter or exit events come during a drag: where the pointer is now.
+    pointerOn = bounds.contains(convert(event.locationInWindow, from: nil))
+    updateCursor()
     updateBar()
     onDragEnded?()
   }

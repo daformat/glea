@@ -2122,6 +2122,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     peekReturnFocus = window.firstResponder
     window.makeFirstResponder(nil)
     root.addSubview(peek)
+    peek.layoutNow()
     page.frame = peek.pageHost.bounds
     page.autoresizingMask = [.width, .height]
     // Loading while the card springs out; shown once it's in place.
@@ -2161,8 +2162,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     guard let peek, let tab = peekTab else { return }
     endPeek()
     if captureTab === tab { releasePendingCapture() }
-    tab.browserView?.isHidden = true
-    peek.animateOut { tab.close() }
+    // The page stays while the card leaves: it's a window of its own, which
+    // can't shrink with the card, so it fades with it.
+    if let pageWindow = tab.browserView?.chromeWindow, !Motion.reduceMotion {
+      Motion.animate(0.16, timing: Motion.easeOut) { pageWindow.animator().alphaValue = 0 }
+    } else {
+      tab.browserView?.isHidden = true
+    }
+    peek.animateOut {
+      tab.browserView?.isHidden = true
+      tab.close()
+    }
     window?.makeKey()
     if let focus = peekReturnFocus { window?.makeFirstResponder(focus) }
   }
@@ -2506,6 +2516,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     showCapturePanel(capture, anchorInWindow: nil, from: tab)
   }
 
+  /// Prints the page in front, or the note shown.
+  @objc func printContent(_ sender: Any?) {
+    if let tab = frontTab {
+      tab.browserView?.printPage()
+    } else if case .note = mode, let window {
+      noteView.printNote(in: window)
+    }
+  }
+
   @objc func reload(_ sender: Any?) {
     guard mode == .web, let tab = activeTab else { return }
     if tab.errorMessage != nil {
@@ -2729,6 +2748,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       if case .note = mode { return true }
       return false
     case #selector(exportCurrentNote(_:)):
+      if case .note = mode { return true }
+      return false
+    case #selector(printContent(_:)):
+      if web || peekTab != nil { return frontTab?.browserView != nil }
       if case .note = mode { return true }
       return false
     case #selector(toggleJournal(_:)):

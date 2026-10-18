@@ -976,6 +976,49 @@ private final class DayHeaderView: NSStackView {
 
 // MARK: - Single note
 
+/// A note as it prints: its title, then its text styled as in the editor,
+/// in the light appearance whatever the app's.
+final class NotePrintView: NSView {
+  private let editor: MarkdownEditorView
+
+  init(ref: NoteRef, width: CGFloat) {
+    editor = MarkdownEditorView(ref: ref, placeholder: "")
+    super.init(frame: NSRect(x: 0, y: 0, width: width, height: 0))
+    appearance = NSAppearance(named: .aqua)
+    let title = NSTextField(wrappingLabelWithString: ref.kind == .journal ? ref.displayTitle : ref.name)
+    title.font = .systemFont(ofSize: 24, weight: .semibold)
+    title.textColor = .labelColor
+    title.preferredMaxLayoutWidth = width
+    let titleHeight = ceil(title.fittingSize.height)
+    title.frame = NSRect(x: 0, y: 0, width: width, height: titleHeight)
+    addSubview(title)
+    editor.textView.isEditable = false
+    editor.frame = NSRect(x: 0, y: titleHeight + 16, width: width, height: 30)
+    addSubview(editor)
+    editor.restyle()
+  }
+
+  /// Fetches what its media print as (for a few seconds at most), then
+  /// loads them and takes its full height.
+  func prepare(_ completion: @escaping () -> Void) {
+    var done = false
+    let finish = { [weak self] in
+      guard !done, let self else { return }
+      done = true
+      self.editor.loadMediaForPrinting()
+      self.editor.frame.size.height = self.editor.intrinsicContentSize.height
+      self.frame.size.height = self.editor.frame.maxY
+      completion()
+    }
+    editor.prepareMediaForPrinting(finish)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { finish() }
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override var isFlipped: Bool { true }
+}
+
 final class NoteView: ColumnPageView, NSTextFieldDelegate {
   weak var navigator: NoteNavigator?
   private(set) var ref: NoteRef?
@@ -1085,6 +1128,25 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
   }
 
   func focusEditor() { editor?.focus() }
+
+  /// Prints the note shown: its title, then its text, on white paper.
+  func printNote(in window: NSWindow) {
+    guard let ref else { return }
+    editor?.flush()
+    let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+    info.horizontalPagination = .fit
+    info.verticalPagination = .automatic
+    info.isHorizontallyCentered = false
+    info.isVerticallyCentered = false
+    let width = info.paperSize.width - info.leftMargin - info.rightMargin
+    let view = NotePrintView(ref: ref, width: width)
+    let title = titleField.stringValue.isEmpty ? "Untitled" : titleField.stringValue
+    view.prepare {
+      let operation = NSPrintOperation(view: view, printInfo: info)
+      operation.jobTitle = title
+      operation.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+  }
 
   override var searchableEditors: [MarkdownEditorView] { [editor].compactMap { $0 } }
 

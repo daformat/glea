@@ -20,6 +20,8 @@ final class PeekView: NSView {
   /// Where the page's browser view goes (it fills it).
   let pageHost = NSView()
   private let dim = NSView()
+  /// The card and its pills, which spring out of the link together.
+  private let group = PeekGroup()
   private let shadowHost = NSView()
   private let card = NSView()
   private let addressPill = PeekPill()
@@ -28,6 +30,8 @@ final class PeekView: NSView {
   private let titleLabel = NSTextField.label("", size: 12.5, weight: .medium)
   private let hostLabel = NSTextField.label("", size: 12.5, color: Theme.secondaryText)
   private var isClosing = false
+  /// Its pills are in (title changes animate from then on).
+  private var hasAppeared = false
   private let address: NSStackView
 
   override init(frame frameRect: NSRect) {
@@ -41,6 +45,8 @@ final class PeekView: NSView {
 
     dim.wantsLayer = true
     addSubview(dim)
+    group.wantsLayer = true
+    addSubview(group)
 
     shadowHost.wantsLayer = true
     shadowHost.shadow = NSShadow()
@@ -48,7 +54,7 @@ final class PeekView: NSView {
     shadowHost.layer?.shadowOpacity = 0.28
     shadowHost.layer?.shadowRadius = 30
     shadowHost.layer?.shadowOffset = CGSize(width: 0, height: -10)
-    addSubview(shadowHost)
+    group.addSubview(shadowHost)
     card.wantsLayer = true
     card.layer?.cornerRadius = Self.cornerRadius
     card.layer?.cornerCurve = .continuous
@@ -73,7 +79,7 @@ final class PeekView: NSView {
     address.spacing = 7
     address.setCustomSpacing(8, after: favicon)
     address.translatesAutoresizingMaskIntoConstraints = false
-    addressPill.addSubview(address)
+    addressPill.content.addSubview(address)
     NSLayoutConstraint.activate([
       favicon.widthAnchor.constraint(equalToConstant: 16),
       favicon.heightAnchor.constraint(equalToConstant: 16),
@@ -81,7 +87,7 @@ final class PeekView: NSView {
       address.trailingAnchor.constraint(lessThanOrEqualTo: addressPill.trailingAnchor, constant: -12),
       address.centerYAnchor.constraint(equalTo: addressPill.centerYAnchor),
     ])
-    addSubview(addressPill)
+    group.addSubview(addressPill)
 
     let buttons = [
       IconButton(symbol: "macwindow.badge.plus", tooltip: "Open as Tab (⌘↩)", target: self, action: #selector(openAsTab)),
@@ -93,13 +99,13 @@ final class PeekView: NSView {
     row.orientation = .horizontal
     row.spacing = 2
     row.translatesAutoresizingMaskIntoConstraints = false
-    buttonsPill.addSubview(row)
+    buttonsPill.content.addSubview(row)
     NSLayoutConstraint.activate([
       row.leadingAnchor.constraint(equalTo: buttonsPill.leadingAnchor, constant: 3),
       row.trailingAnchor.constraint(equalTo: buttonsPill.trailingAnchor, constant: -3),
       row.centerYAnchor.constraint(equalTo: buttonsPill.centerYAnchor),
     ])
-    addSubview(buttonsPill)
+    group.addSubview(buttonsPill)
     updateColors()
   }
 
@@ -136,6 +142,7 @@ final class PeekView: NSView {
   private func layoutPieces() {
     let rect = cardRect
     dim.frame = bounds
+    group.frame = bounds
     shadowHost.frame = rect
     card.frame = shadowHost.bounds
     pageHost.frame = card.bounds.insetBy(dx: Self.pageInset, dy: Self.pageInset)
@@ -153,6 +160,9 @@ final class PeekView: NSView {
     layoutPieces()
   }
 
+  /// Lays out the card now, for the page to take its size from the start.
+  func layoutNow() { layoutPieces() }
+
   override func viewDidChangeEffectiveAppearance() {
     super.viewDidChangeEffectiveAppearance()
     updateColors()
@@ -167,12 +177,24 @@ final class PeekView: NSView {
 
   // MARK: Content
 
+  /// The address pill takes the new title's length with a spring (once
+  /// shown: the first one is laid out as it comes in).
   func setPage(title: String, host: String, favicon image: NSImage?) {
     let showsTitle = !title.isEmpty && title != host
+    let titleChanged = showsTitle && (titleLabel.isHidden || titleLabel.stringValue != title)
+    let oldWidth = addressPill.layer?.presentation()?.bounds.width ?? addressPill.frame.width
     titleLabel.stringValue = title
     titleLabel.isHidden = !showsTitle
     hostLabel.stringValue = host
     layoutPieces()
+    if hasAppeared, !isClosing, !Motion.reduceMotion {
+      if abs(addressPill.frame.width - oldWidth) > 0.5 { addressPill.springWidth(from: oldWidth, fromTrailing: false) }
+      if titleChanged, let layer = titleLabel.layer {
+        let fade = Motion.basic("opacity", duration: 0.2, timing: Motion.easeOut)
+        fade.fromValue = 0
+        layer.add(fade, forKey: "glea.peek.title")
+      }
+    }
     favicon.image = image ?? Theme.symbol("globe", size: 13)
     favicon.contentTintColor = image == nil ? Theme.secondaryText : nil
   }
@@ -184,15 +206,19 @@ final class PeekView: NSView {
   /// is a window of its own, which can't follow the card's animation).
   func animateIn(from origin: NSPoint?, revealPage: @escaping () -> Void) {
     layoutPieces()
+    hasAppeared = true
     guard !Motion.reduceMotion else { return revealPage() }
     let final = cardRect
     let start = origin ?? NSPoint(x: final.midX, y: final.midY)
-    // From a small card around the click to its place: scaled about its
-    // center, and moved there (layers of views in a flipped one have y
-    // going down, like it).
-    if let layer = shadowHost.layer {
-      let dy = (start.y - final.midY) * (layer.superlayer?.isGeometryFlipped == true || isFlipped ? 1 : -1)
-      let from = CATransform3DConcat(shadowHost.centeredScale(0.18), CATransform3DMakeTranslation(start.x - final.midX, dy, 0))
+    // From a small card around the click to its place, its pills with it:
+    // scaled about the card's center, and moved there (the group is flipped
+    // like this view: its layer has y going down).
+    if let layer = group.layer {
+      let center = CGPoint(x: final.midX, y: final.midY)
+      var from = CATransform3DMakeTranslation(start.x - center.x, start.y - center.y, 0)
+      from = CATransform3DTranslate(from, center.x, center.y, 0)
+      from = CATransform3DScale(from, 0.18, 0.18, 1)
+      from = CATransform3DTranslate(from, -center.x, -center.y, 0)
       let grow = Motion.spring("transform", stiffness: 340, damping: 30)
       grow.fromValue = from
       grow.toValue = CATransform3DIdentity
@@ -203,7 +229,10 @@ final class PeekView: NSView {
       layer.add(fade, forKey: "glea.peek.fade")
     }
     fadeIn(dim, duration: 0.18)
-    for pill in [addressPill, buttonsPill] { pill.animateIn(scale: 0.96, offsetY: 4, fade: 0.16, duration: 0.24) }
+    // A moment later, each pill grows out of the corner it has on the
+    // card: the address its bottom left, the buttons their bottom right.
+    addressPill.scaleIn(fromRight: false, delay: 0.26)
+    buttonsPill.scaleIn(fromRight: true, delay: 0.18)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.26) { [weak self] in
       guard let self, !self.isClosing else { return }
       revealPage()
@@ -256,11 +285,31 @@ final class PeekView: NSView {
   @objc private func close() { onClose?() }
 }
 
+/// Flipped like the peek, and only its card and pills take clicks: around
+/// them they reach the peek (which closes).
+private final class PeekGroup: NSView {
+  override var isFlipped: Bool { true }
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    let hit = super.hitTest(point)
+    return hit === self ? nil : hit
+  }
+}
+
 /// The rounded, page-colored backing of the peek's address and buttons.
 private final class PeekPill: NSView {
+  /// What it shows, clipped to it as it changes width.
+  let content = NSView()
+
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     wantsLayer = true
+    content.wantsLayer = true
+    content.layer?.cornerRadius = 10
+    content.layer?.cornerCurve = .continuous
+    content.layer?.masksToBounds = true
+    content.frame = bounds
+    content.autoresizingMask = [.width, .height]
+    addSubview(content)
     layer?.cornerRadius = 10
     layer?.cornerCurve = .continuous
     layer?.borderWidth = 1
@@ -286,4 +335,62 @@ private final class PeekPill: NSView {
 
   // Clicks between the buttons stay in the pill (they don't close the peek).
   override func mouseDown(with event: NSEvent) {}
+
+  // MARK: Animations
+
+  /// Springs in from small at its bottom corner (left, or right), fading
+  /// in whole (its content with it), `delay` after the card starts.
+  func scaleIn(fromRight: Bool, delay: CFTimeInterval) {
+    guard let layer else { return }
+    let begin = CACurrentMediaTime() + delay
+    // (Its layer has y going down in its flipped superview.)
+    let corner = CGPoint(x: fromRight ? bounds.width : 0, y: superview?.isFlipped == true ? bounds.height : 0)
+    var from = CATransform3DMakeTranslation(corner.x, corner.y, 0)
+    from = CATransform3DScale(from, 0.4, 0.4, 1)
+    from = CATransform3DTranslate(from, -corner.x, -corner.y, 0)
+    let grow = Motion.spring("transform", stiffness: 300, damping: 24)
+    grow.fromValue = from
+    grow.toValue = CATransform3DIdentity
+    add(grow, to: layer, at: begin, key: "glea.pill.grow")
+    let fade = Motion.basic("opacity", duration: 0.16, timing: Motion.easeOut)
+    fade.fromValue = 0
+    fade.toValue = 1
+    add(fade, to: layer, at: begin, key: "glea.pill.fade")
+  }
+
+  /// From `fromWidth` to its width with a subtle spring, keeping its
+  /// leading edge (or trailing), what it shows clipped to it.
+  func springWidth(from fromWidth: CGFloat, fromTrailing: Bool, delay: CFTimeInterval = 0) {
+    guard let layer, let contentLayer = content.layer else { return }
+    let begin = CACurrentMediaTime() + delay
+    // The pill, from that width at its leading or trailing end.
+    let shift = fromTrailing ? layer.bounds.width - fromWidth : 0
+    springBounds(of: layer, fromWidth: fromWidth, frameShift: shift, boundsShift: 0, begin: begin, key: "glea.pill")
+    // Its content stays put in it: shown from its leading end, or its
+    // trailing one.
+    springBounds(of: contentLayer, fromWidth: fromWidth, frameShift: 0, boundsShift: shift, begin: begin, key: "glea.pill.content")
+  }
+
+  /// Springs `layer` from `fromWidth` wide, its frame's left edge `frameShift`
+  /// right of where it ends and its bounds' origin `boundsShift` right (a
+  /// layer's bounds change about its anchor: its position makes up for it).
+  private func springBounds(of layer: CALayer, fromWidth: CGFloat, frameShift: CGFloat, boundsShift: CGFloat,
+                            begin: CFTimeInterval, key: String) {
+    let final = layer.bounds
+    let grow = Motion.spring("bounds", stiffness: 300, damping: 26)
+    grow.fromValue = NSValue(rect: NSRect(x: final.minX + boundsShift, y: final.minY, width: fromWidth, height: final.height))
+    add(grow, to: layer, at: begin, key: key + ".bounds")
+    let dx = frameShift + layer.anchorPoint.x * (fromWidth - final.width)
+    guard abs(dx) > 0.01 else { return }
+    let move = Motion.spring("position", stiffness: 300, damping: 26)
+    move.fromValue = NSValue(point: NSPoint(x: layer.position.x + dx, y: layer.position.y))
+    add(move, to: layer, at: begin, key: key + ".position")
+  }
+
+  /// Starts at `begin`, holding its first value until then.
+  private func add(_ animation: CABasicAnimation, to layer: CALayer, at begin: CFTimeInterval, key: String) {
+    animation.beginTime = begin
+    animation.fillMode = .backwards
+    layer.add(animation, forKey: key)
+  }
 }

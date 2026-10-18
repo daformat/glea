@@ -187,6 +187,49 @@ enum TestHooks {
          let item = controller.tabMenu(for: tab).items.first(where: { $0.title == argument }), let action = item.action {
         NSApp.sendAction(action, to: item.target, from: item)
       }
+    case "media-js", "media-title":
+      // media-js:<script>: runs it in the first embedded page shown;
+      // media-title logs that page's title (a script can put results there).
+      let pages = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? GleaBrowserView }
+        .filter { !$0.isHiddenOrHasHiddenAncestor && $0.enclosingMediaBlock != nil }
+      if command.hasPrefix("media-js") { pages.first?.executeJavaScript(argument) } else { NSLog("Glea test media title: %@", pages.first?.title ?? "none") }
+    case "media-frames":
+      // Logs the first embedded page's views, down from its media block.
+      if let page = [controller.window?.contentView].compactMap({ $0 }).flatMap(allSubviews).compactMap({ $0 as? GleaBrowserView })
+        .first(where: { !$0.isHiddenOrHasHiddenAncestor && $0.enclosingMediaBlock != nil }), let block = page.enclosingMediaBlock {
+        func log(_ view: NSView, _ depth: Int) {
+          NSLog("Glea test frame: %@%@ %@ flipped=%d bounds=%@ transform=%@", String(repeating: "  ", count: depth), String(describing: type(of: view)),
+                NSStringFromRect(view.frame), view.isFlipped ? 1 : 0, NSStringFromRect(view.bounds),
+                view.layer.map { String(describing: CATransform3DIsIdentity($0.transform)) } ?? "-")
+          if depth < 6 { for sub in view.subviews { log(sub, depth + 1) } }
+        }
+        log(block, 0)
+        func logLayer(_ layer: CALayer, _ depth: Int) {
+          NSLog("Glea test layer: %@%@ frame=%@ bounds=%@ pos=%@ anchor=%@ flipped=%d gravity=%@ mask=%d contents=%d", String(repeating: "  ", count: depth),
+                String(describing: type(of: layer)), NSStringFromRect(layer.frame), NSStringFromRect(layer.bounds), NSStringFromPoint(layer.position),
+                NSStringFromPoint(layer.anchorPoint), layer.isGeometryFlipped ? 1 : 0, layer.contentsGravity.rawValue, Int(layer.autoresizingMask.rawValue),
+                layer.contents == nil ? 0 : 1)
+          if depth < 8 { for sub in layer.sublayers ?? [] { logLayer(sub, depth + 1) } }
+        }
+        if let host = [page].flatMap(allSubviews).first(where: { String(describing: type(of: $0)) == "RenderWidgetHostViewCocoa" }), let layer = host.layer {
+          logLayer(layer, 0)
+        }
+      }
+    case "media-handle":
+      // Logs the first media block's height handle: center in the window, pointer on it.
+      if let block = [controller.window?.contentView].compactMap({ $0 }).flatMap(allSubviews).compactMap({ $0 as? MediaBlockView })
+        .first(where: { !$0.isHiddenOrHasHiddenAncestor }) {
+        let handle = block.debugHeightHandle
+        NSLog("Glea test handle: %@ pointerOn=%d %@", NSStringFromPoint(handle.center), handle.pointerOn ? 1 : 0, block.debugPageEdges)
+      }
+    case "media-height":
+      // media-height:<n>,<dy>,<steps>: drags the nth media block's height
+      // handle down by dy (up if negative), in that many steps.
+      let v = argument.split(separator: ",").compactMap { Double($0) }
+      let blocks = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MediaBlockView }
+        .filter { !$0.isHiddenOrHasHiddenAncestor && $0.frame.minX > -50_000 }
+        .sorted { $0.convert($0.bounds, to: nil).maxY > $1.convert($1.bounds, to: nil).maxY }
+      if v.count == 3, blocks.indices.contains(Int(v[0])) { blocks[Int(v[0])].debugDragHeight(by: v[1], steps: Int(v[2])) }
     case "media-collapse":
       // media-collapse:<n>,<0|1>: collapses or expands the nth media block shown.
       let v = argument.split(separator: ",").compactMap { Int($0) }
@@ -955,4 +998,12 @@ final class FakeDragInfo: NSObject, @preconcurrency NSDraggingInfo {
                               searchOptions: [NSPasteboard.ReadingOptionKey: Any] = [:],
                               using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void) {}
   func resetSpringLoading() {}
+}
+
+private extension NSView {
+  var enclosingMediaBlock: MediaBlockView? {
+    var view = superview
+    while let current = view, !(current is MediaBlockView) { view = current.superview }
+    return view as? MediaBlockView
+  }
 }

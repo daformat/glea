@@ -1,5 +1,6 @@
 #import "GleaBridge.h"
 #import <objc/message.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <map>
 #include <set>
@@ -977,9 +978,15 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   NSWindow* window = _chromeWindow.window;
   NSWindow* parent = self.window;
   BOOL visible = parent && !self.isHiddenOrHasHiddenAncestor && !_closeRequested && parent.isVisible;
-  if (visible) {
+  // Sized even while hidden: a page loading out of sight (a peek's, while
+  // its card springs out) is laid out at the size it will show at, not
+  // resized as it appears. (Not at each step of a live window resize: the
+  // background tabs would all lay out again with it.)
+  if (parent && !_closeRequested && (visible || !parent.inLiveResize)) {
     NSRect frame = [self chromeWindowFrame];
-    if (!NSEqualRects(frame, window.frame)) [window setFrame:frame display:YES];
+    if (!NSEqualRects(frame, window.frame)) [window setFrame:frame display:visible];
+  }
+  if (visible) {
     [self roundChromeWindowCorners];
     if (window.parentWindow != parent) {
       [window.parentWindow removeChildWindow:window];
@@ -1132,6 +1139,27 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   return (__bridge NSView*)_browser->GetHost()->GetWindowHandle();
 }
 
+/// Chromium draws a page in a layer it sizes by autoresizing it with its
+/// view's: resized in many small steps (an embed's height dragged), that
+/// layer drifts from the view's bounds and the page draws off its frame.
+/// Fitted again on each layout.
+static void FitPageLayers(NSView* view) {
+  static Class pageViewClass = NSClassFromString(@"RenderWidgetHostViewCocoa");
+  if ([view isKindOfClass:pageViewClass]) {
+    CALayer* layer = view.layer;
+    const CAAutoresizingMask fill = kCALayerWidthSizable | kCALayerHeightSizable;
+    for (CALayer* sublayer in layer.sublayers) {
+      if ((sublayer.autoresizingMask & fill) != fill || CGRectEqualToRect(sublayer.frame, layer.bounds)) continue;
+      [CATransaction begin];
+      [CATransaction setDisableActions:YES];
+      sublayer.frame = layer.bounds;
+      [CATransaction commit];
+    }
+    return;
+  }
+  for (NSView* subview in view.subviews) FitPageLayers(subview);
+}
+
 - (void)layoutBrowserView {
   NSRect bounds = self.bounds;
   NSRect page = bounds;
@@ -1158,7 +1186,10 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   [self updateChromePlacement];
   _pageContainer.frame = page;
   NSView* host = [self hostView];
-  if (host) host.frame = _pageContainer.bounds;
+  if (host) {
+    host.frame = _pageContainer.bounds;
+    FitPageLayers(host);
+  }
 }
 
 - (void)layout {
@@ -1257,6 +1288,10 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
 
 - (void)stopLoading {
   if (_browser) _browser->StopLoad();
+}
+
+- (void)printPage {
+  if (_browser) _browser->GetHost()->Print();
 }
 
 - (void)executeJavaScript:(NSString*)script {

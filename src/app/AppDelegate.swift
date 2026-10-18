@@ -199,6 +199,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     file.addItem(withTitle: "Export Note as Markdown…", action: #selector(BrowserWindowController.exportCurrentNote(_:)), keyEquivalent: "")
     file.addItem(withTitle: "Export All Notes as Markdown…", action: #selector(BrowserWindowController.exportAllNotes(_:)), keyEquivalent: "")
     file.addItem(withTitle: "Show Notes Folder in Finder", action: #selector(BrowserWindowController.revealDataFolder(_:)), keyEquivalent: "")
+    file.addItem(.separator())
+    file.addItem(withTitle: "Print…", action: #selector(BrowserWindowController.printContent(_:)), keyEquivalent: "p")
 
     let edit = submenu(main, "Edit")
     edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")

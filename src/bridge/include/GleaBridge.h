@@ -224,6 +224,8 @@ NS_SWIFT_UI_ACTOR
 - (void)goForward;
 - (void)reload;
 - (void)stopLoading;
+/// Prints the page (Chromium's print preview, then the system's dialog).
+- (void)printPage;
 - (void)executeJavaScript:(NSString*)script;
 - (void)focusPage;
 

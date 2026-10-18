@@ -777,7 +777,9 @@ struct MarkdownStyler {
       return String(text[open.upperBound...].dropLast()).components(separatedBy: " ").first
     }
     if text.hasPrefix("http"), !text.contains(" ") { return text }
-    if text.hasPrefix("![["), text.hasSuffix("]]") { return text }
+    // Without its size or caption, as its key (the same file or page at
+    // two sizes is two blocks).
+    if text.hasPrefix("![["), text.hasSuffix("]]") { return text.split(separator: "|", maxSplits: 1).first.map(String.init) }
     return nil
   }
 
@@ -3326,6 +3328,24 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   var content: String { textView.string }
 
+  /// Fetches what its media print as, then calls `done` (see
+  /// `MediaBlockView.prepareForPrinting`).
+  func prepareMediaForPrinting(_ done: @escaping () -> Void) {
+    let group = DispatchGroup()
+    for view in mediaViews.values {
+      group.enter()
+      view.prepareForPrinting { group.leave() }
+    }
+    group.notify(queue: .main) { MainActor.assumeIsolated { done() } }
+  }
+
+  /// Loads its media for printing (see `MediaBlockView.loadForPrinting`),
+  /// and makes room for them.
+  func loadMediaForPrinting() {
+    for view in mediaViews.values { view.loadForPrinting() }
+    restyle()
+  }
+
   override var isFlipped: Bool { true }
 
   private var contentHeight: CGFloat = 30
@@ -4375,7 +4395,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
           guard let open = self?.onOpenLink else { return }
           DispatchQueue.main.async { open(url) }
         }
-        view.onResize = { [weak self] width in self?.resizeMedia(key, to: width) }
+        view.onResize = { [weak self] width, height in self?.resizeMedia(key, to: width, height: height) }
         mediaViews[media.key] = view
         (mediaHost ?? textView).addSubview(view)
         created = true
@@ -4424,13 +4444,13 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   /// A block's handle was dragged: its line takes the width, in the notation
   /// that holds one (undoable, like typing it).
-  private func resizeMedia(_ key: String, to width: Int?) {
+  private func resizeMedia(_ key: String, to width: Int?, height: Int?) {
     guard let range = mediaLines[key] else { return }
     let s = storage.string as NSString
     var line = s.lineRange(for: NSRange(location: range.location, length: 0))
     while line.length > 0, [0x0A, 0x0D].contains(s.character(at: NSMaxRange(line) - 1)) { line.length -= 1 }
     let old = s.substring(with: line)
-    guard let new = MediaDescriptor.line(old, sizedTo: width), new != old,
+    guard let new = MediaDescriptor.line(old, sizedTo: width, height: height), new != old,
           textView.shouldChangeText(in: line, replacementString: new) else { return }
     let selection = textView.selectedRange()
     storage.replaceCharacters(in: line, with: new)
