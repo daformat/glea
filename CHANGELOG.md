@@ -2,6 +2,13 @@
 
 What changed in each release of Glea.
 
+## 0.19.1 Beta — 2026-10-18
+
+- Smoother scrolling in a journal full of embeds: pictures, videos and
+  web pages load as you scroll near them, instead of all at once.
+- Quitting closes the windows at once, instead of their web pages going
+  blank first.
+
 ## 0.19.0 Beta — 2026-10-18
 
 - File › Print… (<kbd>⌘</kbd><kbd>P</kbd>) prints the note you're in, on
