@@ -236,6 +236,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     view.addItem(withTitle: "Show Web", action: #selector(BrowserWindowController.toggleJournal(_:)), keyEquivalent: "d")
     item(view, "Journal", #selector(BrowserWindowController.showJournal(_:)), "j", [.command, .shift])
     item(view, "All Notes", #selector(BrowserWindowController.showAllNotes(_:)), "h", [.command, .shift])
+    item(view, "Show Note Beside Page", #selector(BrowserWindowController.toggleSideNote(_:)), "d", [.command, .shift])
     view.addItem(.separator())
     view.addItem(withTitle: "Vertical Tabs", action: #selector(toggleVerticalTabs(_:)), keyEquivalent: "")
     view.addItem(.separator())

@@ -2467,6 +2467,20 @@ final class MarkdownTextView: NSTextView {
     return ok
   }
 
+  /// Resized, AppKit's text view scrolls the page to keep what it showed in
+  /// view, as if it were the page. It isn't (the title is above it): each
+  /// change of width moved the page a little, down from its top. The page
+  /// stays where it was (whoever resizes keeps the text in place).
+  override func setFrameSize(_ newSize: NSSize) {
+    let clip = enclosingScrollView?.contentView
+    let origin = clip?.bounds.origin
+    super.setFrameSize(newSize)
+    if let clip, let origin, clip.bounds.origin != origin {
+      clip.scroll(to: origin)
+      enclosingScrollView?.reflectScrolledClipView(clip)
+    }
+  }
+
   /// The page (not this view) scrolls: just enough to keep the cursor in
   /// view with a margin, one line at a time as it moves (AppKit's own jumps
   /// half a page, re-centering the cursor, each time it leaves the view).
@@ -5183,6 +5197,15 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   }
 
   /// The line containing `index`, in this view's coordinates.
+  /// The first character of the line at `y` (in this view).
+  func character(atLineY y: CGFloat) -> Int? {
+    guard storage.length > 0, let container = textView.textContainer else { return nil }
+    if let next = progressiveNext, next == 0 { return nil }
+    let p = textView.convert(NSPoint(x: 0, y: y), from: self)
+    let glyph = layoutManager.glyphIndex(for: NSPoint(x: 0, y: p.y - textView.textContainerOrigin.y), in: container)
+    return layoutManager.characterIndexForGlyph(at: glyph)
+  }
+
   func lineRect(forCharacterAt index: Int) -> NSRect? {
     guard textView.textContainer != nil, storage.length > 0 else { return nil }
     // Not placed yet: the note is still being styled down to it.

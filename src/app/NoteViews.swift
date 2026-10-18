@@ -1131,6 +1131,58 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
   func focusEditor() { editor?.focus() }
 
+  func debugScroll(to y: CGFloat) {
+    scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+    scrollView.reflectScrolledClipView(scrollView.contentView)
+  }
+
+  /// The scroll position and the text of the line at the top of the view.
+  func debugTopLine() -> String {
+    let top = scrollView.contentView.bounds.minY
+    guard let editor else { return "y \(top)" }
+    let y = editor.convert(NSPoint(x: 0, y: top), from: document).y
+    guard let character = editor.character(atLineY: y) else { return "y \(top) editorY \(y)" }
+    let text = (editor.textView.string as NSString).substring(with: NSRange(location: character, length: min(40, (editor.textView.string as NSString).length - character)))
+    return "y \(top) editorY \(y) doc \(document.bounds.height) char \(character) “\(text.replacingOccurrences(of: "\n", with: "⏎"))”"
+  }
+
+  /// What `keepingTopLine` keeps at the top: a character, how far above its
+  /// line the view's top is, and where it left the page. Kept while the
+  /// page stays there (a drag's steps): taken again at each step, the line
+  /// starting the top line changes as the text rewraps, and the page crept.
+  private var topLineAnchor: (character: Int, offset: CGFloat, y: CGFloat)?
+
+  /// Keeps the line at the top of the view there while `change` reflows the
+  /// note (its width changing): the scroll position follows the text.
+  func keepingTopLine(_ change: () -> Void) {
+    let clip = scrollView.contentView
+    let top = clip.bounds.minY
+    guard let editor, top > 0 else {
+      topLineAnchor = nil
+      return change()
+    }
+    var anchor = topLineAnchor
+    if anchor?.y != top {
+      let y = editor.convert(NSPoint(x: 0, y: top), from: document).y
+      guard y > 0, let character = editor.character(atLineY: y),
+            let line = editor.lineRect(forCharacterAt: character) else {
+        topLineAnchor = nil
+        return change()
+      }
+      anchor = (character, top - editor.convert(line, to: document).minY, top)
+    }
+    change()
+    guard let anchor, let line = editor.lineRect(forCharacterAt: anchor.character) else {
+      topLineAnchor = nil
+      return
+    }
+    let bottom = max(0, document.bounds.height - clip.bounds.height)
+    let y = min(max(0, editor.convert(line, to: document).minY + anchor.offset), bottom).rounded()
+    clip.scroll(to: NSPoint(x: clip.bounds.minX, y: y))
+    scrollView.reflectScrolledClipView(clip)
+    topLineAnchor = (anchor.character, anchor.offset, y)
+  }
+
   /// Prints the note shown: its title, then its text, on white paper.
   func printNote(in window: NSWindow) {
     guard let ref else { return }

@@ -511,6 +511,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private let noteView = NoteView()
   private let notesView = NotesListView()
   private let webContainer = PassthroughView()
+  private let sideNote = SideNoteView()
   private let toast = ToastView()
   private var errorView: NSView?
   private var findBar: FindBar?
@@ -641,6 +642,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     ]
     webContainer.wantsLayer = true
     webContainer.layer?.cornerCurve = .continuous
+    buildSideNote()
     barHeight = topBar.heightAnchor.constraint(equalToConstant: Theme.topBarHeight)
     sidebarHeight = topBar.bottomAnchor.constraint(equalTo: root.bottomAnchor)
     topBar.onResize = { [weak self] width, ended in self?.resizeSidebar(to: width, ended: ended) }
@@ -717,6 +719,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     webContainer.layer?.masksToBounds = card
     for tab in tabs { tab.browserView?.chromeCornerRadius = card ? TabLayout.cardRadius : 0 }
     topBar.isVertical = sidebar
+    layoutSideNote()
     root.layoutSubtreeIfNeeded()
     positionTrafficLights()
     syncOverlayWindow()
@@ -768,6 +771,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   func windowDidResize(_ notification: Notification) {
     if isExtra { scheduleSessionSave() }
+    // (Hidden tabs' pages too: they keep their notes' room.)
+    if tabs.contains(where: \.showsSideNote) { layoutSideNote() }
     positionTrafficLights()
     syncOverlayWindow()
   }
@@ -946,6 +951,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       if tab.errorMessage == nil { tab.browserView?.focusPage() }
     }
     updateErrorView()
+    updateSideNote()
     refreshTopBar()
   }
 
@@ -1082,6 +1088,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       lastNoteMode = newMode
     }
     updateErrorView()
+    updateSideNote()
     refreshTopBar()
     scheduleSessionSave()
   }
@@ -1257,7 +1264,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private func attach(_ tab: Tab) {
     let view = tab.ensureBrowserView()
     guard view.superview == nil else { return }
-    view.frame = webContainer.bounds
+    view.frame = pageFrame(for: tab)
     view.autoresizingMask = [.width, .height]
     view.isHidden = true
     webContainer.addSubview(view)
@@ -1268,6 +1275,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let previous = activeTab
     activeTab = tab
     attach(tab)
+    // Its note (or none) in place before its page shows, at its width.
+    updateSideNote(onWeb: true)
     closeFindBar()
     // Show (and focus) the new page before hiding the old one: its window
     // takes keyboard focus straight from the old page's, so the main window
@@ -1555,7 +1564,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   func tab(_ tab: Tab, requestsNewTab url: String, background: Bool) {
     // A page the peek opens in front leaves the notes for the web.
     if tab === peekTab, !background { closePeek() }
-    openTab(url, background: background)
+    let opened = openTab(url, background: background)
+    // (Background tabs: a page's ⌘-click.) The note beside the page goes along.
+    if tab !== peekTab, opened.sideNote == nil {
+      opened.sideNote = tab.sideNote
+      opened.showsSideNote = tab.showsSideNote
+      if !background { updateSideNote() }
+    }
   }
 
   func tab(_ tab: Tab, didReceiveMessage name: String, payload: [String: Any]) {
@@ -2439,6 +2454,242 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if reopened.indices.contains(closed.active) { activate(reopened[closed.active]) }
   }
 
+  // MARK: Note beside the page
+
+  /// How wide the note beside a page would like to be (its left edge
+  /// drags); narrower when the window leaves the page too little room.
+  private var sideNoteWidth: CGFloat = {
+    let saved = CGFloat(UserDefaults.standard.double(forKey: "SideNoteWidth"))
+    return saved > 0 ? saved : SideNoteView.defaultWidth
+  }()
+  private var sideNoteTop: NSLayoutConstraint!
+  private var sideNoteWidthConstraint: NSLayoutConstraint!
+  /// (The note's navigator is weak.)
+  private lazy var sideNoteNavigator = SideNoteNavigator(owner: self)
+  /// How much of the note shows, from 0 to 1, as it slides in or out.
+  private var sideNoteReveal: CGFloat = 0
+  private var sideNoteSlide: Timer?
+  /// The note's width when its edge was pressed, while it's dragged.
+  private var sideNoteDragStart: CGFloat?
+
+  private func buildSideNote() {
+    sideNote.translatesAutoresizingMaskIntoConstraints = false
+    sideNote.isHidden = true
+    contentArea.addSubview(sideNote)
+    sideNote.noteView.navigator = sideNoteNavigator
+    sideNote.onPick = { [weak self] in self?.pickSideNote() }
+    sideNote.onClose = { [weak self] in self?.closeSideNote() }
+    sideNote.onResize = { [weak self] delta, ended in self?.dragSideNoteEdge(by: delta, ended: ended) }
+    sideNoteTop = sideNote.topAnchor.constraint(equalTo: contentArea.topAnchor, constant: Theme.topBarHeight)
+    sideNoteWidthConstraint = sideNote.widthAnchor.constraint(equalToConstant: 0)
+    NSLayoutConstraint.activate([
+      sideNoteTop, sideNoteWidthConstraint,
+      sideNote.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+      sideNote.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+    ])
+  }
+
+  /// The note's width, as far as the window leaves the page some room.
+  private var shownSideNoteWidth: CGFloat {
+    let page: CGFloat = 360
+    let left = TabLayout.isVertical ? sidebarWidth.constant : 0
+    let room = max(SideNoteView.minWidth, contentArea.bounds.width - left - page)
+    return min(max(sideNoteWidth, SideNoteView.minWidth), room).rounded()
+  }
+
+  /// How much of the window's width the note beside `tab`'s page takes:
+  /// as much of it as shows for the tab in front, all of it for the others
+  /// with one (they're ready at their width when switched to).
+  private func sideNoteRoom(for tab: Tab) -> CGFloat {
+    if tab === activeTab { return sideNote.isHidden ? 0 : (shownSideNoteWidth * sideNoteReveal).rounded() }
+    return tab.showsSideNote && tab.sideNote != nil ? shownSideNoteWidth : 0
+  }
+
+  /// A tab's page: the web's room, less its note's. Each page has its own
+  /// width (all of them share the web's view), so switching tabs never
+  /// resizes the one coming in.
+  private func pageFrame(for tab: Tab) -> NSRect {
+    let bounds = webContainer.bounds
+    let room = sideNoteRoom(for: tab)
+    guard room > 0 else { return bounds }
+    // The note runs to the window's edge (with vertical tabs, over the gap
+    // beside the card).
+    let noteLeft = webContainer.convert(NSPoint(x: contentArea.bounds.maxX - room, y: 0), from: contentArea).x
+    return NSRect(x: bounds.minX, y: bounds.minY, width: max(0, min(bounds.width, noteLeft - bounds.minX)), height: bounds.height)
+  }
+
+  /// The pages narrow to leave their notes room, as much of it as shows.
+  private func layoutSideNote() {
+    guard sideNoteTop != nil else { return }
+    let card = TabLayout.isVertical
+    sideNoteWidthConstraint.constant = sideNote.isHidden ? 0 : (shownSideNoteWidth * sideNoteReveal).rounded()
+    sideNote.contentWidth = shownSideNoteWidth
+    // With vertical tabs the note runs the window's height beside the card.
+    sideNoteTop.constant = card ? 0 : Theme.topBarHeight
+    sideNote.showsSeparator = !card
+    root.layoutSubtreeIfNeeded()
+    for tab in tabs {
+      // Like a live window resize: only the page in front at each step of a
+      // drag of the note's edge, the others (out of sight) once it's over.
+      guard let view = tab.browserView, view.superview === webContainer,
+            tab === activeTab || sideNoteDragStart == nil else { continue }
+      let frame = pageFrame(for: tab)
+      if view.frame != frame { view.frame = frame }
+    }
+  }
+
+  /// Shows the active tab's note beside its page (only on the web, or
+  /// `onWeb`: about to be); `animated`, it slides in or out.
+  private func updateSideNote(animated: Bool = false, onWeb: Bool = false) {
+    let tab = (onWeb || mode == .web) && !isShowingNewTab ? activeTab : nil
+    let ref = tab?.showsSideNote == true ? tab?.sideNote : nil
+    if let ref { sideNote.show(ref) }
+    let target: CGFloat = ref != nil ? 1 : 0
+    if target == 0, let responder = window?.firstResponder as? NSView, responder.isDescendant(of: sideNote) {
+      window?.makeFirstResponder(nil)
+    }
+    if target == 1 { sideNote.isHidden = false }
+    sideNoteSlide?.invalidate()
+    sideNoteSlide = nil
+    let finish = { [weak self] in
+      guard let self else { return }
+      if target == 0 { self.sideNote.isHidden = true }
+      self.sideNoteReveal = target
+      self.layoutSideNote()
+      self.root.layoutSubtreeIfNeeded()
+      self.syncOverlayWindow()
+    }
+    guard animated, sideNoteReveal != target, window?.isVisible == true, !Motion.reduceMotion else { return finish() }
+    let from = sideNoteReveal
+    let start = CACurrentMediaTime()
+    let duration: CFTimeInterval = 0.3
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard let self else { return timer.invalidate() }
+        let t = min(1, (CACurrentMediaTime() - start) / duration)
+        guard t < 1 else {
+          timer.invalidate()
+          self.sideNoteSlide = nil
+          return finish()
+        }
+        self.sideNoteReveal = from + (target - from) * CGFloat(CubicBezier.easeOut(t))
+        self.layoutSideNote()
+        self.root.layoutSubtreeIfNeeded()
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    sideNoteSlide = timer
+  }
+
+  /// The note's left edge dragged: the note and the page in front follow.
+  private func dragSideNoteEdge(by delta: CGFloat, ended: Bool) {
+    let start = sideNoteDragStart ?? shownSideNoteWidth
+    sideNoteDragStart = ended ? nil : start
+    sideNoteWidth = start - delta
+    // Past the limits, the edge stays where it stopped.
+    sideNoteWidth = shownSideNoteWidth
+    layoutSideNote()
+    if ended { UserDefaults.standard.set(Double(sideNoteWidth), forKey: "SideNoteWidth") }
+  }
+
+  func debugShowSideNote(_ name: String) {
+    guard let tab = activeTab, let ref = NoteStore.shared.resolve(linkName: name) else { return }
+    tab.sideNote = ref
+    tab.showsSideNote = true
+    updateSideNote()
+  }
+
+  func debugDragSideNote(to width: Double, ended: Bool) {
+    let start = sideNoteDragStart ?? shownSideNoteWidth
+    dragSideNoteEdge(by: start - CGFloat(width), ended: ended)
+  }
+
+  func debugScrollSideNote(to y: Double) { sideNote.noteView.debugScroll(to: CGFloat(y)) }
+
+  func debugSideNoteState() -> String { "width \(sideNote.contentWidth) " + sideNote.noteView.debugTopLine() }
+
+  /// ⇧⌘D: the note beside the page, or none. The tab's last one comes back;
+  /// a tab's first is the last edited of the notes with the page's address
+  /// in them, else today's journal.
+  @objc func toggleSideNote(_ sender: Any?) {
+    guard mode == .web, !isShowingNewTab, let tab = activeTab else { return }
+    if tab.showsSideNote { return closeSideNote() }
+    if tab.sideNote == nil {
+      let address = tab.url.hasPrefix("http") ? tab.url : ""
+      tab.sideNote = NoteStore.shared.lastEdited(mentioning: address) ?? NoteStore.shared.today
+    }
+    tab.showsSideNote = true
+    updateSideNote(animated: true)
+    sideNote.noteView.focusEditor()
+  }
+
+  private func closeSideNote() {
+    guard let tab = activeTab else { return }
+    MarkdownEditorView.flushAll()
+    tab.showsSideNote = false
+    updateSideNote(animated: true)
+    if tab.errorMessage == nil { tab.browserView?.focusPage() }
+  }
+
+  /// The note's title: another note, found or created (with nothing typed,
+  /// a new one named after the page, starting with a link to it).
+  private func pickSideNote() {
+    guard let tab = activeTab else { return }
+    let omnibox = OmniboxView(target: .currentTab, initialText: "")
+    omnibox.notesOnly = true
+    omnibox.newNoteName = tab.displayTitle
+    omnibox.onDismiss = { [weak self] in self?.dismissOverlay() }
+    omnibox.onChoose = { [weak self, weak tab] item, _ in
+      guard let self, let tab else { return }
+      self.dismissOverlay(restoreFocus: false)
+      switch item.action {
+      case .note(let ref):
+        tab.sideNote = ref
+      case .createNote(let name):
+        let ref = NoteStore.shared.createNote(named: name)
+        if name == omnibox.newNoteName, tab.url.hasPrefix("http"), NoteStore.shared.content(of: ref).isEmpty {
+          let title = tab.displayTitle.replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")")
+          NoteStore.shared.save(ref, content: "[\(title)](\(tab.url))\n\n")
+        }
+        tab.sideNote = ref
+      case .open, .tab:
+        return
+      }
+      MarkdownEditorView.flushAll()
+      self.updateSideNote()
+      self.sideNote.noteView.focusEditor()
+    }
+    present(omnibox)
+    omnibox.activate()
+    omnibox.animateAppear()
+  }
+
+  /// A link in the note beside the page: a web link opens in the page (⌘:
+  /// in a background tab, with the same note beside it), a note in the
+  /// note's place.
+  fileprivate func openFromSideNote(_ url: URL) {
+    guard let tab = activeTab else { return openLink(url) }
+    if url.scheme == "glea-note" {
+      let raw = url.absoluteString.dropFirst("glea-note:".count)
+      let written = String(raw).removingPercentEncoding ?? String(raw)
+      let target = WikiTarget(written)
+      guard let ref = NoteStore.shared.resolve(linkName: written)
+              ?? NoteStore.shared.resolve(linkName: target.name.isEmpty ? written : target.name) else { return openLink(url) }
+      tab.sideNote = ref
+      updateSideNote()
+    } else if url.scheme == "http" || url.scheme == "https" {
+      if NSApp.currentEvent?.modifierFlags.contains(.command) == true {
+        let opened = openTab(url.absoluteString, background: true)
+        opened.sideNote = tab.sideNote
+        opened.showsSideNote = tab.showsSideNote
+      } else {
+        tab.load(url.absoluteString)
+      }
+    } else {
+      openLink(url)
+    }
+  }
+
   /// ⌘D: flip between the journal/notes and the web.
   @objc func toggleJournal(_ sender: Any?) {
     if mode == .web {
@@ -2716,6 +2967,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   func validateMenuItem(_ item: NSMenuItem) -> Bool {
     let web = mode == .web && activeTab != nil && !isShowingNewTab
     switch item.action {
+    case #selector(toggleSideNote(_:)):
+      item.title = web && activeTab?.showsSideNote == true ? "Hide Note Beside Page" : "Show Note Beside Page"
+      return web
     case #selector(showDeveloperTools(_:)):
       item.title = activeTab?.devTools?.isOpen == true ? "Hide Developer Tools" : "Show Developer Tools"
       return web
@@ -2761,4 +3015,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       return true
     }
   }
+}
+
+
+/// Where the note beside a page sends its links (see `openFromSideNote`).
+@MainActor
+final class SideNoteNavigator: NoteNavigator {
+  weak var owner: BrowserWindowController?
+  init(owner: BrowserWindowController) { self.owner = owner }
+  func openNote(_ ref: NoteRef) { owner?.openNote(ref) }
+  func openLink(_ url: URL) { owner?.openFromSideNote(url) }
+  func openSearch(_ url: URL) { owner?.openSearch(url) }
 }

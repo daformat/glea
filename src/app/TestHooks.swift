@@ -157,6 +157,17 @@ enum TestHooks {
       // Puts the cursor at the start of the visible note.
       let editor = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? MarkdownEditorView }.first { !$0.isHiddenOrHasHiddenAncestor }
       editor?.focus(atEnd: false)
+    case "side-note":
+      // side-note:<note name> shows that note beside the page in front.
+      controller.debugShowSideNote(argument)
+    case "side-note-drag":
+      // side-note-drag:<width>[,end] drags the note's edge to that width.
+      let parts = argument.split(separator: ",")
+      if let width = Double(parts.first ?? "") { controller.debugDragSideNote(to: width, ended: parts.count > 1) }
+    case "side-note-scroll":
+      if let y = Double(argument) { controller.debugScrollSideNote(to: y) }
+    case "side-note-state":
+      NSLog("Glea side note: %@", controller.debugSideNoteState())
     case "fold-duration":
       if let seconds = Double(argument) { Motion.foldDuration = seconds }
     case "table-hover":

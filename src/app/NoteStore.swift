@@ -240,6 +240,12 @@ final class NoteStore {
       .map(\.key)
   }
 
+  /// The note or journal day last edited of those whose text has `text`.
+  func lastEdited(mentioning text: String) -> NoteRef? {
+    guard !text.isEmpty else { return nil }
+    return entries.filter { $0.value.content.contains(text) }.max { $0.value.modified < $1.value.modified }?.key
+  }
+
   /// Journal days with content, newest first.
   var journalDays: [NoteRef] {
     entries.keys.filter { $0.kind == .journal }.sorted { $0.name > $1.name }

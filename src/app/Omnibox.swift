@@ -510,6 +510,12 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
   /// Incognito: no history (no completion, no visited pages) and nothing
   /// typed is sent for suggestions. Notes and tabs are there as usual.
   var isIncognito = false
+  /// Picks a note rather than going anywhere (the note beside a page):
+  /// only notes, and with nothing typed, a new one named `newNoteName`.
+  var notesOnly = false {
+    didSet { if notesOnly { field.placeholderString = "Find or create a note" } }
+  }
+  var newNoteName = ""
 
   let target: Target
   /// Part of a page (the incognito window's) rather than floating over the
@@ -648,7 +654,7 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
     // bare text or the title): the suggestion is appended to the editor's
     // text, selected, and its title placed.
     defer { updateCompletionTitle() }
-    guard !isDeletion, !isIncognito, let editor = field.currentEditor() as? NSTextView, let storage = editor.textStorage,
+    guard !isDeletion, !isIncognito, !notesOnly, let editor = field.currentEditor() as? NSTextView, let storage = editor.textStorage,
           editor.selectedRange().location == (typed as NSString).length,
           let found = HistoryStore.shared.completion(for: typed) else { return }
     completion = found
@@ -730,6 +736,7 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
   }
 
   private func rebuild(keepingSelection: Bool = false) {
+    if notesOnly { return rebuildNotes() }
     let q = query
     var items: [PickerItem] = []
     let store = NoteStore.shared
@@ -793,10 +800,37 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
     needsLayout = true
   }
 
+  /// Only notes (see `notesOnly`).
+  private func rebuildNotes() {
+    let q = query
+    let store = NoteStore.shared
+    var items: [PickerItem] = []
+    if q.isEmpty {
+      items.append(PickerItem(icon: "calendar", title: "Today", subtitle: "Journal", action: .note(store.today)))
+      for ref in store.notes.prefix(5) {
+        items.append(PickerItem(icon: "doc.text", title: ref.name, subtitle: "Note", action: .note(ref)))
+      }
+    } else {
+      for result in store.search(q, limit: 7) {
+        let isJournal = result.ref.kind == .journal
+        items.append(PickerItem(icon: isJournal ? "calendar" : "doc.text", title: result.ref.displayTitle,
+                                subtitle: result.snippet, action: .note(result.ref)))
+      }
+    }
+    let name = q.isEmpty ? newNoteName.trimmingCharacters(in: .whitespacesAndNewlines) : q
+    if !name.isEmpty, !store.hasNote(named: name) {
+      items.append(PickerItem(icon: "plus.circle", title: "Create Note:", subtitle: name, action: .createNote(name),
+                              shortcut: q.isEmpty ? nil : "⇧⌘↩", dividerAbove: true))
+    }
+    list.items = items
+    list.select(0)
+    needsLayout = true
+  }
+
   private func fetchSuggestions() {
     suggestionWork?.cancel()
     let q = query
-    guard !q.isEmpty, !isIncognito, OmniboxView.url(from: q) == nil else {
+    guard !q.isEmpty, !isIncognito, !notesOnly, OmniboxView.url(from: q) == nil else {
       suggestions = []
       return
     }

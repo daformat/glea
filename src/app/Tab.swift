@@ -38,6 +38,10 @@ final class Tab: NSObject, GleaBrowserViewDelegate {
   /// Pinned tabs sit, icon-only, at the start of the tab bar; ⌘W doesn't
   /// close them and links to other sites open in new tabs.
   var isPinned = false
+  /// The note beside the page (View › Note Beside Page), kept once hidden:
+  /// it comes back as it was.
+  var sideNote: NoteRef?
+  var showsSideNote = false
   var groupID: UUID?
   /// Incognito tabs' browsing session (in memory): nothing about them is
   /// written to disk, history included.
