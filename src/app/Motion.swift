@@ -132,15 +132,25 @@ extension NSView {
   /// Moves/resizes the view to `frame` with a spring. `fromCurrentFrame`
   /// starts from its frame rather than what's on screen (right after moving
   /// it to another superview, the screen still has the old coordinates).
-  func springFrame(to frame: NSRect, stiffness: CGFloat = 420, damping: CGFloat = 32, fromCurrentFrame: Bool = false) {
+  /// `shift` moves where it starts from (in its superview's coordinates):
+  /// content that scrolled moves with the scroll, and springs only the rest.
+  func springFrame(to frame: NSRect, stiffness: CGFloat = 420, damping: CGFloat = 32, fromCurrentFrame: Bool = false,
+                   shift: CGSize = .zero) {
     wantsLayer = true
     guard let layer, !Motion.reduceMotion, !self.frame.isEmpty else {
       self.frame = frame
       return
     }
     let presentation = fromCurrentFrame ? nil : layer.presentation()
-    let fromPosition = presentation?.position ?? layer.position
+    var fromPosition = presentation?.position ?? layer.position
     let fromBounds = presentation?.bounds ?? layer.bounds
+    if shift != .zero {
+      // (The layer's coordinates may be flipped from the view's.)
+      let unshifted = layer.position
+      self.frame = self.frame.offsetBy(dx: shift.width, dy: shift.height)
+      fromPosition.x += layer.position.x - unshifted.x
+      fromPosition.y += layer.position.y - unshifted.y
+    }
     self.frame = frame
     let position = Motion.spring("position", stiffness: stiffness, damping: damping)
     position.fromValue = fromPosition

@@ -194,8 +194,13 @@ final class IconButton: NSControl {
     super.hitTest(point) == nil ? nil : self
   }
 
-  override func mouseEntered(with event: NSEvent) { hovering = true }
+  override func mouseEntered(with event: NSEvent) { if tracksHover { hovering = true } }
   override func mouseExited(with event: NSEvent) { hovering = false }
+
+  /// Off, it never hovers (its tab is being dragged).
+  var tracksHover = true {
+    didSet { if tracksHover != oldValue { syncHoverWithPointer() } }
+  }
 
   // Hidden under the pointer (its page left, say), it gets no exit event;
   // shown again, the pointer may be anywhere.
@@ -212,7 +217,7 @@ final class IconButton: NSControl {
   /// Tabs that move under a still pointer (scrolling the strip) get no
   /// enter/exit events: match the hover to where the pointer is now.
   func syncHoverWithPointer() {
-    guard let window, !isHiddenOrHasHiddenAncestor else {
+    guard let window, !isHiddenOrHasHiddenAncestor, tracksHover else {
       if hovering { hovering = false }
       return
     }

@@ -99,6 +99,8 @@ final class TabsView: NSView {
   private var underlines: [UUID: GroupLineView] = [:]
   private var drag: TabDrag?
   private var lastDragEventTime: CFTimeInterval = 0
+  /// How far the strip just scrolled, while laying out after it (mid-drag).
+  private var scrollShift: CGFloat = 0
   /// Views just dropped (back in the strip): their spring starts where they are.
   private var releasedViews: [NSView] = []
   /// The width of unpinned tabs at the last layout.
@@ -297,7 +299,12 @@ final class TabsView: NSView {
     guard view.frame != frame else { return }
     if animated && !view.frame.isEmpty {
       let released = releasedViews.contains { $0 === view }
-      view.springFrame(to: frame, stiffness: 420, damping: 34, fromCurrentFrame: released)
+      // Scrolled mid-drag: what's in the strip moves with it at once (lagging
+      // springs drift out of the strip's bounds, where AppKit stops drawing
+      // their titles).
+      let shift = view.superview !== tabStrip ? .zero
+        : axis == .horizontal ? CGSize(width: -scrollShift, height: 0) : CGSize(width: 0, height: -scrollShift)
+      view.springFrame(to: frame, stiffness: 420, damping: 34, fromCurrentFrame: released, shift: shift)
       if released { releasedViews.removeAll { $0 === view } }
     } else {
       // A spring still running would end on its old target, then jump.
@@ -1046,7 +1053,7 @@ private final class TabPill: NSView {
 
   // (Not while hidden in its collapsed group's capsule, under the pointer
   // that collapsed it.)
-  override func mouseEntered(with event: NSEvent) { if !isCollapsedAway { hovering = true } }
+  override func mouseEntered(with event: NSEvent) { if !isCollapsedAway, !hoverSuspended { hovering = true } }
   override func mouseExited(with event: NSEvent) { hovering = false }
 
   /// Tabs that move under a still pointer (scrolling the strip) get no
@@ -1054,7 +1061,7 @@ private final class TabPill: NSView {
   func syncHoverWithPointer() {
     guard let window, !isHidden else { return }
     let point = window.mouseLocationOutsideOfEventStream
-    let inside = bounds.contains(convert(point, from: nil))
+    let inside = hoverSuspended ? isDragged : bounds.contains(convert(point, from: nil))
       && (superview.map { $0.bounds.contains($0.convert(point, from: nil)) } ?? true)
     if inside != hovering { hovering = inside }
     // Its buttons moved under the pointer too (the copy button would stay
@@ -1139,6 +1146,18 @@ private final class TabPill: NSView {
     didSet {
       guard isDragged != oldValue else { return }
       if isDragged { hovering = true } else { syncHoverWithPointer() }
+    }
+  }
+
+  /// While a tab is dragged nothing else hovers, and neither do its buttons:
+  /// tabs slide under the pointer (and the dragged one) with no enter or
+  /// exit events, and would keep a hover they caught on the way.
+  var hoverSuspended = false {
+    didSet {
+      guard hoverSuspended != oldValue else { return }
+      closeButton.tracksHover = !hoverSuspended
+      copyButton.tracksHover = !hoverSuspended
+      syncHoverWithPointer()
     }
   }
 
@@ -2054,11 +2073,14 @@ extension TabsView {
     var speed: CGFloat = 0
     if drag.pointer >= stripStart + 2, drag.pointer < stripStart + edge { speed = -(stripStart + edge - drag.pointer) / edge }
     if drag.pointer > stripEnd - edge { speed = (drag.pointer - (stripEnd - edge)) / edge }
+    let before = tabStrip.scrollOffset
     if speed != 0, tabStrip.scroll(by: min(1, max(-1, speed)) * 14) {
       // What's under the pointer changed.
       let target = computeDropTarget()
       if self.drag?.groupWith == nil { self.drag?.lastTarget = target }
+      scrollShift = tabStrip.scrollOffset - before
       relayout(animated: true)
+      scrollShift = 0
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) { [weak self] in self?.autoScroll() }
   }
@@ -2116,6 +2138,7 @@ extension TabsView {
       addSubview(pill)  // above both strips while dragged
       pill.frame = frame
       pill.isDragged = true
+      setHoverSuspended(true)
       updateDropTarget(event)
       relayout(animated: true)
       watchForLostRelease { [weak self] in self?.dragTab(id, phase: .ended, event: event) }
@@ -2132,6 +2155,8 @@ extension TabsView {
       window?.isMovable = true
       pill.contentFade = 1
       pill.isDragged = false
+      // (Once it's put back in the strip and the others moved.)
+      defer { setHoverSuspended(false) }
       let target = dropTarget()
       let items = unpinnedItems(excludingDrag: true)
       let groupWith = drag?.groupWith
@@ -2168,6 +2193,17 @@ extension TabsView {
         break
       }
       relayout(animated: true)
+    }
+  }
+
+  /// Hover is off for the bar's tabs while one is dragged; back on, it's
+  /// matched to the pointer, again once the tabs have sprung into place.
+  private func setHoverSuspended(_ suspended: Bool) {
+    for pill in pills.values { pill.hoverSuspended = suspended }
+    guard !suspended else { return }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+      guard let self, self.drag == nil else { return }
+      for pill in self.pills.values { pill.syncHoverWithPointer() }
     }
   }
 
