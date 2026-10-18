@@ -2,6 +2,22 @@
 
 What changed in each release of Glea.
 
+## 0.21.0 Beta — 2026-10-18
+
+- A note beside the page: View › Show Note Beside Page (<kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd>)
+  opens a note to the right of the page you're reading, ready to write in.
+  The first time on a tab it's the note you last edited that has the page's
+  address in it, or today's journal. Each tab keeps its own note, and
+  brings it back as it was.
+- Click the note's title to switch to another note, or to create one named
+  after the page that starts with a link to it.
+- Links in the note open in the page beside it; <kbd>⌘</kbd>-click opens
+  them in a new tab with the same note beside it. Links to other notes
+  open in the note's place.
+- Drag the note's left edge to make it wider or narrower.
+- Switching between horizontal and vertical tabs no longer sweeps a fade
+  across the tabs.
+
 ## 0.20.2 Beta — 2026-10-18
 
 - A note scrolled to its end stays there when you tick a checkbox or
