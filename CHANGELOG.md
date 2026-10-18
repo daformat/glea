@@ -2,6 +2,27 @@
 
 What changed in each release of Glea.
 
+## 0.19.0 Beta — 2026-10-18
+
+- File › Print… (<kbd>⌘</kbd><kbd>P</kbd>) prints the note you're in, on
+  white paper with its pictures, PDFs and embedded notes (videos and web
+  embeds print as a still), or the page in front on the web and in a peek.
+- Embed any web page in a note with `![[https://…]]`. Links to pictures,
+  videos, sounds, PDFs and known services still show as those. Once
+  clicked, the page scrolls; at its top or bottom, your next scroll moves
+  the note.
+- Web embeds resize like pictures, and web pages in height too, with a
+  handle below them: the size is written as `|600x400`, or `|x400` at
+  full width.
+- The same picture or page embedded twice at different sizes now shows
+  twice.
+- Tweets no longer show white around their card.
+- Peek: the address and buttons spring out of the card's corners, and the
+  address grows to the page's title when it arrives. The page appears at
+  its final size, and fades out with the card when you close it.
+- Background tabs keep their size while hidden, so they no longer reflow
+  when you switch to them.
+
 ## 0.18.0 Beta — 2026-10-17
 
 - Peek: clicking a web link in a note or the journal opens the page in a
