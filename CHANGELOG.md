@@ -2,6 +2,18 @@
 
 What changed in each release of Glea.
 
+## 0.20.0 Beta — 2026-10-18
+
+- Mermaid diagrams: a code block marked `mermaid` shows as its diagram
+  (flowcharts, sequence and class diagrams, state and entity diagrams,
+  Gantt charts, pies, mind maps and more), in your note's colors in light
+  and dark. With the cursor in it, its source shows with the diagram
+  under it, following your typing, or what's wrong with it.
+- Click a diagram to edit it where you clicked: in a label at that
+  letter, on a box where it's named, on an arrow on the line that draws
+  it.
+- The slash menu has Diagram (`/diagram`).
+
 ## 0.19.1 Beta — 2026-10-18
 
 - Smoother scrolling in a journal full of embeds: pictures, videos and
