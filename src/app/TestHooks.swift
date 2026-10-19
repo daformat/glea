@@ -168,6 +168,14 @@ enum TestHooks {
       if let y = Double(argument) { controller.debugScrollSideNote(to: y) }
     case "side-note-state":
       NSLog("Glea side note: %@", controller.debugSideNoteState())
+    case "zen":
+      // zen toggles zen mode (sliding); zen:on or zen:off sets it.
+      if argument.isEmpty || (argument == "on") != TabLayout.isZen { controller.toggleZenMode(nil) }
+    case "zen-reveal":
+      // zen-reveal:1 shows the bar over the page in zen mode, zen-reveal:0 hides it.
+      controller.debugZenReveal(argument == "1")
+    case "zen-state":
+      NSLog("Glea zen: %@", controller.debugZenState())
     case "fold-duration":
       if let seconds = Double(argument) { Motion.foldDuration = seconds }
     case "table-hover":

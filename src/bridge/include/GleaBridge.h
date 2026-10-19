@@ -189,6 +189,10 @@ NS_SWIFT_UI_ACTOR
 /// Rounds all corners of `chromeWindow` (popups). 0: only where the page
 /// meets the bottom corners of the window.
 @property(nonatomic) CGFloat chromeCornerRadius;
+/// A part of this view (in its coordinates) where `chromeWindow` draws
+/// nothing, so the app's views below show through: a bar over the page,
+/// which keeps its size. Empty: none.
+@property(nonatomic) NSRect chromeCutout;
 
 /// Sent as the Referer of this browser's frame navigations. Some embeds
 /// (YouTube) refuse to play without one. Set before the view is shown.

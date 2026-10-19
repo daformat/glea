@@ -126,6 +126,7 @@ struct PickerItem {
     case note(NoteRef)
     case tab(Int)
     case createNote(String)
+    case command(BrowserCommand.Kind)
   }
 
   var icon: String
@@ -507,6 +508,8 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
 
   var onChoose: ((PickerItem, Target) -> Void)?
   var tabsProvider: () -> [Tab] = { [] }
+  /// What it can do where it was opened (its command bar).
+  var commandsProvider: () -> [BrowserCommand] = { [] }
   /// Incognito: no history (no completion, no visited pages) and nothing
   /// typed is sent for suggestions. Notes and tabs are there as usual.
   var isIncognito = false
@@ -756,6 +759,13 @@ final class OmniboxView: OverlayView, NSTextFieldDelegate {
         let address = q + completion.suffix
         items.append(PickerItem(icon: "clock", title: completion.title.isEmpty ? address : completion.title,
                                 subtitle: completion.title.isEmpty ? openHint : "\(openHint) · \(address)", action: .open(url: completion.url)))
+      }
+      // Then commands named by what was typed (↩ runs the first).
+      if OmniboxView.url(from: q) == nil {
+        for command in BrowserCommand.matching(q, in: commandsProvider()).prefix(3) {
+          items.append(PickerItem(icon: command.icon, title: command.title, subtitle: command.subtitle,
+                                  action: .command(command.kind), shortcut: command.shortcut))
+        }
       }
       // (While ⌘ is held, they say they open in a new tab.)
       let newTab = commandHeld ? " in a new tab" : ""
@@ -1121,6 +1131,34 @@ final class CapturePanel: OverlayView, NSTextFieldDelegate {
       return true
     default:
       return false
+    }
+  }
+}
+
+/// What the omnibox does besides going somewhere (its command bar), found
+/// by name or by another word for it.
+struct BrowserCommand {
+  enum Kind {
+    case zenMode, newNote, copyLink, copyMarkdownLink, verticalTabs, sideNote
+  }
+
+  let kind: Kind
+  let title: String
+  /// What it does (now: a toggle says which way).
+  let subtitle: String
+  let icon: String
+  /// Other words for it.
+  let keywords: [String]
+  var shortcut: String? = nil
+
+  /// Those named by `query`: from two letters typed, each of its words
+  /// starts one of the title's words or keywords.
+  static func matching(_ query: String, in commands: [BrowserCommand]) -> [BrowserCommand] {
+    let words = query.lowercased().split(separator: " ").map(String.init)
+    guard query.trimmingCharacters(in: .whitespaces).count >= 2, !words.isEmpty else { return [] }
+    return commands.filter { command in
+      let names = (command.title.lowercased().split(separator: " ") + command.keywords.flatMap { $0.split(separator: " ") }).map(String.init)
+      return words.allSatisfy { word in names.contains { $0.hasPrefix(word) } }
     }
   }
 }

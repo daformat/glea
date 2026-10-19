@@ -731,7 +731,8 @@ final class TopBarView: NSView {
       separatorLayer.frame = isVertical ? .zero : NSRect(x: 0, y: 0, width: bounds.width, height: 1)
       resizeEdge.frame = NSRect(x: sidebarWidth - 6, y: 0, width: 6, height: bounds.height)
       let inset = TabLayout.cardInset
-      cardOutline.isHidden = !isVertical
+      // (None beside the sidebar's own strip: zen mode, no card.)
+      cardOutline.isHidden = !isVertical || bounds.width <= sidebarWidth + inset
       cardOutline.frame = NSRect(x: sidebarWidth, y: inset, width: max(0, bounds.width - sidebarWidth - inset),
                                  height: max(0, bounds.height - 2 * inset)).insetBy(dx: -1, dy: -1)
     }

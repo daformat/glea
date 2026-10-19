@@ -239,6 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     item(view, "Show Note Beside Page", #selector(BrowserWindowController.toggleSideNote(_:)), "d", [.command, .shift])
     view.addItem(.separator())
     view.addItem(withTitle: "Vertical Tabs", action: #selector(toggleVerticalTabs(_:)), keyEquivalent: "")
+    item(view, "Zen Mode", #selector(BrowserWindowController.toggleZenMode(_:)), "s", [.command, .control])
     view.addItem(.separator())
     view.addItem(withTitle: "Reload Page", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
     view.addItem(withTitle: "Stop", action: #selector(BrowserWindowController.stopLoading(_:)), keyEquivalent: ".")

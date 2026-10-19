@@ -1071,6 +1071,44 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
     layer.maskedCorners = corners;
     layer.masksToBounds = radius > 0;
   }
+  [self applyChromeCutout];
+}
+
+- (void)setChromeCutout:(NSRect)cutout {
+  if (NSEqualRects(cutout, _chromeCutout)) return;
+  _chromeCutout = cutout;
+  [self applyChromeCutout];
+}
+
+/// The cutout, as a mask on the page window's frame view (where its
+/// corners are rounded too).
+- (void)applyChromeCutout {
+  NSWindow* window = _chromeWindow.window;
+  NSView* frameView = window.contentView.superview;
+  NSWindow* parent = self.window;
+  if (!frameView || !parent) return;
+  frameView.wantsLayer = YES;
+  CALayer* layer = frameView.layer;
+  NSRect hole = NSIntersectionRect(_chromeCutout, self.bounds);
+  if (NSIsEmptyRect(hole)) {
+    if (layer.mask) layer.mask = nil;
+    return;
+  }
+  NSRect frame = window.frame;
+  NSRect local = NSOffsetRect([parent convertRectToScreen:[self convertRect:hole toView:nil]], -NSMinX(frame), -NSMinY(frame));
+  if (layer.geometryFlipped) local.origin.y = NSHeight(frame) - NSMaxY(local);
+  CAShapeLayer* mask = [layer.mask isKindOfClass:CAShapeLayer.class] ? (CAShapeLayer*)layer.mask : [CAShapeLayer layer];
+  CGMutablePathRef path = CGPathCreateMutable();
+  CGPathAddRect(path, NULL, layer.bounds);
+  CGPathAddRect(path, NULL, local);
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  mask.fillRule = kCAFillRuleEvenOdd;
+  mask.frame = layer.bounds;
+  mask.path = path;
+  layer.mask = mask;
+  [CATransaction commit];
+  CGPathRelease(path);
 }
 
 - (void)setFrameSize:(NSSize)newSize {

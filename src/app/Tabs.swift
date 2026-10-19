@@ -19,6 +19,17 @@ enum TabLayout {
     }
   }
 
+  /// Zen mode (View › Zen Mode): on the web, the tabs and toolbar are out of
+  /// the way and the page fills the window; the pointer at their edge
+  /// shows them over the page.
+  static var isZen: Bool {
+    get { defaults.bool(forKey: "zenMode") }
+    set { defaults.set(newValue, forKey: "zenMode") }
+  }
+  /// Zen mode changed: the window it was toggled in (the object) slides,
+  /// the others follow at once.
+  static let zenDidChange = Notification.Name("app.glea.zenDidChange")
+
   static let minSidebarWidth: CGFloat = 180
   static let maxSidebarWidth: CGFloat = 400
 

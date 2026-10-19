@@ -475,6 +475,84 @@ final class PassthroughView: NSView {
   }
 }
 
+/// The shadow the bar shown over the page in zen mode casts on it: it's in
+/// the overlay window, the only one over the page's.
+private final class ZenEdgeShadow: NSView {
+  static let depth: CGFloat = 10
+  private let gradient = CAGradientLayer()
+
+  /// Along the sidebar's right edge, or under the top bar.
+  var isVertical = false {
+    didSet { if isVertical != oldValue { needsLayout = true } }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layer?.addSublayer(gradient)
+    gradient.colors = [NSColor.black.withAlphaComponent(0.12).cgColor, NSColor.black.withAlphaComponent(0.04).cgColor,
+                       NSColor.black.withAlphaComponent(0).cgColor]
+    gradient.locations = [0, 0.35, 1]
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override func layout() {
+    super.layout()
+    Motion.withoutAnimation {
+      gradient.frame = bounds
+      // (Not flipped: the top bar's edge is the shadow's top.)
+      gradient.startPoint = isVertical ? CGPoint(x: 0, y: 0.5) : CGPoint(x: 0.5, y: 1)
+      gradient.endPoint = isVertical ? CGPoint(x: 1, y: 0.5) : CGPoint(x: 0.5, y: 0)
+    }
+  }
+}
+
+/// What's around the page's card in zen mode: the web bar's color, and
+/// the card's outline (the bar, which has them otherwise, is away).
+private final class ZenBackdrop: NSView {
+  private let outline = CALayer()
+
+  /// The card's frame here (its outline goes around it).
+  var cardFrame: NSRect = .zero {
+    didSet {
+      Motion.withoutAnimation { outline.frame = cardFrame.insetBy(dx: -1, dy: -1) }
+    }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    outline.borderWidth = 1
+    outline.cornerCurve = .continuous
+    outline.cornerRadius = TabLayout.cardRadius + 1
+    layer?.addSublayer(outline)
+    for name in [NSApplication.didBecomeActiveNotification, NSApplication.didResignActiveNotification] {
+      NotificationCenter.default.addObserver(self, selector: #selector(updateColors), name: name, object: nil)
+    }
+    updateColors()
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override func viewDidChangeEffectiveAppearance() {
+    super.viewDidChangeEffectiveAppearance()
+    updateColors()
+  }
+
+  /// (The bar's: dimmer while Glea isn't active.)
+  @objc private func updateColors() {
+    effectiveAppearance.performAsCurrentDrawingAppearance {
+      layer?.backgroundColor = (NSApp.isActive ? Theme.webBar : Theme.inactiveWebBar).cgColor
+      outline.borderColor = Theme.separator.cgColor
+    }
+  }
+}
+
 extension NSWindow {
   /// Where the app puts its own views (bars): the main window's root view.
   var appRootView: NSView? { (windowController as? BrowserWindowController)?.rootView ?? contentView }
@@ -616,14 +694,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     contentArea.translatesAutoresizingMaskIntoConstraints = false
     // The content over the bar: it lets clicks through where it shows
     // nothing, and with vertical tabs the page's card sits on the bar.
+    // (Under everything: the card's surroundings in zen mode.)
+    root.addSubview(zenBackdrop)
+    zenBackdrop.pinEdges(to: root)
+    zenBackdrop.isHidden = true
     root.addSubview(topBar)
     root.addSubview(contentArea)
     contentArea.pinEdges(to: root)
-    NSLayoutConstraint.activate([
-      topBar.topAnchor.constraint(equalTo: root.topAnchor),
-      topBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-      topBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-    ])
+    topBarTop = topBar.topAnchor.constraint(equalTo: root.topAnchor)
+    topBarLeading = topBar.leadingAnchor.constraint(equalTo: root.leadingAnchor)
+    topBarTrailing = topBar.trailingAnchor.constraint(equalTo: root.trailingAnchor)
+    topBarStrip = topBar.widthAnchor.constraint(equalToConstant: sidebarSize)
+    NSLayoutConstraint.activate([topBarTop, topBarLeading, topBarTrailing])
     // The notes are always under the top bar. The web is too, or with
     // vertical tabs it's a card beside the sidebar, its color all around.
     // Each keeps its place whatever the mode: switching modes moves nothing.
@@ -650,6 +732,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     NotificationCenter.default.addObserver(forName: TabLayout.didChange, object: nil, queue: .main) { [weak self] _ in
       MainActor.assumeIsolated { self?.applyTabLayout(animated: false) }
     }
+    NotificationCenter.default.addObserver(forName: TabLayout.zenDidChange, object: nil, queue: .main) { [weak self] note in
+      let toggledHere = note.object as AnyObject? === self
+      MainActor.assumeIsolated { self?.applyZen(animated: toggledHere) }
+    }
     journalView.navigator = self
     noteView.navigator = self
     notesView.navigator = self
@@ -670,6 +756,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       MainActor.assumeIsolated { self?.showDownloadFlight() }
     }
     overlayRoot.addSubview(toast)
+    zenShadow.isHidden = true
+    overlayRoot.addSubview(zenShadow)
+    applyZen(animated: false)
     NSLayoutConstraint.activate([
       toast.centerXAnchor.constraint(equalTo: overlayRoot.centerXAnchor),
       toast.bottomAnchor.constraint(equalTo: overlayRoot.bottomAnchor, constant: -24),
@@ -688,6 +777,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private var webInCard: [NSLayoutConstraint] = []
   /// The page card's left edge: the sidebar's width.
   private lazy var sidebarWidth = webContainer.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor, constant: TabLayout.sidebarWidth)
+  /// The sidebar's width (vertical tabs), out of the way or not.
+  private var sidebarSize = TabLayout.sidebarWidth
+  /// The bar's place: they slide it out of the way in zen mode.
+  private var topBarTop: NSLayoutConstraint!
+  private var topBarLeading: NSLayoutConstraint!
+  private var topBarTrailing: NSLayoutConstraint!
+  /// In zen mode the sidebar is only its own strip (it floats over the
+  /// page's views when shown), not the window's width around the card.
+  private var topBarStrip: NSLayoutConstraint!
 
   /// Pins `view` to the content under the top bar.
   @discardableResult
@@ -709,16 +807,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let sidebar = card && mode == .web
     let fade = animated && sidebar != topBar.isVertical && window?.isVisible == true && !Motion.reduceMotion
     let snapshot = fade ? barSnapshot() : nil
-    sidebarWidth.constant = TabLayout.sidebarWidth
-    topBar.sidebarWidth = TabLayout.sidebarWidth
+    sidebarSize = TabLayout.sidebarWidth
+    topBar.sidebarWidth = sidebarSize
     NSLayoutConstraint.deactivate(card ? webUnderBar : webInCard)
     NSLayoutConstraint.activate(card ? webInCard : webUnderBar)
     barHeight.isActive = !sidebar
     sidebarHeight.isActive = sidebar
-    webContainer.layer?.cornerRadius = card ? TabLayout.cardRadius : 0
-    webContainer.layer?.masksToBounds = card
-    for tab in tabs { tab.browserView?.chromeCornerRadius = card ? TabLayout.cardRadius : 0 }
+    for tab in tabs { tab.browserView?.chromeCornerRadius = pageCornerRadius }
     topBar.isVertical = sidebar
+    layoutZen()
     layoutSideNote()
     root.layoutSubtreeIfNeeded()
     positionTrafficLights()
@@ -757,14 +854,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private func resizeSidebar(to width: CGFloat, ended: Bool) {
     // (The page keeps some room.)
     let maxWidth = min(TabLayout.maxSidebarWidth, root.bounds.width - 320)
-    sidebarWidth.constant = min(max(width, TabLayout.minSidebarWidth), max(TabLayout.minSidebarWidth, maxWidth)).rounded()
-    topBar.sidebarWidth = sidebarWidth.constant
+    sidebarSize = min(max(width, TabLayout.minSidebarWidth), max(TabLayout.minSidebarWidth, maxWidth)).rounded()
+    topBar.sidebarWidth = sidebarSize
+    layoutZen()
     root.layoutSubtreeIfNeeded()
+    updateZenCutout()
     positionTrafficLights()
     syncOverlayWindow()
     if ended {
       // Other windows follow.
-      TabLayout.sidebarWidth = sidebarWidth.constant
+      TabLayout.sidebarWidth = sidebarSize
       NotificationCenter.default.post(name: TabLayout.didChange, object: nil)
     }
   }
@@ -773,6 +872,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if isExtra { scheduleSessionSave() }
     // (Hidden tabs' pages too: they keep their notes' room.)
     if tabs.contains(where: \.showsSideNote) { layoutSideNote() }
+    updateZenCutout()
     positionTrafficLights()
     syncOverlayWindow()
   }
@@ -1170,6 +1270,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let web = mode == .web
     // Vertical tabs are the web's: the notes keep the top bar.
     if (TabLayout.isVertical && web) != topBar.isVertical { applyTabLayout(animated: true) }
+    // (Zen mode is the web's too.)
+    if zenTarget != (zenWanted ? 1 : 0) { applyZen(animated: false) }
     topBar.update(section: section, tabs: infos, groups: groupInfos, activeID: shown.map(ObjectIdentifier.init),
                   canGoBack: web ? shown?.canGoBack ?? false : canGoBackInNotes,
                   canGoForward: web ? shown?.canGoForward ?? false : canGoForwardInNotes,
@@ -1937,10 +2039,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let omnibox = OmniboxView(target: target, initialText: initial)
     omnibox.isIncognito = isIncognito
     omnibox.tabsProvider = { [weak self] in self?.tabs ?? [] }
+    omnibox.commandsProvider = { [weak self] in self?.omniboxCommands ?? [] }
     omnibox.onDismiss = { [weak self] in self?.dismissOverlay() }
     omnibox.onChoose = { [weak self] item, target in
       guard let self else { return }
-      self.dismissOverlay(restoreFocus: false)
+      // (A command acts on what's in front: the focus goes back to it.)
+      if case .command = item.action { self.dismissOverlay() } else { self.dismissOverlay(restoreFocus: false) }
       self.perform(item, target: target)
     }
     present(omnibox)
@@ -1966,6 +2070,62 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       let ref = NoteStore.shared.createNote(named: name)
       openNote(ref)
       noteView.focusEditor()
+    case .command(let kind):
+      run(kind)
+    }
+  }
+
+  /// What the omnibox can do here (its command bar).
+  private var omniboxCommands: [BrowserCommand] {
+    let page = mode == .web && !isShowingNewTab ? activeTab : nil
+    let zen = TabLayout.isZen
+    var commands = [
+      BrowserCommand(kind: .zenMode, title: "Zen Mode", subtitle: zen ? "Show the tabs and toolbar" : "Hide the tabs and toolbar",
+                     icon: zen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right",
+                     keywords: ["sidebar", "toolbar", "tabs", "ui", "hide", "show", "toggle", "focus", "full", "compact", "distraction free"],
+                     shortcut: "⌃⌘S"),
+      BrowserCommand(kind: .newNote, title: "New Note", subtitle: "Write a new note", icon: "square.and.pencil",
+                     keywords: ["create", "write"], shortcut: "⌥⌘N"),
+    ]
+    if let page, page.url.hasPrefix("http") {
+      commands += [
+        BrowserCommand(kind: .copyMarkdownLink, title: "Copy Link as Markdown", subtitle: page.displayTitle, icon: "link",
+                       keywords: ["url", "address", "md", "markdown"]),
+        BrowserCommand(kind: .copyLink, title: "Copy Link", subtitle: OmniboxView.shortURL(page.url), icon: "doc.on.doc",
+                       keywords: ["url", "address"]),
+      ]
+    }
+    if page != nil {
+      commands.append(BrowserCommand(kind: .sideNote, title: page?.showsSideNote == true ? "Hide Note Beside Page" : "Show Note Beside Page",
+                                     subtitle: "Write while reading", icon: "rectangle.righthalf.inset.filled",
+                                     keywords: ["side note", "split", "write"], shortcut: "⇧⌘D"))
+    }
+    let vertical = TabLayout.isVertical
+    commands.append(BrowserCommand(kind: .verticalTabs, title: vertical ? "Horizontal Tabs" : "Vertical Tabs",
+                                   subtitle: vertical ? "Tabs along the top" : "Tabs down the side",
+                                   icon: vertical ? "rectangle.topthird.inset.filled" : "rectangle.leadingthird.inset.filled",
+                                   keywords: ["layout", "tabs", "vertical", "horizontal"]))
+    return commands
+  }
+
+  private func run(_ command: BrowserCommand.Kind) {
+    switch command {
+    case .zenMode:
+      toggleZenMode(nil)
+    case .newNote:
+      newNote(nil)
+    case .copyLink, .copyMarkdownLink:
+      guard let tab = activeTab else { return }
+      // (Brackets in the title would end the link's text early.)
+      let title = tab.displayTitle.replacingOccurrences(of: "[", with: "(").replacingOccurrences(of: "]", with: ")")
+      let markdown = command == .copyMarkdownLink
+      NSPasteboard.general.clearContents()
+      NSPasteboard.general.setString(markdown ? "[\(title)](\(tab.url))" : tab.url, forType: .string)
+      toast.show(markdown ? "Copied the link as Markdown" : "Copied the link")
+    case .sideNote:
+      toggleSideNote(nil)
+    case .verticalTabs:
+      TabLayout.isVertical.toggle()
     }
   }
 
@@ -2197,7 +2357,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     guard let peek, let tab = peekTab, let page = tab.browserView else { return }
     endPeek()
     page.removeFromSuperview()
-    page.chromeCornerRadius = TabLayout.isVertical ? TabLayout.cardRadius : 0
+    page.chromeCornerRadius = pageCornerRadius
     peek.removeFromSuperview()
     insert(tab)
     activate(tab)
@@ -2454,6 +2614,288 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if reopened.indices.contains(closed.active) { activate(reopened[closed.active]) }
   }
 
+  // MARK: Zen mode
+
+  /// How far the tabs and toolbar are out of the way, from 0 (in place) to
+  /// 1 (zen mode: the page fills the window).
+  private var zenAmount: CGFloat = 0
+  /// Where `zenAmount` is going.
+  private var zenTarget: CGFloat = 0
+  private var zenSlide: Timer?
+  /// How much of the bar shows over the page in zen mode (the pointer went
+  /// to its edge), from 0 to 1. The page keeps its size under it.
+  private var zenReveal: CGFloat = 0
+  private var zenRevealTarget: CGFloat = 0
+  private var zenRevealSlide: Timer?
+  /// Watches the pointer for the window's edge, in zen mode.
+  private var zenPointerWatch: Timer?
+  /// When the pointer left the shown bar (it goes a moment later).
+  private var zenLeftBarAt: CFTimeInterval?
+  /// The page the shown bar is cut out of.
+  private weak var zenCutPage: GleaBrowserView?
+  /// The pages out of sight keep their size until a slide is over, then
+  /// follow one at a time; a new slide stops them.
+  private var pagesWaiting = false
+  private var pagesGeneration = 0
+  private let zenShadow = ZenEdgeShadow()
+  private let zenBackdrop = ZenBackdrop()
+
+  /// The tabs and toolbar are out of the way here: zen mode, on the web.
+  private var zenWanted: Bool { TabLayout.isZen && mode == .web }
+
+  /// A page's corners: the card's (vertical tabs, zen mode), or the
+  /// window's. (Under the top bar, the card's round as it comes.)
+  private var pageCornerRadius: CGFloat {
+    TabLayout.isVertical ? TabLayout.cardRadius : (TabLayout.cardRadius * zenAmount).rounded()
+  }
+
+  /// ⌃⌘S: zen mode, the page alone in the window, the tabs and toolbar
+  /// coming over it at their edge. It slides here; other windows follow.
+  @objc func toggleZenMode(_ sender: Any?) {
+    TabLayout.isZen.toggle()
+    NotificationCenter.default.post(name: TabLayout.zenDidChange, object: self)
+  }
+
+  /// Slides the tabs and toolbar out of the way, or back (`animated`; else
+  /// at once), as zen mode and the mode want.
+  private func applyZen(animated: Bool) {
+    let target: CGFloat = zenWanted ? 1 : 0
+    zenTarget = target
+    zenSlide?.invalidate()
+    zenSlide = nil
+    guard zenAmount != target else { return layoutZenStep() }
+    let from = zenAmount
+    pagesGeneration += 1
+    let finish = { [weak self] in
+      guard let self else { return }
+      self.zenAmount = target
+      if target == 0 { self.setZenReveal(0, animated: false) }
+      self.layoutZenStep()
+      self.syncOverlayWindow()
+      self.resizeWaitingPages()
+    }
+    guard animated, window?.isVisible == true, !Motion.reduceMotion else {
+      // (Back from the web in zen mode: the bar fades in over the notes.)
+      if target == 0, from == 1, window?.isVisible == true { topBar.animateIn(scale: 1, fade: 0.2, duration: 0.2) }
+      return finish()
+    }
+    // Only the page in front follows each step (like a live resize): the
+    // others wait until it's over.
+    pagesWaiting = true
+    for tab in tabs where tab !== activeTab { tab.browserView?.autoresizingMask = [] }
+    let start = CACurrentMediaTime()
+    let duration: CFTimeInterval = 0.3
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard let self else { return timer.invalidate() }
+        let t = min(1, (CACurrentMediaTime() - start) / duration)
+        guard t < 1 else {
+          timer.invalidate()
+          self.zenSlide = nil
+          return finish()
+        }
+        self.zenAmount = from + (target - from) * CGFloat(CubicBezier.easeOut(t))
+        self.layoutZenStep()
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    zenSlide = timer
+  }
+
+  /// The pages out of sight, to their size now, one at a time.
+  private func resizeWaitingPages() {
+    guard pagesWaiting else { return }
+    let generation = pagesGeneration
+    var waiting = tabs.filter { $0 !== activeTab }
+    func next() {
+      guard generation == pagesGeneration else { return }
+      guard !waiting.isEmpty else {
+        pagesWaiting = false
+        return
+      }
+      placePage(waiting.removeFirst())
+      DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60) { next() }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { next() }
+  }
+
+  /// The bar, the web and the note beside the page, for `zenAmount` and
+  /// `zenReveal`.
+  private func layoutZenStep() {
+    layoutZen()
+    layoutSideNote()
+    updateZenCutout()
+    updateZenPointerWatch()
+  }
+
+  /// The bar slides out as the web grows into its room (with vertical tabs,
+  /// the card to the window's edges).
+  private func layoutZen() {
+    guard topBarTop != nil else { return }
+    let full = zenAmount >= 1
+    let sidebar = topBar.isVertical
+    // How far the bar is out of the window.
+    let out = zenAmount * (1 - zenReveal)
+    topBarTop.constant = sidebar ? 0 : -(Theme.topBarHeight * out).rounded()
+    topBarLeading.constant = sidebar ? -(sidebarSize * out).rounded() : 0
+    topBarTrailing.isActive = !(sidebar && full)
+    topBarStrip.constant = sidebarSize
+    topBarStrip.isActive = sidebar && full
+    // In zen mode the page is still a card on the bar's color (the
+    // backdrop, as the bar leaves), at the same inset all around.
+    let inset = TabLayout.cardInset
+    let zenInset = (inset * zenAmount).rounded()
+    webUnderBar[0].constant = (Theme.topBarHeight * (1 - zenAmount)).rounded() + zenInset
+    webUnderBar[1].constant = zenInset
+    webUnderBar[2].constant = -zenInset
+    webUnderBar[3].constant = -zenInset
+    sidebarWidth.constant = (sidebarSize * (1 - zenAmount)).rounded() + zenInset
+    webInCard[1].constant = inset
+    webInCard[2].constant = -inset
+    webInCard[3].constant = -inset
+    let card = TabLayout.isVertical || zenAmount > 0
+    webContainer.layer?.cornerRadius = card ? pageCornerRadius : 0
+    webContainer.layer?.masksToBounds = card
+    zenBackdrop.isHidden = zenAmount == 0
+    root.layoutSubtreeIfNeeded()
+    zenBackdrop.cardFrame = webContainer.convert(webContainer.bounds, to: root)
+    // In zen mode the bar comes over the page's views (the note beside it,
+    // the new tab page), and through the page's window (see the cutout).
+    let above = full
+    let isAbove = (root.subviews.firstIndex { $0 === topBar } ?? 0) > (root.subviews.firstIndex { $0 === contentArea } ?? 0)
+    if isAbove != above {
+      var views = root.subviews.filter { $0 !== topBar }
+      let content = views.firstIndex { $0 === contentArea } ?? 0
+      views.insert(topBar, at: above ? content + 1 : content)
+      root.subviews = views
+    }
+  }
+
+  /// The part of the window the shown bar takes, in the root's coordinates.
+  private var zenBarRect: NSRect {
+    let bounds = root.bounds
+    if topBar.isVertical { return NSRect(x: 0, y: 0, width: (sidebarSize * zenReveal).rounded(), height: bounds.height) }
+    let height = (Theme.topBarHeight * zenReveal).rounded()
+    return NSRect(x: 0, y: bounds.maxY - height, width: bounds.width, height: height)
+  }
+
+  /// The page in front leaves the shown bar a hole to show through (it keeps
+  /// its size), with a shadow on it along the bar's edge.
+  private func updateZenCutout() {
+    let shown = zenAmount > 0 && zenReveal > 0
+    let page = shown && mode == .web && !isShowingNewTab ? activeTab?.browserView : nil
+    if zenCutPage !== page {
+      zenCutPage?.chromeCutout = .zero
+      zenCutPage?.chromeWindow?.ignoresMouseEvents = false
+      zenCutPage = page
+    }
+    let bar = zenBarRect
+    page?.chromeCutout = page.map { $0.convert(bar, from: root) } ?? .zero
+    zenShadow.isHidden = !shown
+    guard shown else { return }
+    let depth = ZenEdgeShadow.depth
+    zenShadow.isVertical = topBar.isVertical
+    zenShadow.frame = topBar.isVertical
+      ? NSRect(x: bar.maxX, y: 0, width: depth, height: bar.height)
+      : NSRect(x: 0, y: bar.minY - depth, width: bar.width, height: depth)
+    zenShadow.alphaValue = zenReveal
+  }
+
+  /// Shows the bar over the page, or hides it (`animated`: it slides).
+  private func setZenReveal(_ target: CGFloat, animated: Bool) {
+    zenLeftBarAt = nil
+    guard target != zenRevealTarget || (zenRevealSlide == nil && zenReveal != target) else { return }
+    zenRevealTarget = target
+    zenRevealSlide?.invalidate()
+    zenRevealSlide = nil
+    let step = { [weak self] in
+      guard let self else { return }
+      self.layoutZen()
+      self.root.layoutSubtreeIfNeeded()
+      self.updateZenCutout()
+    }
+    guard animated, window?.isVisible == true, !Motion.reduceMotion else {
+      zenReveal = target
+      return step()
+    }
+    let from = zenReveal
+    let start = CACurrentMediaTime()
+    // Out a little quicker than in.
+    let duration: CFTimeInterval = target > from ? 0.22 : 0.18
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
+      MainActor.assumeIsolated {
+        guard let self else { return timer.invalidate() }
+        let t = min(1, (CACurrentMediaTime() - start) / duration)
+        self.zenReveal = from + (target - from) * CGFloat(CubicBezier.easeOut(t))
+        step()
+        if t >= 1 {
+          timer.invalidate()
+          self.zenRevealSlide = nil
+        }
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    zenRevealSlide = timer
+  }
+
+  /// In zen mode, the pointer is watched for the window's edge (the page's
+  /// window is over it: no tracking area of this one sees it).
+  private func updateZenPointerWatch() {
+    let watch = zenAmount >= 1 && window?.isVisible == true
+    if watch, zenPointerWatch == nil {
+      let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self] _ in
+        MainActor.assumeIsolated { self?.zenPointerMoved() }
+      }
+      RunLoop.main.add(timer, forMode: .common)
+      zenPointerWatch = timer
+    } else if !watch, let timer = zenPointerWatch {
+      timer.invalidate()
+      zenPointerWatch = nil
+    }
+  }
+
+  /// The pointer at the window's edge (where the bar was) shows the bar
+  /// over the page; away from it a moment, it goes. Over it, clicks go to
+  /// the bar, not the page under its hole.
+  private func zenPointerMoved() {
+    guard let window, zenAmount >= 1 else { return }
+    let point = root.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+    let bounds = root.bounds
+    let sidebar = topBar.isVertical
+    let inWindow = bounds.contains(point)
+    let busy = NSEvent.pressedMouseButtons != 0 || RunLoop.current.currentMode == .eventTracking
+    if zenRevealTarget == 0 {
+      let atEdge = inWindow && (sidebar ? point.x <= bounds.minX + 4 : point.y >= bounds.maxY - 4)
+      if atEdge, !busy, NSApp.isActive, NSApp.mainWindow === window, overlay == nil { setZenReveal(1, animated: true) }
+    } else {
+      // (A little past its edge still counts: the pointer overshoots.)
+      let reach = sidebar ? point.x <= sidebarSize + 12 : point.y >= bounds.maxY - Theme.topBarHeight - 12
+      if (inWindow && reach) || busy || zenRevealHeld {
+        zenLeftBarAt = nil
+      } else if let left = zenLeftBarAt {
+        if CACurrentMediaTime() - left > 0.35 { setZenReveal(0, animated: true) }
+      } else {
+        zenLeftBarAt = CACurrentMediaTime()
+      }
+    }
+    let overBar = zenReveal > 0 && zenBarRect.contains(point)
+    if let page = zenCutPage?.chromeWindow, page.ignoresMouseEvents != overBar { page.ignoresMouseEvents = overBar }
+  }
+
+  func debugZenState() -> String {
+    "zen \(TabLayout.isZen) amount \(zenAmount) reveal \(zenReveal) web \(NSStringFromRect(webContainer.frame)) "
+      + "bar \(NSStringFromRect(topBar.frame)) page \(activeTab?.browserView.map { NSStringFromRect($0.frame) } ?? "-") "
+      + "cutout \(zenCutPage.map { NSStringFromRect($0.chromeCutout) } ?? "-")"
+  }
+
+  /// (Test hooks: shown, the bar stays wherever the pointer is.)
+  private var zenRevealHeld = false
+
+  func debugZenReveal(_ shown: Bool) {
+    zenRevealHeld = shown
+    setZenReveal(shown ? 1 : 0, animated: true)
+  }
+
   // MARK: Note beside the page
 
   /// How wide the note beside a page would like to be (its left edge
@@ -2521,21 +2963,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   /// The pages narrow to leave their notes room, as much of it as shows.
   private func layoutSideNote() {
     guard sideNoteTop != nil else { return }
-    let card = TabLayout.isVertical
+    let card = TabLayout.isVertical || zenAmount > 0
     sideNoteWidthConstraint.constant = sideNote.isHidden ? 0 : (shownSideNoteWidth * sideNoteReveal).rounded()
     sideNote.contentWidth = shownSideNoteWidth
-    // With vertical tabs the note runs the window's height beside the card.
-    sideNoteTop.constant = card ? 0 : Theme.topBarHeight
+    // With vertical tabs the note runs the window's height beside the card
+    // (in zen mode, the page's).
+    sideNoteTop.constant = TabLayout.isVertical ? 0 : (Theme.topBarHeight * (1 - zenAmount)).rounded()
     sideNote.showsSeparator = !card
     root.layoutSubtreeIfNeeded()
-    for tab in tabs {
-      // Like a live window resize: only the page in front at each step of a
-      // drag of the note's edge, the others (out of sight) once it's over.
-      guard let view = tab.browserView, view.superview === webContainer,
-            tab === activeTab || sideNoteDragStart == nil else { continue }
-      let frame = pageFrame(for: tab)
-      if view.frame != frame { view.frame = frame }
-    }
+    // Like a live window resize: only the page in front at each step of a
+    // drag of the note's edge or of a zen slide, the others (out of sight)
+    // once it's over.
+    for tab in tabs where tab === activeTab || (sideNoteDragStart == nil && !pagesWaiting) { placePage(tab) }
+  }
+
+  /// Puts `tab`'s page where it goes now, as round as it goes.
+  private func placePage(_ tab: Tab) {
+    guard let view = tab.browserView, view.superview === webContainer else { return }
+    view.autoresizingMask = [.width, .height]
+    let frame = pageFrame(for: tab)
+    if view.frame != frame { view.frame = frame }
+    if view.chromeCornerRadius != pageCornerRadius { view.chromeCornerRadius = pageCornerRadius }
   }
 
   /// Shows the active tab's note beside its page (only on the web, or
@@ -2652,7 +3100,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
           NoteStore.shared.save(ref, content: "[\(title)](\(tab.url))\n\n")
         }
         tab.sideNote = ref
-      case .open, .tab:
+      case .open, .tab, .command:
         return
       }
       MarkdownEditorView.flushAll()
@@ -2970,6 +3418,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     case #selector(toggleSideNote(_:)):
       item.title = web && activeTab?.showsSideNote == true ? "Hide Note Beside Page" : "Show Note Beside Page"
       return web
+    case #selector(toggleZenMode(_:)):
+      item.state = TabLayout.isZen ? .on : .off
+      return true
     case #selector(showDeveloperTools(_:)):
       item.title = activeTab?.devTools?.isOpen == true ? "Hide Developer Tools" : "Show Developer Tools"
       return web
