@@ -813,7 +813,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     NSLayoutConstraint.activate(card ? webInCard : webUnderBar)
     barHeight.isActive = !sidebar
     sidebarHeight.isActive = sidebar
-    for tab in tabs { tab.browserView?.chromeCornerRadius = pageCornerRadius }
+    for tab in tabs { if let page = tab.browserView { round(page) } }
     topBar.isVertical = sidebar
     layoutZen()
     layoutSideNote()
@@ -2357,7 +2357,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     guard let peek, let tab = peekTab, let page = tab.browserView else { return }
     endPeek()
     page.removeFromSuperview()
-    page.chromeCornerRadius = pageCornerRadius
+    round(page)
     peek.removeFromSuperview()
     insert(tab)
     activate(tab)
@@ -2649,6 +2649,18 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     TabLayout.isVertical ? TabLayout.cardRadius : (TabLayout.cardRadius * zenAmount).rounded()
   }
 
+  /// Rounds a page as a card or not. Under the top bar, a card coming in
+  /// zen mode rounds its top corners from square, its bottom ones from the
+  /// window's (those snapping to the card's poked out of the window's).
+  private func round(_ page: GleaBrowserView) {
+    let top = pageCornerRadius
+    let easing = !TabLayout.isVertical && zenAmount > 0 && zenAmount < 1
+    let window = page.windowCornerRadius
+    let bottom = easing ? (window + (TabLayout.cardRadius - window) * zenAmount).rounded() : -1
+    if page.chromeCornerRadius != top { page.chromeCornerRadius = top }
+    if page.chromeBottomCornerRadius != bottom { page.chromeBottomCornerRadius = bottom }
+  }
+
   /// ⌃⌘S: zen mode, the page alone in the window, the tabs and toolbar
   /// coming over it at their edge. It slides here; other windows follow.
   @objc func toggleZenMode(_ sender: Any?) {
@@ -2771,19 +2783,24 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
   }
 
-  /// The part of the window the shown bar takes, in the root's coordinates.
+  /// The part of the window the bar takes as it slides or shows over the
+  /// page, in the root's coordinates.
   private var zenBarRect: NSRect {
     let bounds = root.bounds
-    if topBar.isVertical { return NSRect(x: 0, y: 0, width: (sidebarSize * zenReveal).rounded(), height: bounds.height) }
-    let height = (Theme.topBarHeight * zenReveal).rounded()
+    let shown = 1 - zenAmount * (1 - zenReveal)
+    if topBar.isVertical { return NSRect(x: 0, y: 0, width: (sidebarSize * shown).rounded(), height: bounds.height) }
+    let height = (Theme.topBarHeight * shown).rounded()
     return NSRect(x: 0, y: bounds.maxY - height, width: bounds.width, height: height)
   }
 
-  /// The page in front leaves the shown bar a hole to show through (it keeps
-  /// its size), with a shadow on it along the bar's edge.
+  /// The page in front leaves the bar a hole to show through: shown over it
+  /// (it keeps its size), with a shadow on it along the bar's edge, and as
+  /// they slide (the page's window, a frame behind the bar's, would cover
+  /// its edge for a moment).
   private func updateZenCutout() {
+    let cut = zenAmount > 0 && (zenReveal > 0 || zenAmount < 1)
     let shown = zenAmount > 0 && zenReveal > 0
-    let page = shown && mode == .web && !isShowingNewTab ? activeTab?.browserView : nil
+    let page = cut && mode == .web && !isShowingNewTab ? activeTab?.browserView : nil
     if zenCutPage !== page {
       zenCutPage?.chromeCutout = .zero
       zenCutPage?.chromeWindow?.ignoresMouseEvents = false
@@ -2983,7 +3000,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     view.autoresizingMask = [.width, .height]
     let frame = pageFrame(for: tab)
     if view.frame != frame { view.frame = frame }
-    if view.chromeCornerRadius != pageCornerRadius { view.chromeCornerRadius = pageCornerRadius }
+    round(view)
   }
 
   /// Shows the active tab's note beside its page (only on the web, or

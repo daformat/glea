@@ -799,6 +799,7 @@ static std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>>& DownloadCallbacks
     [self addSubview:_pageContainer];
     [self buildDevToolsPane];
     [LiveViews() addObject:self];
+    _chromeBottomCornerRadius = -1;
   }
   return self;
 }
@@ -1049,13 +1050,7 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   BOOL atTop = windowed && NSMaxY(page) >= NSMaxY(outer) - inset - 1;
   BOOL atLeft = NSMinX(page) <= NSMinX(outer) + inset + 1;
   BOOL atRight = NSMaxX(page) >= NSMaxX(outer) - inset - 1;
-  // The Glea window's own corner radius (larger on recent macOS).
-  CGFloat windowRadius = 10;
-  SEL cornerRadius = NSSelectorFromString(@"_cornerRadius");
-  if ([parent respondsToSelector:cornerRadius]) {
-    CGFloat value = ((CGFloat(*)(id, SEL))objc_msgSend)(parent, cornerRadius);
-    if (value > 0) windowRadius = value;
-  }
+  CGFloat windowRadius = self.windowCornerRadius + inset;
   CACornerMask all = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner | kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
   BOOL flipped = layer.geometryFlipped;
   CACornerMask windowCorners = 0;
@@ -1065,6 +1060,8 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   if (atTop && atRight) windowCorners |= flipped ? kCALayerMaxXMinYCorner : kCALayerMaxXMaxYCorner;
   CGFloat radius = _chromeCornerRadius > 0 ? _chromeCornerRadius : (windowCorners ? windowRadius - inset : 0);
   CACornerMask corners = _chromeCornerRadius > 0 ? all : windowCorners;
+  // Top and bottom apart: the mask rounds them (see applyChromeCutout).
+  if ([self splitsCorners]) radius = 0;
   if (layer.cornerRadius != radius || layer.maskedCorners != corners) {
     layer.cornerRadius = radius;
     layer.cornerCurve = kCACornerCurveContinuous;
@@ -1072,6 +1069,44 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
     layer.masksToBounds = radius > 0;
   }
   [self applyChromeCutout];
+}
+
+/// The Glea window's own corner radius (larger on recent macOS), less the
+/// page's inset from its border.
+- (CGFloat)windowCornerRadius {
+  NSWindow* parent = self.window;
+  CGFloat radius = 10;
+  SEL cornerRadius = NSSelectorFromString(@"_cornerRadius");
+  if ([parent respondsToSelector:cornerRadius]) {
+    CGFloat value = ((CGFloat(*)(id, SEL))objc_msgSend)(parent, cornerRadius);
+    if (value > 0) radius = value;
+  }
+  return parent ? radius - ChromeWindowBorderInset(parent) : radius;
+}
+
+- (BOOL)splitsCorners {
+  return _chromeBottomCornerRadius >= 0 && _chromeBottomCornerRadius != _chromeCornerRadius;
+}
+
+- (void)setChromeBottomCornerRadius:(CGFloat)radius {
+  if (radius == _chromeBottomCornerRadius) return;
+  _chromeBottomCornerRadius = radius;
+  [self roundChromeWindowCorners];
+}
+
+/// `rect` with its top corners `top` round and its bottom ones `bottom`
+/// (y up), added to `path`.
+static void AddRoundedRect(CGMutablePathRef path, CGRect rect, CGFloat top, CGFloat bottom) {
+  CGFloat most = MIN(rect.size.width, rect.size.height) / 2;
+  top = MAX(0, MIN(top, most));
+  bottom = MAX(0, MIN(bottom, most));
+  CGFloat minX = CGRectGetMinX(rect), maxX = CGRectGetMaxX(rect), minY = CGRectGetMinY(rect), maxY = CGRectGetMaxY(rect);
+  CGPathMoveToPoint(path, NULL, minX + bottom, minY);
+  CGPathAddArcToPoint(path, NULL, maxX, minY, maxX, minY + bottom, bottom);
+  CGPathAddArcToPoint(path, NULL, maxX, maxY, maxX - top, maxY, top);
+  CGPathAddArcToPoint(path, NULL, minX, maxY, minX, maxY - top, top);
+  CGPathAddArcToPoint(path, NULL, minX, minY, minX + bottom, minY, bottom);
+  CGPathCloseSubpath(path);
 }
 
 - (void)setChromeCutout:(NSRect)cutout {
@@ -1090,17 +1125,36 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   frameView.wantsLayer = YES;
   CALayer* layer = frameView.layer;
   NSRect hole = NSIntersectionRect(_chromeCutout, self.bounds);
-  if (NSIsEmptyRect(hole)) {
+  BOOL split = [self splitsCorners];
+  if (NSIsEmptyRect(hole) && !split) {
     if (layer.mask) layer.mask = nil;
     return;
   }
-  NSRect frame = window.frame;
-  NSRect local = NSOffsetRect([parent convertRectToScreen:[self convertRect:hole toView:nil]], -NSMinX(frame), -NSMinY(frame));
-  if (layer.geometryFlipped) local.origin.y = NSHeight(frame) - NSMaxY(local);
   CAShapeLayer* mask = [layer.mask isKindOfClass:CAShapeLayer.class] ? (CAShapeLayer*)layer.mask : [CAShapeLayer layer];
   CGMutablePathRef path = CGPathCreateMutable();
-  CGPathAddRect(path, NULL, layer.bounds);
-  CGPathAddRect(path, NULL, local);
+  if (split) {
+    // (Its top is the layer's top unless the layer is flipped.)
+    CGFloat top = MAX(0, _chromeCornerRadius), bottom = _chromeBottomCornerRadius;
+    AddRoundedRect(path, layer.bounds, layer.geometryFlipped ? bottom : top, layer.geometryFlipped ? top : bottom);
+  } else {
+    CGPathAddRect(path, NULL, layer.bounds);
+  }
+  if (!NSIsEmptyRect(hole)) {
+    NSRect frame = window.frame;
+    NSRect local = NSOffsetRect([parent convertRectToScreen:[self convertRect:hole toView:nil]], -NSMinX(frame), -NSMinY(frame));
+    if (layer.geometryFlipped) local.origin.y = NSHeight(frame) - NSMaxY(local);
+    if (@available(macOS 13, *)) {
+      // (Even-odd would fill the corners' notches inside the hole.)
+      CGPathRef holePath = CGPathCreateWithRect(local, NULL);
+      CGPathRef cut = CGPathCreateCopyBySubtractingPath(path, holePath, false);
+      CGPathRelease(holePath);
+      CGPathRelease(path);
+      path = CGPathCreateMutableCopy(cut);
+      CGPathRelease(cut);
+    } else {
+      CGPathAddRect(path, NULL, local);
+    }
+  }
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   mask.fillRule = kCAFillRuleEvenOdd;

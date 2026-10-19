@@ -193,6 +193,12 @@ NS_SWIFT_UI_ACTOR
 /// nothing, so the app's views below show through: a bar over the page,
 /// which keeps its size. Empty: none.
 @property(nonatomic) NSRect chromeCutout;
+/// The bottom corners' radius when it differs from `chromeCornerRadius`
+/// (a card easing in from the window's bottom corners). Negative (the
+/// default): as the others.
+@property(nonatomic) CGFloat chromeBottomCornerRadius;
+/// How round a page's corners are where they're the window's.
+@property(nonatomic, readonly) CGFloat windowCornerRadius;
 
 /// Sent as the Referer of this browser's frame navigations. Some embeds
 /// (YouTube) refuse to play without one. Set before the view is shown.
