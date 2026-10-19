@@ -2,6 +2,17 @@
 
 What changed in each release of Glea.
 
+## 0.22.0 Beta — 2026-10-19
+
+- Zen mode: View › Zen Mode (<kbd>⌃</kbd><kbd>⌘</kbd><kbd>S</kbd>) slides
+  the tabs and toolbar out of the way, and the page fills the window as a
+  card, with horizontal or vertical tabs. Move the pointer to the window's
+  top edge (with vertical tabs, its left edge) and they slide back over the
+  page, without resizing it; move away and they go again.
+- The search box (<kbd>⌘</kbd><kbd>K</kbd>) runs commands too: type Zen
+  Mode (or sidebar, toolbar), New Note, Copy Link, Copy Link as Markdown,
+  Note Beside Page or Vertical Tabs, and press Return.
+
 ## 0.21.0 Beta — 2026-10-18
 
 - A note beside the page: View › Show Note Beside Page (<kbd>⇧</kbd><kbd>⌘</kbd><kbd>D</kbd>)
