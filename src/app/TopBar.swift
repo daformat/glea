@@ -732,7 +732,7 @@ final class TopBarView: NSView {
       resizeEdge.frame = NSRect(x: sidebarWidth - 6, y: 0, width: 6, height: bounds.height)
       let inset = TabLayout.cardInset
       // (None beside the sidebar's own strip: zen mode, no card.)
-      cardOutline.isHidden = !isVertical || bounds.width <= sidebarWidth + inset
+      cardOutline.isHidden = !isVertical || bounds.width <= sidebarWidth + inset || !showsCardOutline
       cardOutline.frame = NSRect(x: sidebarWidth, y: inset, width: max(0, bounds.width - sidebarWidth - inset),
                                  height: max(0, bounds.height - 2 * inset)).insetBy(dx: -1, dy: -1)
     }
@@ -1016,6 +1016,12 @@ final class TopBarView: NSView {
 
   /// Vertical tabs: the bar spans the window (its color around the page's
   /// card); the sidebar is this wide at its left.
+  /// The outline around the page's card (vertical tabs). Off while the
+  /// card slides: the page draws its own then (see `chromeBorderColor`).
+  var showsCardOutline = true {
+    didSet { if showsCardOutline != oldValue { needsLayout = true } }
+  }
+
   var sidebarWidth: CGFloat = 240 {
     didSet { if sidebarWidth != oldValue, isVertical { needsLayout = true } }
   }

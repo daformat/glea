@@ -522,6 +522,10 @@ private final class ZenBackdrop: NSView {
     }
   }
 
+  var showsOutline = true {
+    didSet { outline.isHidden = !showsOutline }
+  }
+
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
     wantsLayer = true
@@ -2668,6 +2672,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     pagesGeneration += 1
     let finish = { [weak self] in
       guard let self else { return }
+      self.setSlidingOutline(false)
       self.zenAmount = target
       if target == 0 { self.setZenReveal(0, animated: false) }
       self.layoutZenStep()
@@ -2683,6 +2688,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     // others wait until it's over.
     pagesWaiting = true
     for tab in tabs where tab !== activeTab { tab.browserView?.autoresizingMask = [] }
+    setSlidingOutline(true)
     let start = CACurrentMediaTime()
     let duration: CFTimeInterval = 0.3
     let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] timer in
@@ -2700,6 +2706,22 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
     RunLoop.main.add(timer, forMode: .common)
     zenSlide = timer
+  }
+
+  /// The page whose window draws the card's outline while it slides.
+  private weak var outlinedPage: GleaBrowserView?
+
+  /// While the card slides, the page draws its outline on its own edge:
+  /// the app's, in another window, lags the page's by a frame or two and
+  /// it looks cut. At rest, the app's are back (just outside the page).
+  private func setSlidingOutline(_ sliding: Bool) {
+    let card = TabLayout.isVertical || zenAmount > 0 || zenTarget > 0
+    let page = sliding && card && !isShowingNewTab ? activeTab?.browserView : nil
+    if outlinedPage !== page { outlinedPage?.chromeBorderColor = nil }
+    outlinedPage = page
+    page?.chromeBorderColor = NSColor(cgColor: root.resolvedCGColor(Theme.separator))
+    topBar.showsCardOutline = page == nil
+    zenBackdrop.showsOutline = page == nil
   }
 
   /// The pages out of sight, to their size now, one at a time.
