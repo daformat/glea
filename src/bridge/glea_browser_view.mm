@@ -1071,18 +1071,7 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
     layer.maskedCorners = corners;
     layer.masksToBounds = radius > 0;
   }
-  CGColorRef border = _chromeBorderColor.CGColor;
-  if (layer.borderWidth != (border ? 1 : 0) || !CGColorEqualToColor(layer.borderColor, border)) {
-    layer.borderWidth = border ? 1 : 0;
-    layer.borderColor = border;
-  }
   [self applyChromeCutout];
-}
-
-- (void)setChromeBorderColor:(NSColor*)color {
-  if (color == _chromeBorderColor || [color isEqual:_chromeBorderColor]) return;
-  _chromeBorderColor = color;
-  [self roundChromeWindowCorners];
 }
 
 - (void)setChromeCutout:(NSRect)cutout {
