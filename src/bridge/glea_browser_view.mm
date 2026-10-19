@@ -958,8 +958,8 @@ static CGFloat ChromeWindowBorderInset(NSWindow* parent) {
   if (!parent) return NSMakeRect(0, 0, 800, 600);
   NSRect frame = [parent convertRectToScreen:[self convertRect:page toView:nil]];
   // Stay inside the Glea window's hairline border: a child window draws
-  // over it.
-  if (_chromeCornerRadius <= 0 && !(parent.styleMask & NSWindowStyleMaskFullScreen)) {
+  // over it. (Rounded pages too: a card sliding to the window's edges.)
+  if (!(parent.styleMask & NSWindowStyleMaskFullScreen)) {
     CGFloat inset = ChromeWindowBorderInset(parent);
     frame = NSIntersectionRect(frame, NSInsetRect(parent.frame, inset, inset));
   }
