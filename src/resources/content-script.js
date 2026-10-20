@@ -2526,10 +2526,11 @@ ${code.replace(/\n+$/, "")}
         return /^\/profile\/[^/]+\/post\/\w+\/?$/.test(location.pathname) ? location.origin + location.pathname : null;
       }
       if (host === "instagram.com" && tag === "ARTICLE") {
-        const link = linkIn(node, /(^|\.)instagram\.com$/, /^\/(?:[\w.]+\/)?(?:p|reel|tv)\/[\w-]+\/?$/);
+        const post2 = /^\/(?:[\w.]+\/)?(?:p|reels?|tv)\/(?!audio\/)[\w-]+(?:\/|$)/;
+        const link = linkIn(node, /(^|\.)instagram\.com$/, post2);
         const path = link ? link.pathname : location.pathname;
-        const m = path.match(/\/(p|reel|tv)\/([\w-]+)/);
-        return m ? `https://www.instagram.com/${m[1]}/${m[2]}/` : null;
+        const m = path.match(/\/(p|reels?|tv)\/(?!audio\/)([\w-]+)/);
+        return m ? `https://www.instagram.com/${m[1] === "reels" ? "reel" : m[1]}/${m[2]}/` : null;
       }
       if (host === "youtube.com") {
         if (node.matches("#movie_player, .html5-video-player, #player-container-id")) {
@@ -2622,6 +2623,19 @@ ${code.replace(/\n+$/, "")}
     function textOf(node) {
       return ((node instanceof HTMLElement ? node.innerText : node.textContent) || "").trim().slice(0, 600);
     }
+    function withoutPageMedia(markdown, node) {
+      if (!markdown.includes("](blob:")) {
+        return markdown;
+      }
+      const videos = [node, ...Array.from(node.querySelectorAll("video"))].filter(
+        (e) => e instanceof HTMLVideoElement
+      );
+      return markdown.replace(/!\[([^\]]*)\]\((blob:[^)\s]*)\)/g, (_, alt, src) => {
+        const video = videos.find((v) => (v.currentSrc || v.getAttribute("src")) === src);
+        const poster = video && video.poster ? absolute2(video.poster) : "";
+        return /^https?:/.test(poster) ? `![${alt}](${poster})` : "";
+      }).trim();
+    }
     async function captureArea(rect, ctx) {
       if (rect.viewport.width < 4 || rect.viewport.height < 4) {
         throw new Error("Too small");
@@ -2663,6 +2677,7 @@ ${code.replace(/\n+$/, "")}
           markdown = `![](${absolute2(bg)})`;
         }
       }
+      markdown = withoutPageMedia(markdown, node);
       if (!markdown) {
         return ctx.captureArea();
       }

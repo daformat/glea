@@ -158,10 +158,14 @@ type Answer = { message?: string } | undefined;
         : null;
     }
     if (host === "instagram.com" && tag === "ARTICLE") {
-      const link = linkIn(node, /(^|\.)instagram\.com$/, /^\/(?:[\w.]+\/)?(?:p|reel|tv)\/[\w-]+\/?$/);
+      // Its own page, or one of its pages: the narrow layout only links to
+      // its likes (/p/ID/liked_by/) and to it as a reel (/reels/ID/). Ads
+      // have none.
+      const post = /^\/(?:[\w.]+\/)?(?:p|reels?|tv)\/(?!audio\/)[\w-]+(?:\/|$)/;
+      const link = linkIn(node, /(^|\.)instagram\.com$/, post);
       const path = link ? link.pathname : location.pathname;
-      const m = path.match(/\/(p|reel|tv)\/([\w-]+)/);
-      return m ? `https://www.instagram.com/${m[1]}/${m[2]}/` : null;
+      const m = path.match(/\/(p|reels?|tv)\/(?!audio\/)([\w-]+)/);
+      return m ? `https://www.instagram.com/${m[1] === "reels" ? "reel" : m[1]}/${m[2]}/` : null;
     }
     if (host === "youtube.com") {
       // The player: the video being watched. A thumbnail or list item: its video.
@@ -277,6 +281,25 @@ type Answer = { message?: string } | undefined;
     return ((node instanceof HTMLElement ? node.innerText : node.textContent) || "").trim().slice(0, 600);
   }
 
+  // Media the page made itself (blob: addresses, like Instagram's videos)
+  // only exists in it: a video's poster instead, or nothing (an empty result
+  // is kept as a picture).
+  function withoutPageMedia(markdown: string, node: Element): string {
+    if (!markdown.includes("](blob:")) {
+      return markdown;
+    }
+    const videos = [node, ...Array.from(node.querySelectorAll("video"))].filter(
+      (e): e is HTMLVideoElement => e instanceof HTMLVideoElement,
+    );
+    return markdown
+      .replace(/!\[([^\]]*)\]\((blob:[^)\s]*)\)/g, (_, alt: string, src: string) => {
+        const video = videos.find((v) => (v.currentSrc || v.getAttribute("src")) === src);
+        const poster = video && video.poster ? absolute(video.poster) : "";
+        return /^https?:/.test(poster) ? `![${alt}](${poster})` : "";
+      })
+      .trim();
+  }
+
   // Taken as a picture: hides the overlay so it isn't in it; the app calls
   // shotTaken() once it has the pixels.
   async function captureArea(rect: AreaRect, ctx: ShootContext<Answer>): Promise<Answer> {
@@ -322,6 +345,7 @@ type Answer = { message?: string } | undefined;
         markdown = `![](${absolute(bg)})`;
       }
     }
+    markdown = withoutPageMedia(markdown, node);
     // Nothing Markdown can hold (drawings, custom widgets): keep a picture.
     if (!markdown) {
       return ctx.captureArea();
