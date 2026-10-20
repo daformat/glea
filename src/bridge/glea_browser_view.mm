@@ -9,6 +9,7 @@
 #include "include/cef_browser.h"
 #include "include/cef_client.h"
 #include "include/cef_command_ids.h"
+#include "include/cef_cookie.h"
 #include "include/cef_devtools_message_observer.h"
 #include "include/cef_parser.h"
 #include "include/cef_permission_handler.h"
@@ -658,6 +659,59 @@ class DevToolsObserver : public CefDevToolsMessageObserver {
   IMPLEMENT_REFCOUNTING(DevToolsObserver);
 };
 
+// Runs a block on the main thread once the last reference to it goes: shared
+// by the steps of a job whose callbacks come back in any order.
+class Completion : public CefBaseRefCounted {
+ public:
+  explicit Completion(dispatch_block_t block) : block_([block copy]) {}
+  ~Completion() override { dispatch_async(dispatch_get_main_queue(), block_); }
+
+ private:
+  dispatch_block_t block_;
+
+  IMPLEMENT_REFCOUNTING(Completion);
+};
+
+class CookieSet : public CefSetCookieCallback {
+ public:
+  explicit CookieSet(CefRefPtr<Completion> done) : done_(done) {}
+  void OnComplete(bool success) override {}
+
+ private:
+  CefRefPtr<Completion> done_;
+
+  IMPLEMENT_REFCOUNTING(CookieSet);
+};
+
+// Copies each cookie it visits into another cookie store.
+class CookieCopier : public CefCookieVisitor {
+ public:
+  CookieCopier(CefRefPtr<CefCookieManager> target, CefRefPtr<Completion> done) : target_(target), done_(done) {}
+
+  bool Visit(const CefCookie& cookie, int count, int total, bool& deleteCookie) override {
+    std::string domain = CefString(&cookie.domain).ToString();
+    if (domain.empty()) return true;
+    CefCookie copy(cookie);
+    std::string host = domain;
+    if (domain[0] == '.') {
+      host = domain.substr(1);
+    } else {
+      // A host-only cookie stays one (and __Host- ones need it).
+      CefString(&copy.domain).clear();
+    }
+    std::string path = CefString(&cookie.path).ToString();
+    std::string url = (cookie.secure ? "https://" : "http://") + host + (path.empty() ? "/" : path);
+    target_->SetCookie(url, copy, new CookieSet(done_));
+    return true;
+  }
+
+ private:
+  CefRefPtr<CefCookieManager> target_;
+  CefRefPtr<Completion> done_;
+
+  IMPLEMENT_REFCOUNTING(CookieCopier);
+};
+
 }  // namespace
 
 namespace glea {
@@ -682,6 +736,11 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
 @implementation GleaBrowsingSession {
  @public
   CefRefPtr<CefRequestContext> _context;
+  // The embeds' session: the profile's cookies are copied into it before
+  // its browsers load, so embeds are signed in where the user is.
+  BOOL _mirrorsCookies;
+  NSDate* _lastMirror;
+  NSMutableArray<dispatch_block_t>* _waitingForMirror;
 }
 
 + (instancetype)incognitoSession {
@@ -703,8 +762,39 @@ void CloseAllBrowsers(std::function<void()> on_all_closed) {
     CefString(&settings.cache_path) = path.UTF8String;
     settings.persist_session_cookies = true;
     session->_context = CefRequestContext::CreateContext(settings, glea::ProfilePrefs());
+    session->_mirrorsCookies = YES;
   }
   return session;
+}
+
+/// Runs `block` once the session is ready for a new browser: for the embeds',
+/// once the profile's cookies are copied in (again if the last copy is a few
+/// seconds old, so a sign-in in a tab reaches the next embed).
+- (void)whenReady:(dispatch_block_t)block {
+  if (!_mirrorsCookies) {
+    block();
+    return;
+  }
+  if (_waitingForMirror) {
+    [_waitingForMirror addObject:[block copy]];
+    return;
+  }
+  if (_lastMirror && -_lastMirror.timeIntervalSinceNow < 10) {
+    block();
+    return;
+  }
+  _waitingForMirror = [NSMutableArray arrayWithObject:[block copy]];
+  GleaBrowsingSession* session = self;
+  CefRefPtr<Completion> done = new Completion(^{
+    session->_lastMirror = [NSDate date];
+    NSArray<dispatch_block_t>* waiting = session->_waitingForMirror;
+    session->_waitingForMirror = nil;
+    for (dispatch_block_t waiter in waiting) waiter();
+  });
+  CefRefPtr<CefCookieManager> source = CefRequestContext::GetGlobalContext()->GetCookieManager(nullptr);
+  CefRefPtr<CefCookieManager> target = _context->GetCookieManager(nullptr);
+  // (Without access to either store, `done` goes with this scope.)
+  if (source && target) source->VisitAllCookies(new CookieCopier(target, done));
 }
 
 @end
@@ -825,6 +915,22 @@ static std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>>& DownloadCallbacks
 - (void)createBrowser {
   _creating = YES;
   _keepAlive = self;
+  if (_session) {
+    [_session whenReady:^{ [self startBrowser]; }];
+  } else {
+    [self startBrowser];
+  }
+}
+
+- (void)startBrowser {
+  if (_closeRequested) {
+    // Closed while its session got ready: there is no browser to tear down.
+    _creating = NO;
+    _closeRequested = NO;
+    [self close];
+    _keepAlive = nil;
+    return;
+  }
   _client = new BrowserClient(self);
   if (self.prefersChromeStyle) {
     if (glea::UsesChromeTabs()) {
