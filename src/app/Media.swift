@@ -2134,15 +2134,26 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
       const native = window.__gleaNative;
       if (!native) return;
       let scroller = null, last = '';
+      // Where each element was scrolled to, down: only one that moved down
+      // or up is followed (a strip scrolled sideways, like Instagram's
+      // stories, is at both ends and would hand every scroll to the note).
+      const tops = new WeakMap();
+      const scrollsDown = e => e.scrollHeight > e.clientHeight + 1;
       const report = () => {
-        const e = scroller && scroller.isConnected ? scroller : (document.scrollingElement || document.documentElement);
+        const e = scroller && scroller.isConnected && scrollsDown(scroller) ? scroller : (document.scrollingElement || document.documentElement);
         if (!e) return;
         const state = JSON.stringify({ top: e.scrollTop <= 0, bottom: e.scrollTop + e.clientHeight >= e.scrollHeight - 1 });
         if (state !== last) { last = state; native.post('scrollEdges', state); }
       };
       addEventListener('scroll', event => {
         const target = event.target;
-        scroller = target === document || target === document.documentElement || target === document.body ? null : target;
+        if (target === document || target === document.documentElement || target === document.body) {
+          scroller = null;
+        } else if (target instanceof Element) {
+          const moved = tops.has(target) ? tops.get(target) !== target.scrollTop : target.scrollTop !== 0;
+          tops.set(target, target.scrollTop);
+          if (moved && scrollsDown(target)) scroller = target;
+        }
         report();
       }, { capture: true, passive: true });
       addEventListener('resize', report);
