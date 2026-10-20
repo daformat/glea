@@ -762,6 +762,8 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   private(set) var descriptor: MediaDescriptor
   let noteID: String
+  /// The web pages embedded in notes (point-and-shoot reaches them).
+  static let webPageViews = NSHashTable<GleaBrowserView>.weakObjects()
   /// The notes it's in, outermost first (see MarkdownEditorView.embedChain).
   let embedChain: [String]
   /// The reserved height changed: animating from the old one (given), or
@@ -1503,7 +1505,10 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
           }.resume()
         case .page(let page):
           let isWebPage = provider.name == EmbedProvider.webPage.name
-          self.showBrowser(page.absoluteString, script: isWebPage ? MediaBlockView.scrollEdgeReporter : nil)
+          // A web page takes point-and-shoot, like a tab.
+          self.showBrowser(page.absoluteString,
+                           script: isWebPage ? Tab.contentScript + MediaBlockView.scrollEdgeReporter : nil)
+          if isWebPage, let view = self.content as? GleaBrowserView { MediaBlockView.webPageViews.add(view) }
         case .html(let html):
           self.contentDark = self.isDark
           self.showBrowser(EmbedService.hostURL, served: EmbedService.hostPage(html, dark: self.isDark),
@@ -1663,6 +1668,13 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   }
 
   func browserView(_ view: GleaBrowserView, didReceiveMessage name: String, payload json: String) {
+    if name == "capture" || name == "captureArea" {
+      guard view === content, let controller = window?.windowController as? BrowserWindowController,
+            let payload = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] else { return }
+      controller.pageDidCapture(name, payload: payload, page: view, url: view.url, title: view.title,
+                                preferred: NoteRef(id: noteID))
+      return
+    }
     if name == "scrollEdges" {
       guard view === content, let payload = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Bool] else { return }
       pageEdges = (payload["top"] ?? true, payload["bottom"] ?? false)

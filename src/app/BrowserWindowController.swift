@@ -1680,9 +1680,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       NSLog("Glea test result: \(payload["value"] ?? "")")
       return
     }
-    guard tab === frontTab else { return }
+    guard tab === frontTab, let page = tab.browserView else { return }
+    pageDidCapture(name, payload: payload, page: page, url: tab.url, title: tab.title,
+                   preferred: tab === peekTab ? peekSource : nil)
+  }
+
+  /// A point-and-shoot shot (a click or a dragged area) from a tab's page or
+  /// a web page embedded in a note (`preferred`, offered first).
+  func pageDidCapture(_ name: String, payload: [String: Any], page: GleaBrowserView, url: String, title: String,
+                      preferred: NoteRef?) {
     if name == "captureArea" {
-      captureArea(payload, in: tab)
+      captureArea(payload, in: page, url: url, title: title, preferred: preferred)
       return
     }
     guard name == "capture" else { return }
@@ -1690,14 +1698,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       kind: Capture.Kind(rawValue: payload["kind"] as? String ?? "") ?? .element,
       markdown: payload["markdown"] as? String ?? "",
       text: payload["text"] as? String ?? "",
-      pageURL: payload["url"] as? String ?? tab.url,
-      pageTitle: payload["title"] as? String ?? tab.title)
-    showCapturePanel(capture, anchorInWindow: anchor(for: payload["rect"], in: tab), from: tab)
+      pageURL: payload["url"] as? String ?? url,
+      pageTitle: payload["title"] as? String ?? title)
+    showCapturePanel(capture, anchorInWindow: anchor(for: payload["rect"], in: page), from: page, preferred: preferred)
   }
 
   /// Converts a viewport rect (CSS pixels) from the page into window coordinates.
-  private func anchor(for value: Any?, in tab: Tab) -> NSRect? {
-    guard let rect = value as? [String: Double], let view = tab.browserView else { return nil }
+  private func anchor(for value: Any?, in view: GleaBrowserView) -> NSRect? {
+    guard let rect = value as? [String: Double] else { return nil }
     let zoom = pow(1.2, view.zoomLevel)
     let pageRect = NSRect(x: (rect["x"] ?? 0) * zoom, y: (rect["y"] ?? 0) * zoom,
                           width: (rect["width"] ?? 0) * zoom, height: (rect["height"] ?? 0) * zoom)
@@ -1705,25 +1713,27 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   /// A dragged area: screenshot it through DevTools, then offer to collect it.
-  private func captureArea(_ payload: [String: Any], in tab: Tab) {
-    guard let area = payload["rect"] as? [String: Double], let view = tab.browserView else { return }
+  private func captureArea(_ payload: [String: Any], in view: GleaBrowserView, url: String, title: String,
+                           preferred: NoteRef?) {
+    guard let area = payload["rect"] as? [String: Double] else { return }
     let rect = NSRect(x: area["x"] ?? 0, y: area["y"] ?? 0, width: area["width"] ?? 0, height: area["height"] ?? 0)
     let viewportWidth = (payload["viewport"] as? [String: Double])?["width"] ?? Double(view.bounds.width / pow(1.2, view.zoomLevel))
     // The viewport as shown, cropped here (a clipped capture flashes the page).
-    view.captureScreenshot(ofPageRect: .zero) { [weak self, weak tab] full in
-      guard let self, let tab else { return }
-      tab.browserView?.executeJavaScript("window.__gleaPNS && __gleaPNS.shotTaken()")
+    view.captureScreenshot(ofPageRect: .zero) { [weak self, weak view] full in
+      guard let self, let view else { return }
+      view.executeJavaScript("window.__gleaPNS && __gleaPNS.shotTaken()")
       let png = full.flatMap { Self.crop($0, to: rect, viewportWidth: viewportWidth) }
       guard let png else {
-        tab.browserView?.executeJavaScript("window.__gleaPNS && __gleaPNS.cancel()")
+        view.executeJavaScript("window.__gleaPNS && __gleaPNS.cancel()")
         self.toast.show("Couldn’t capture that area")
         return
       }
-      var capture = Capture(kind: .image, markdown: "", text: "Screenshot of \(tab.displayTitle)",
-                            pageURL: payload["url"] as? String ?? tab.url,
-                            pageTitle: payload["title"] as? String ?? tab.title)
+      var capture = Capture(kind: .image, markdown: "", text: "Screenshot of \(title.isEmpty ? url : title)",
+                            pageURL: payload["url"] as? String ?? url,
+                            pageTitle: payload["title"] as? String ?? title)
       capture.imageData = png
-      self.showCapturePanel(capture, anchorInWindow: self.anchor(for: payload["rect"], in: tab), from: tab)
+      self.showCapturePanel(capture, anchorInWindow: self.anchor(for: payload["rect"], in: view), from: view,
+                            preferred: preferred)
     }
   }
 
@@ -1866,7 +1876,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   /// The page waiting on the capture card, told to cancel if the card goes
   /// away without a choice (e.g. replaced by the omnibox).
-  private weak var captureTab: Tab?
+  private weak var capturePage: GleaBrowserView?
 
   private func present(_ newOverlay: OverlayView) {
     releasePendingCapture()
@@ -1881,8 +1891,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   private func releasePendingCapture() {
-    captureTab?.browserView?.executeJavaScript("window.__gleaPNS && __gleaPNS.cancel()")
-    captureTab = nil
+    capturePage?.executeJavaScript("window.__gleaPNS && __gleaPNS.cancel()")
+    capturePage = nil
   }
 
   func dismissOverlayForTesting() { dismissOverlay() }
@@ -2157,7 +2167,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   }
 
   /// `onCollect` replaces collecting into the chosen note (and its toast).
-  private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from tab: Tab?,
+  private func showCapturePanel(_ capture: Capture, anchorInWindow: NSRect?, from page: GleaBrowserView?,
+                                preferred: NoteRef? = nil,
                                 onDismiss: (() -> Void)? = nil, onCollect: ((NoteRef) -> Void)? = nil) {
     let root = rootView
     var anchor = NSRect(x: root.bounds.midX - 170, y: TabLayout.pageTop + 8, width: 0, height: 0)
@@ -2165,17 +2176,15 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       // Window coordinates are bottom-up; the overlay is flipped.
       anchor = NSRect(x: rect.minX, y: root.bounds.height - rect.maxY, width: rect.width, height: rect.height)
     }
-    // From the peek: the note it was opened from comes first.
-    let preferred = tab.flatMap { $0 === peekTab ? peekSource : nil }
     let panel = CapturePanel(capture: capture, anchor: anchor, lastTarget: lastCaptureTarget, preferred: preferred)
     panel.onDismiss = { [weak self] in
       self?.releasePendingCapture()
       self?.dismissOverlay()
       onDismiss?()
     }
-    panel.onCollect = { [weak self, weak tab] ref in
+    panel.onCollect = { [weak self, weak page] ref in
       guard let self else { return }
-      self.captureTab = nil
+      self.capturePage = nil
       if let onCollect {
         self.dismissOverlay()
         return onCollect(ref)
@@ -2184,13 +2193,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       self.dismissOverlay()
       let name = ref == NoteStore.shared.today ? "Today" : ref.displayTitle
       // The page just lets go of the target; the toast is the only confirmation.
-      tab?.browserView?.executeJavaScript("window.__gleaPNS && __gleaPNS.done()")
+      page?.executeJavaScript("window.__gleaPNS && __gleaPNS.done()")
       NoteStore.shared.collect(capture, into: ref) {
         self.toast.show("Collected to", linkTitle: name) { [weak self] in self?.openCollected(ref) }
       }
     }
     present(panel)
-    captureTab = tab
+    capturePage = page
     panel.activate()
     panel.animateAppear()
   }
@@ -2214,6 +2223,13 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   private var pendingPointAndShoot: DispatchWorkItem?
 
+  /// The pages ⌥ points into: the page in front, and the web pages embedded
+  /// in the notes shown (only the one under the pointer lights up).
+  private var pointAndShootPages: [GleaBrowserView] {
+    let embeds = MediaBlockView.webPageViews.allObjects.filter { $0.window === window && !$0.isHiddenOrHasHiddenAncestor }
+    return (frontTab?.browserView.map { [$0] } ?? []) + embeds
+  }
+
   /// ⌥ alone, or ⌥⌘ (Caps Lock aside).
   private static func isPointAndShoot(_ flags: NSEvent.ModifierFlags) -> Bool {
     flags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .command]) == .option
@@ -2226,33 +2242,36 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let optionOnly = BrowserWindowController.isPointAndShoot(flags) && NSEvent.pressedMouseButtons == 0
     pendingPointAndShoot?.cancel()
     pendingPointAndShoot = nil
-    guard let view = frontTab?.browserView else { return }
+    let pages = pointAndShootPages
+    guard !pages.isEmpty else { return }
     guard optionOnly else {
       // Turning it off must always get through.
-      view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(false)")
+      for view in pages { view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(false)") }
       return
     }
-    view.executeJavaScript("window.__gleaPNS && __gleaPNS.setTextOnly(\(flags.contains(.command)))")
+    for view in pages { view.executeJavaScript("window.__gleaPNS && __gleaPNS.setTextOnly(\(flags.contains(.command)))") }
     // Turning it on needs the page in front, and Option held on its own for a
     // moment: ⌥ on the way to ⌥⌘→ (switch tabs) never starts a capture.
     // The page has keyboard focus in its own window (Chrome style) or in ours.
-    let focused = window?.isKeyWindow == true || view.chromeWindow?.isKeyWindow == true
+    let focused = window?.isKeyWindow == true || pages.contains { $0.chromeWindow?.isKeyWindow == true }
     let testing = ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] != nil
     guard (NSApp.isActive && focused) || testing, overlay == nil, !isShowingNewTab else { return }
-    let work = DispatchWorkItem { [weak self, weak view] in
-      guard let self, let view, self.frontTab?.browserView === view else { return }
+    let work = DispatchWorkItem { [weak self] in
+      guard let self else { return }
       guard BrowserWindowController.isPointAndShoot(NSEvent.modifierFlags)
               || ProcessInfo.processInfo.environment["GLEA_TEST_HOOKS"] != nil else { return }
-      // Where the pointer is, in page (CSS) pixels, for pages that haven't seen it move.
-      var args = "true"
-      if let window = view.window {
-        let point = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
-        let zoom = pow(1.2, view.zoomLevel)
-        if view.bounds.contains(point) {
-          args += ", \(Int(point.x / zoom)), \(Int(point.y / zoom))"
+      for view in self.pointAndShootPages where pages.contains(where: { $0 === view }) {
+        // Where the pointer is, in page (CSS) pixels, for pages that haven't seen it move.
+        var args = "true"
+        if let window = view.window {
+          let point = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+          let zoom = pow(1.2, view.zoomLevel)
+          if view.bounds.contains(point) {
+            args += ", \(Int(point.x / zoom)), \(Int(point.y / zoom))"
+          }
         }
+        view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(\(args))")
       }
-      view.executeJavaScript("window.__gleaPNS && __gleaPNS.setActive(\(args))")
     }
     pendingPointAndShoot = work
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
@@ -2336,7 +2355,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   private func closePeek() {
     guard let peek, let tab = peekTab else { return }
     endPeek()
-    if captureTab === tab { releasePendingCapture() }
+    if capturePage === tab.browserView { releasePendingCapture() }
     // The page stays while the card leaves: it's a window of its own, which
     // can't shrink with the card, so it fades with it.
     if let pageWindow = tab.browserView?.chromeWindow, !Motion.reduceMotion {
@@ -3229,7 +3248,8 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   @objc func collectPage(_ sender: Any?) {
     guard let tab = frontTab, tab.url.hasPrefix("http") else { return }
     let capture = Capture(kind: .page, markdown: "", text: "", pageURL: tab.url, pageTitle: tab.title)
-    showCapturePanel(capture, anchorInWindow: nil, from: tab)
+    // From the peek: the note it was opened from comes first.
+    showCapturePanel(capture, anchorInWindow: nil, from: tab.browserView, preferred: tab === peekTab ? peekSource : nil)
   }
 
   /// Prints the page in front, or the note shown.
