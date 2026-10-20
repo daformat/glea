@@ -1043,33 +1043,49 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   /// For automated checks: hit tests as if for a scroll.
   static var debugScrollHitTest = false
 
-  /// A PDF or a web page scrolls itself once clicked, until a click
-  /// anywhere else; before that, and always with the pointer outside it,
-  /// the wheel scrolls the note.
-  private var scrollsItself = false
-  private var clickMonitor: Any?
+  /// A PDF or a web page scrolls itself when a scroll starts over it. A
+  /// scroll already going on carries on where it started, momentum
+  /// included: the note keeps scrolling as the block slides under the
+  /// pointer, and the block as it slides away.
+  private static weak var scrollOwner: MediaBlockView?
+  /// The timestamp of the event that started the scroll going on.
+  private static var scrollStart: TimeInterval = -1
+  private static var lastWheelClick: TimeInterval = -1
+  private static var scrollMonitor: Any?
+
+  private static func watchScrolls() {
+    guard scrollMonitor == nil else { return }
+    scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+      MainActor.assumeIsolated {
+        // (A wheel's clicks have no phase: close together, they're one scroll.)
+        let wheelClick = event.phase.isEmpty && event.momentumPhase.isEmpty
+        let begins = event.phase.contains(.began) || event.phase.contains(.mayBegin)
+          || (wheelClick && event.timestamp - lastWheelClick > 0.3)
+        if wheelClick { lastWheelClick = event.timestamp }
+        if begins {
+          scrollStart = event.timestamp
+          scrollOwner = nil
+        }
+      }
+      return event
+    }
+  }
+
+  /// Whether the scroll event being hit-tested is this block's: one that
+  /// starts over it, or goes on after starting over it.
+  private func takesScroll() -> Bool {
+    guard let event = NSApp.currentEvent, event.type == .scrollWheel else { return true }
+    if event.timestamp == Self.scrollStart, Self.scrollOwner == nil { Self.scrollOwner = self }
+    return Self.scrollOwner === self
+  }
 
   /// Whether it has more than it shows (other embeds are sized to their
   /// content).
-  private var scrollsOnceClicked: Bool {
+  private var scrollsInPlace: Bool {
     switch descriptor.kind {
     case .document: return true
     case .embed(_, let provider, _): return provider.name == EmbedProvider.webPage.name
     default: return false
-    }
-  }
-
-  private func watchClicks() {
-    if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
-    clickMonitor = nil
-    guard window != nil, scrollsOnceClicked else { return }
-    clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
-      MainActor.assumeIsolated {
-        guard let self else { return }
-        self.scrollsItself = event.window === self.window && self.loaded && !self.collapsed
-          && self.wrapperFrame.contains(self.convert(event.locationInWindow, from: nil))
-      }
-      return event
     }
   }
 
@@ -1082,7 +1098,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
     guardFocus()
-    watchClicks()
+    if window != nil, scrollsInPlace { Self.watchScrolls() }
     // The toggle's label fits or not as the window resizes.
     if let resizeObserver { NotificationCenter.default.removeObserver(resizeObserver) }
     resizeObserver = window.map {
@@ -2156,7 +2172,7 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
 
   /// The note scrolls when the wheel is over an embed (embeds are sized to
   /// their content, so they have nothing to scroll themselves; a PDF or a
-  /// web page does, once clicked: see `scrollsItself`).
+  /// web page does: see `takesScroll`).
   override func scrollWheel(with event: NSEvent) {
     enclosingScrollView?.scrollWheel(with: event)
   }
@@ -2165,7 +2181,9 @@ final class MediaBlockView: NSView, GleaBrowserViewDelegate {
     let local = convert(point, from: superview)
     if MediaBlockView.hitTestingScroll {
       guard bounds.contains(local) else { return nil }
-      if scrollsItself, !collapsed, wrapperFrame.contains(local), !pagePassesGesture() { return super.hitTest(point) ?? self }
+      if scrollsInPlace, loaded, !collapsed, wrapperFrame.contains(local), takesScroll(), !pagePassesGesture() {
+        return super.hitTest(point) ?? self
+      }
       return self
     }
     // Only the visible parts take clicks; the rest belongs to the text.
@@ -2352,8 +2370,7 @@ final class MediaResizeHandle: NSView {
   }
 }
 
-/// A PDF's pages, scrolling in place once its block is clicked (see
-/// `MediaBlockView.scrollsItself`). A scroll that starts at the top or the
+/// A PDF's pages, scrolling in place (see `MediaBlockView.takesScroll`). A scroll that starts at the top or the
 /// bottom and pushes past it goes to the note instead; one that reaches an
 /// end mid-way stops there.
 final class PDFEmbedView: NSView {
