@@ -2,6 +2,21 @@
 
 What changed in each release of Glea.
 
+## 0.22.1 Beta — 2026-10-20
+
+- Web pages embedded in notes show you signed in wherever you are in
+  Glea (Instagram, say), and still stay out of your web history.
+- PDFs and web pages in notes scroll as soon as you scroll over them, no
+  click first. A scroll already moving the note keeps moving it as they
+  slide under the pointer.
+- Point and shoot works in web pages embedded in notes: hold <kbd>⌥</kbd>
+  over one, and what you collect offers its note first.
+- A web page in a note no longer gets stuck, handing every scroll to the
+  note, after something in it scrolled sideways (Instagram's stories).
+- Point and shoot collects Instagram posts as embeds in its narrow layout
+  too, and a video only the page can play (an ad's) as a picture rather
+  than an address that never loads.
+
 ## 0.22.0 Beta — 2026-10-19
 
 - Zen mode: View › Zen Mode (<kbd>⌃</kbd><kbd>⌘</kbd><kbd>S</kbd>) slides
