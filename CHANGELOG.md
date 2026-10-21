@@ -2,6 +2,18 @@
 
 What changed in each release of Glea.
 
+## 0.22.2 Beta — 2026-10-21
+
+- Zen mode: switching between the web and the notes no longer shows the
+  tabs for a moment as the toolbar comes back, or resizes the page, with
+  horizontal or vertical tabs.
+- Zen mode: nothing of the hidden tabs and toolbar shows around the page
+  until you bring them back at the window's edge, even as a page loads.
+- Zen mode: the outline around the page follows the window as you resize
+  it.
+- With vertical tabs, a loading page's progress bar no longer streaks
+  across the window as you switch to the web.
+
 ## 0.22.1 Beta — 2026-10-20
 
 - Web pages embedded in notes show you signed in wherever you are in
