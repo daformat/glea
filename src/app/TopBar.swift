@@ -665,22 +665,23 @@ final class TopBarView: NSView {
     downloadsRing.strokeColor = resolvedCGColor(Theme.accent)
   }
 
+  /// (`atOnce`: nothing fades or slides, the bar out of sight as it changes.)
   func update(section: Section, tabs: [TabInfo], groups: [GroupInfo], activeID: ObjectIdentifier?, canGoBack: Bool, canGoForward: Bool,
-              progress: Double) {
+              progress: Double, atOnce: Bool = false) {
     let sectionChanged = section != self.section
     self.section = section
     journalButton.isActive = section == .journal
     notesButton.isActive = section == .notes
     backButton.isEnabled = canGoBack
     forwardButton.isEnabled = canGoForward
-    modeButton.setSymbol(isWeb ? "note.text" : "globe", animated: sectionChanged && window != nil)
+    modeButton.setSymbol(isWeb ? "note.text" : "globe", animated: sectionChanged && window != nil && !atOnce)
     modeButton.toolTip = isWeb ? "Switch to Notes (⌘D)" : "Switch to Web (⌘D)"
 
     tabsView.delegate = delegate
     let (added, reveal) = tabsView.update(tabs: tabs, groups: groups, activeID: activeID, isWeb: isWeb)
 
     self.progress = progress
-    let animated = window != nil
+    let animated = window != nil && !atOnce
     Motion.animate(animated ? 0.2 : 0, timing: Motion.easeInOut) {
       applyColors()
       separatorLayer.opacity = isWeb ? 1 : 0
@@ -892,10 +893,16 @@ final class TopBarView: NSView {
     }
   }
 
+  private var progressIsVertical = false
+
   private func updateProgress() {
     let visible = isWeb && progress > 0 && progress < 1
+    // The bar ↔ the sidebar: it goes to its new place at once (sliding
+    // there, it would cross the window).
+    let moved = progressIsVertical != isVertical
+    progressIsVertical = isVertical
     CATransaction.begin()
-    CATransaction.setAnimationDuration(Motion.reduceMotion ? 0 : 0.25)
+    CATransaction.setAnimationDuration(Motion.reduceMotion || moved ? 0 : 0.25)
     CATransaction.setAnimationTimingFunction(Motion.easeOut)
     // (In the sidebar: under the navigation, at the top.)
     let y = isVertical ? bounds.height - Theme.topBarHeight - 1 : 0

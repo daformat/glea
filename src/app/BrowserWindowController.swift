@@ -872,6 +872,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     if isExtra { scheduleSessionSave() }
     // (Hidden tabs' pages too: they keep their notes' room.)
     if tabs.contains(where: \.showsSideNote) { layoutSideNote() }
+    // The card's outline goes around it at its new size.
+    root.layoutSubtreeIfNeeded()
+    zenBackdrop.cardFrame = webContainer.convert(webContainer.bounds, to: root)
     updateZenCutout()
     positionTrafficLights()
     syncOverlayWindow()
@@ -1201,9 +1204,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     for view in [journalView, noteView, notesView, webContainer] where view !== incoming && view !== outgoing {
       view.isHidden = true
     }
+    // (Zen mode's backdrop is the web's: not around the notes.)
+    if webContainer.isHidden { zenBackdrop.isHidden = true }
     incoming.isHidden = false
     incoming.layer?.removeAllAnimations()
     guard outgoing !== incoming else { return }
+    zenBackdrop.alphaValue = 1
     let animate = window?.isVisible == true && !Motion.reduceMotion
     if !animate {
       finishTransition(hiding: outgoing)
@@ -1214,6 +1220,17 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     outgoing.animateOut(scale: 1.01, fade: 0.14, duration: 0.2) { [weak self] in
       guard let self, generation == self.transitionGeneration else { return }
       self.finishTransition(hiding: outgoing)
+    }
+    // Zen mode's backdrop is the web's surroundings: it fades along.
+    if incoming === webContainer || outgoing === webContainer {
+      let showing = incoming === webContainer
+      zenBackdrop.isHidden = !TabLayout.isZen
+      if showing { zenBackdrop.alphaValue = 0 }
+      NSAnimationContext.runAnimationGroup { context in
+        context.duration = showing ? 0.22 : 0.14
+        if showing { context.timingFunction = Motion.easeOut }
+        zenBackdrop.animator().alphaValue = showing ? 1 : 0
+      }
     }
     // Chrome-style pages are drawn in their own window over webContainer:
     // fade it along.
@@ -1239,6 +1256,7 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     view.isHidden = true
     view.layer?.removeAllAnimations()
     if view === webContainer {
+      zenBackdrop.isHidden = true
       activeTab?.browserView?.isHidden = true
       // Faded out and now hidden: opaque again for next time (unless the
       // page keeps running out of sight, its window transparent).
@@ -1270,12 +1288,14 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let web = mode == .web
     // Vertical tabs are the web's: the notes keep the top bar.
     if (TabLayout.isVertical && web) != topBar.isVertical { applyTabLayout(animated: true) }
-    // (Zen mode is the web's too.)
-    if zenTarget != (zenWanted ? 1 : 0) { applyZen(animated: false) }
+    // (Zen mode is the web's too: the bar leaves, or comes back fading in,
+    // already showing the other mode's, rather than its tabs crossfading.)
+    let zenFlips = zenTarget != (zenWanted ? 1 : 0)
+    if zenFlips { applyZen(animated: false) }
     topBar.update(section: section, tabs: infos, groups: groupInfos, activeID: shown.map(ObjectIdentifier.init),
                   canGoBack: web ? shown?.canGoBack ?? false : canGoBackInNotes,
                   canGoForward: web ? shown?.canGoForward ?? false : canGoForwardInNotes,
-                  progress: shown?.isLoading == true ? max(0.05, shown?.progress ?? 0) : 0)
+                  progress: shown?.isLoading == true ? max(0.05, shown?.progress ?? 0) : 0, atOnce: zenFlips)
     let appTitle = isIncognito ? "Incognito" : "Glea"
     window?.title = mode != .web ? appTitle : isShowingNewTab ? "New Tab" : (activeTab?.displayTitle ?? appTitle)
     updateStartPage()
@@ -2661,11 +2681,16 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
 
   /// The tabs and toolbar are out of the way here: zen mode, on the web.
   private var zenWanted: Bool { TabLayout.isZen && mode == .web }
+  /// How far the web's card is in zen mode's place. It's zen mode's,
+  /// whatever the mode (only the bar goes over the notes): its page
+  /// resizing as the web and the notes switch would show, the page drawing
+  /// each size late.
+  private var webZenAmount: CGFloat { zenSlide != nil ? zenAmount : TabLayout.isZen ? 1 : 0 }
 
   /// A page's corners: the card's (vertical tabs, zen mode), or the
   /// window's. (Under the top bar, the card's round as it comes.)
   private var pageCornerRadius: CGFloat {
-    TabLayout.isVertical ? TabLayout.cardRadius : (TabLayout.cardRadius * zenAmount).rounded()
+    TabLayout.isVertical ? TabLayout.cardRadius : (TabLayout.cardRadius * webZenAmount).rounded()
   }
 
   /// Rounds a page as a card or not. Under the top bar, a card coming in
@@ -2673,9 +2698,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   /// window's (those snapping to the card's poked out of the window's).
   private func round(_ page: GleaBrowserView) {
     let top = pageCornerRadius
-    let easing = !TabLayout.isVertical && zenAmount > 0 && zenAmount < 1
+    let easing = !TabLayout.isVertical && webZenAmount > 0 && webZenAmount < 1
     let window = page.windowCornerRadius
-    let bottom = easing ? (window + (TabLayout.cardRadius - window) * zenAmount).rounded() : -1
+    let bottom = easing ? (window + (TabLayout.cardRadius - window) * webZenAmount).rounded() : -1
     if page.chromeCornerRadius != top { page.chromeCornerRadius = top }
     if page.chromeBottomCornerRadius != bottom { page.chromeBottomCornerRadius = bottom }
   }
@@ -2767,6 +2792,9 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     let sidebar = topBar.isVertical
     // How far the bar is out of the window.
     let out = zenAmount * (1 - zenReveal)
+    // All the way out, it isn't drawn at all: nothing of it (what spills
+    // out of it as it changes) shows until the pointer brings it back.
+    topBar.isHidden = out >= 1
     topBarTop.constant = sidebar ? 0 : -(Theme.topBarHeight * out).rounded()
     topBarLeading.constant = sidebar ? -(sidebarSize * out).rounded() : 0
     topBarTrailing.isActive = !(sidebar && full)
@@ -2775,19 +2803,21 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     // In zen mode the page is still a card on the bar's color (the
     // backdrop, as the bar leaves), at the same inset all around.
     let inset = TabLayout.cardInset
-    let zenInset = (inset * zenAmount).rounded()
-    webUnderBar[0].constant = (Theme.topBarHeight * (1 - zenAmount)).rounded() + zenInset
+    let card = webZenAmount
+    let zenInset = (inset * card).rounded()
+    webUnderBar[0].constant = (Theme.topBarHeight * (1 - card)).rounded() + zenInset
     webUnderBar[1].constant = zenInset
     webUnderBar[2].constant = -zenInset
     webUnderBar[3].constant = -zenInset
-    sidebarWidth.constant = (sidebarSize * (1 - zenAmount)).rounded() + zenInset
+    sidebarWidth.constant = (sidebarSize * (1 - card)).rounded() + zenInset
     webInCard[1].constant = inset
     webInCard[2].constant = -inset
     webInCard[3].constant = -inset
-    let card = TabLayout.isVertical || zenAmount > 0
-    webContainer.layer?.cornerRadius = card ? pageCornerRadius : 0
-    webContainer.layer?.masksToBounds = card
-    zenBackdrop.isHidden = zenAmount == 0
+    let isCard = TabLayout.isVertical || card > 0
+    webContainer.layer?.cornerRadius = isCard ? pageCornerRadius : 0
+    webContainer.layer?.masksToBounds = isCard
+    // (The web's: it goes with it.)
+    zenBackdrop.isHidden = card == 0 || webContainer.isHidden
     root.layoutSubtreeIfNeeded()
     zenBackdrop.cardFrame = webContainer.convert(webContainer.bounds, to: root)
     // In zen mode the bar comes over the page's views (the note beside it,
@@ -2999,12 +3029,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
   /// The pages narrow to leave their notes room, as much of it as shows.
   private func layoutSideNote() {
     guard sideNoteTop != nil else { return }
-    let card = TabLayout.isVertical || zenAmount > 0
+    let card = TabLayout.isVertical || webZenAmount > 0
     sideNoteWidthConstraint.constant = sideNote.isHidden ? 0 : (shownSideNoteWidth * sideNoteReveal).rounded()
     sideNote.contentWidth = shownSideNoteWidth
     // With vertical tabs the note runs the window's height beside the card
     // (in zen mode, the page's).
-    sideNoteTop.constant = TabLayout.isVertical ? 0 : (Theme.topBarHeight * (1 - zenAmount)).rounded()
+    sideNoteTop.constant = TabLayout.isVertical ? 0 : (Theme.topBarHeight * (1 - webZenAmount)).rounded()
     sideNote.showsSeparator = !card
     root.layoutSubtreeIfNeeded()
     // Like a live window resize: only the page in front at each step of a
