@@ -2,6 +2,11 @@
 
 What changed in each release of Glea.
 
+## 0.22.3 Beta — 2026-10-26
+
+- Web pages run on Chromium 156 (up from 154), with its security fixes.
+  Videos and sound still play as before, decoded by macOS.
+
 ## 0.22.2 Beta — 2026-10-21
 
 - Zen mode: switching between the web and the notes no longer shows the
