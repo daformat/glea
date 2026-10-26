@@ -1,5 +1,5 @@
 #!/bin/bash
-# Builds CEF 154 (branch 8037, the commit Glea ships) with H.264 and AAC
+# Builds CEF 156 (branch 8078, the commit Glea ships) with H.264 and AAC
 # support where macOS does the decoding:
 #   - H.264 video: VideoToolbox (Chromium's GPU-process decoder). FFmpeg's
 #     video decoders are compiled out, and so are OpenH264 (encoding uses
@@ -24,8 +24,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 GLEA=$(cd "$HERE/../.." && pwd)
 WORK=${CEF_BUILD_DIR:-$HOME/dev/cef-build}
-BRANCH=8037
-COMMIT=564dd6c4aafff558154bd3176eb5d13551db6734
+BRANCH=8078
+COMMIT=4fa4ab516dacf6c49fc7e6e70d2b7ebce29fa35f
 SRC=$WORK/chromium_git/chromium/src
 
 export PATH=$WORK/depot_tools:$PATH
@@ -64,7 +64,7 @@ build() {
   xcrun -f metal >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
   cd "$SRC/cef"
   GN_OUT_CONFIGS=Release_GN_arm64 ./cef_create_projects.sh
-  autoninja -C "$SRC/out/Release_GN_arm64" cefsimple
+  autoninja -C "$SRC/out/Release_GN_arm64" cefclient
   python3 tools/make_distrib.py --output-dir="$SRC/cef/binary_distrib" --arm64-build --ninja-build \
     --minimal --no-docs --no-symbols --no-archive
 }

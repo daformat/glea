@@ -4,7 +4,7 @@ A minimal macOS web browser built on Chromium, inspired by [Beam](https://github
 It has a daily journal, linked notes, a unified omnibox, and point-and-shoot capture from web pages.
 Everything you write is a plain Markdown file on disk.
 
-- **Engine:** Chromium via the [Chromium Embedded Framework](https://github.com/chromiumembedded/cef) (CEF 154), one browser per tab.
+- **Engine:** Chromium via the [Chromium Embedded Framework](https://github.com/chromiumembedded/cef) (CEF 156), one browser per tab.
 - **App:** native AppKit, written in Swift. A thin Objective-C++ bridge wraps CEF's C++ API.
 
 ## Build and run

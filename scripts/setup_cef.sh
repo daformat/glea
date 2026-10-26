@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads the CEF binary distribution into third_party/cef and verifies its checksum.
 set -euo pipefail
-CEF_VERSION="${CEF_VERSION:-154.0.28+g564dd6c+chromium-154.0.8037.58}"
+CEF_VERSION="${CEF_VERSION:-156.0.14+g4fa4ab5+chromium-156.0.8078.48}"
 PLATFORM="${PLATFORM:-macosarm64}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/third_party/cef"
