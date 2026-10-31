@@ -407,9 +407,21 @@ extension NSScrollView {
   /// Content fades out under the top edge once scrolled (`fade` masks the
   /// scroll view's layer; call again as it scrolls or resizes).
   func updateTopFade(_ fade: CAGradientLayer, height: CGFloat) {
-    guard let layer else { return }
+    applyTopFade(fade, height: height, strength: topFadeStrength(height: height))
+  }
+
+  /// How strong the fade is: none at the top, full once scrolled `height`.
+  func topFadeStrength(height: CGFloat) -> CGFloat {
     let offset = contentView.bounds.minY - contentView.contentInsets.top
-    let strength = min(max(offset / height, 0), 1)
+    return min(max(offset / height, 0), 1)
+  }
+}
+
+extension NSView {
+  /// The view fades out under its top edge, over `height` (`fade` masks
+  /// its layer), as much as `strength` (0 to 1).
+  func applyTopFade(_ fade: CAGradientLayer, height: CGFloat, strength: CGFloat) {
+    guard let layer else { return }
     Motion.withoutAnimation {
       fade.frame = layer.bounds
       // Top of the view is location 0 (the gradient runs top to bottom).
@@ -1268,7 +1280,7 @@ final class NoteView: ColumnPageView, NSTextFieldDelegate {
 
   private func refreshMeta() {
     guard let ref else { return }
-    let words = NoteStore.shared.content(of: ref).split { $0.isWhitespace || $0.isNewline }.count
+    let words = NoteStore.shared.wordCount(of: ref)
     var parts = ["\(words) word\(words == 1 ? "" : "s")"]
     if let modified = NoteStore.shared.modified(ref) {
       // Under a minute (or a hair ahead of the clock, just saved): "now".
@@ -1656,6 +1668,44 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   private let trashSlot = NSView()
   private lazy var trashSlotWidth = trashSlot.widthAnchor.constraint(equalToConstant: 0)
 
+  /// How the notes are ordered, in each group: by `sortKey`, its own way
+  /// (newest first, A to Z, longest first) unless reversed.
+  private enum SortKey: String {
+    case edited, created, title, length
+  }
+  private var sortKey = SortKey(rawValue: UserDefaults.standard.string(forKey: "notesSortKey") ?? "") ?? .edited {
+    didSet { UserDefaults.standard.set(sortKey.rawValue, forKey: "notesSortKey") }
+  }
+  private var sortReversed = UserDefaults.standard.bool(forKey: "notesSortReversed") {
+    didSet { UserDefaults.standard.set(sortReversed, forKey: "notesSortReversed") }
+  }
+  /// How the groups are ordered (the notes in none last): by `groupSortKey`,
+  /// its own way (A to Z, the last edited first, the largest first) unless
+  /// reversed.
+  private enum GroupSortKey: String {
+    case name, edited, count
+  }
+  private var groupSortKey = GroupSortKey(rawValue: UserDefaults.standard.string(forKey: "noteGroupsSortKey") ?? "") ?? .name {
+    didSet { UserDefaults.standard.set(groupSortKey.rawValue, forKey: "noteGroupsSortKey") }
+  }
+  private var groupSortReversed = UserDefaults.standard.bool(forKey: "noteGroupsSortReversed") {
+    didSet { UserDefaults.standard.set(groupSortReversed, forKey: "noteGroupsSortReversed") }
+  }
+
+  /// Journal days show too (sort menu › Show Journal Notes), in a section
+  /// of their own after the notes in no group.
+  private var showsJournal = UserDefaults.standard.bool(forKey: "notesShowJournal") {
+    didSet { UserDefaults.standard.set(showsJournal, forKey: "notesShowJournal") }
+  }
+  /// The journal's section, as a group no group can be (their names have
+  /// no "/").
+  static let journalGroup = "/journal"
+  static let journalTitle = "Journal"
+
+  private static func title(of group: String?) -> String {
+    group == journalGroup ? journalTitle : group ?? ungroupedTitle
+  }
+
   /// Collapsed groups, by name ("" for the notes in none).
   private var collapsed = Set(UserDefaults.standard.stringArray(forKey: "collapsedNoteGroups") ?? []) {
     didSet { UserDefaults.standard.set(Array(collapsed).sorted(), forKey: "collapsedNoteGroups") }
@@ -1666,6 +1716,9 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// does while a note is dragged).
   private var renaming: String?
   private var pendingReload = false
+  /// The header of the group at the top, held there while its notes scroll
+  /// under it (until the next group's header pushes it out).
+  private let stickyHeader = StickyHeaderView()
   /// Where a note dragged over the list would go, and what shows it.
   private var dropTarget: DropTarget?
   private let dropHighlight = DropHighlightView()
@@ -1690,6 +1743,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     searchField.onFocus = { [weak self] in self?.updateSearchPill() }
     searchPill.onClickIcon = { [weak self] in self?.focusSearch() }
     let newButton = IconButton(symbol: "plus", tooltip: "New Note (⌥⌘N)", target: self, action: #selector(newNote))
+    let sortButton = IconButton(symbol: "arrow.up.arrow.down", tooltip: "Sort", target: self, action: #selector(showSortMenu(_:)))
 
     let titleGroup = NSStackView(views: [title, countLabel])
     titleGroup.alignment = .firstBaseline
@@ -1709,7 +1763,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       trashButton.trailingAnchor.constraint(equalTo: trashSlot.trailingAnchor),
       trashButton.centerYAnchor.constraint(equalTo: trashSlot.centerYAnchor),
     ])
-    controls.setViews([searchPill, newButton, trashSlot], in: .leading)
+    controls.setViews([searchPill, sortButton, newButton, trashSlot], in: .leading)
     // (The slot has the gap before the button.)
     controls.setCustomSpacing(0, after: newButton)
     controls.spacing = 4  // like the trash button's gap
@@ -1762,6 +1816,19 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     addSubview(header)
     addSubview(controls)
     addSubview(scroll)
+    // Over the list, not in it: it stays put while the list scrolls (even
+    // ahead of the main thread), and only moves when pushed.
+    stickyHeader.isHidden = true
+    stickyHeader.scrollView = scroll
+    stickyHeader.onClick = { [weak self] in
+      guard let self, let row = self.tableView.stickyRow?.row else { return }
+      self.rowClicked(row)
+    }
+    stickyHeader.menuForHeader = { [weak self] in
+      guard let self, let row = self.tableView.stickyRow?.row else { return nil }
+      return self.tableView.menuForRow?(row)
+    }
+    addSubview(stickyHeader)
     emptyState.isHidden = true
     addSubview(emptyState)
     let preferred = header.widthAnchor.constraint(equalTo: widthAnchor, constant: -112)
@@ -1806,12 +1873,13 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
   override func layout() {
     super.layout()
-    scroll.updateTopFade(topFade, height: 14)
+    scroll.updateTopFade(topFade, height: Self.topFadeHeight)
     // Labels may use the margin up to the column; the dashes step aside
     // when they'd run under the notes' checkboxes.
     toc.labelRoom = header.frame.minX - 26 - 28
     toc.setTucked(header.frame.minX - 40 < toc.dashesExtent + 8, animated: window?.isVisible == true)
     let inset = max(0, header.frame.minX - 12)
+    defer { updateStickyHeader() }
     guard inset != rowInset else { return }
     rowInset = inset
     tableView.enumerateAvailableRowViews { rowView, _ in (rowView as? RoundedRowView)?.inset = inset }
@@ -1849,17 +1917,58 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   }
 
   private func updateToc() {
-    toc.setEntries(groupHeaders.map { TocEntry(depth: 0, title: $0 ?? Self.ungroupedTitle) })
+    toc.setEntries(groupHeaders.map { TocEntry(depth: 0, title: Self.title(of: $0)) })
     updateActiveGroup()
   }
 
   @objc private func listScrolled() {
-    scroll.updateTopFade(topFade, height: 14)
+    scroll.updateTopFade(topFade, height: Self.topFadeHeight)
     updateActiveGroup()
+    updateStickyHeader()
+  }
+
+  /// Holds the header of the group at the top of the list there, while the
+  /// group's own header is scrolled away; the next header pushes it out.
+  private func updateStickyHeader() {
+    let top = scroll.contentView.bounds.minY
+    let topRow = tableView.row(at: NSPoint(x: tableView.bounds.midX, y: top + 1))
+    let header = filter.isEmpty && topRow >= 0
+      ? items[...min(topRow, items.count - 1)].lastIndex { if case .header = $0 { true } else { false } } : nil
+    guard let header, case .header(let group) = items[header],
+          tableView.rect(ofRow: header).minY < top - 0.5 || heldDuringSlide == .some(group) else {
+      stickyHeader.isHidden = true
+      stickyHeader.wash = nil
+      tableView.stickyRow = nil
+      return
+    }
+    // (As tall as its row shows, spacing included: its name sits where the
+    // header's own does.)
+    var frame = NSRect(x: 0, y: top, width: tableView.bounds.width, height: tableView.rect(ofRow: header).height)
+    if let next = items[(header + 1)...].firstIndex(where: { if case .header = $0 { true } else { false } }) {
+      frame.origin.y = min(top, tableView.rect(ofRow: next).minY - frame.height)
+    }
+    // (The view stays at the top of the list; pushed, its header slides out
+    // of it, under the list's top edge.)
+    stickyHeader.push = frame.minY - top
+    let isCollapsed = collapsed.contains(group ?? "")
+    let turns = !stickyHeader.isHidden && stickyHeader.group == group && stickyHeader.row.isCollapsed != isCollapsed
+    stickyHeader.group = group
+    stickyHeader.row.inset = rowInset
+    stickyHeader.row.isCollapsed = isCollapsed
+    if turns { stickyHeader.row.turnChevron() }
+    configure(stickyHeader.cell, for: group)
+    stickyHeader.frame = convert(NSRect(x: frame.minX, y: top, width: frame.width, height: frame.height + StickyHeaderView.fade),
+                                 from: tableView)
+    stickyHeader.isHidden = false
+    // Over the list's top edge: it fades there as the list does.
+    stickyHeader.topFadeStrength = scroll.topFadeStrength(height: Self.topFadeHeight)
+    tableView.stickyRow = (header, frame)
+    updateStickyWash()
   }
 
   /// The list fades out under its top edge once scrolled, like a page.
   private let topFade = CAGradientLayer()
+  static let topFadeHeight: CGFloat = 14
 
   /// The active group is the last one whose header has reached the top.
   private func updateActiveGroup() {
@@ -1910,15 +2019,15 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     let store = NoteStore.shared
     countLabel.stringValue = "\(store.notes.count)"
     var fresh: [NotesListItem] = []
-    let groups = store.groups
+    let groups = sortedGroups()
     if !filter.isEmpty {
-      fresh = store.search(filter, limit: 200).map(\.ref).filter { $0.kind == .note }.map { .note($0) }
+      fresh = store.search(filter, limit: 200).map(\.ref).filter { $0.kind == .note || showsJournal }.map { .note($0) }
     } else if groups.isEmpty {
-      fresh = store.notes.map { .note($0) }
+      fresh = sorted(store.notes).map { .note($0) }
     } else {
       // Each group, then the notes in none.
       var byGroup: [String: [NoteRef]] = [:]
-      for ref in store.notes { byGroup[store.group(of: ref) ?? "", default: []].append(ref) }
+      for ref in sorted(store.notes) { byGroup[store.group(of: ref) ?? "", default: []].append(ref) }
       for group in groups.map(Optional.some) + [nil] {
         fresh.append(.header(group))
         guard !collapsed.contains(group ?? "") else { continue }
@@ -1926,7 +2035,13 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         fresh += refs.isEmpty ? [.placeholder(group)] : refs.map { .note($0) }
       }
     }
+    // Then the journal's days, if shown.
+    if filter.isEmpty, showsJournal, !store.journalDays.isEmpty {
+      fresh.append(.header(Self.journalGroup))
+      if !collapsed.contains(Self.journalGroup) { fresh += sorted(store.journalDays).map { .note($0) } }
+    }
     show(fresh)
+    updateStickyHeader()
     let empty = store.notes.isEmpty && filter.isEmpty
     emptyState.isHidden = !empty
     scroll.isHidden = empty
@@ -1983,9 +2098,138 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
   @objc private func newNote() { onNewNote?() }
 
+  /// `refs` (notes, or journal days) in the order chosen.
+  private func sorted(_ refs: [NoteRef]) -> [NoteRef] {
+    let store = NoteStore.shared
+    let byTitle: (NoteRef, NoteRef) -> Bool = { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    let sorted: [NoteRef] = switch sortKey {
+    case .edited: refs.sorted { (store.modified($0) ?? .distantPast) > (store.modified($1) ?? .distantPast) }
+    case .created: refs.sorted { (store.created($0) ?? .distantPast) > (store.created($1) ?? .distantPast) }
+    case .title: refs.sorted(by: byTitle)
+    case .length:
+      // (Counted once each.)
+      Dictionary(uniqueKeysWithValues: refs.map { ($0, store.wordCount(of: $0)) })
+        .sorted { $0.value != $1.value ? $0.value > $1.value : byTitle($0.key, $1.key) }.map(\.key)
+    }
+    return sortReversed ? sorted.reversed() : sorted
+  }
+
+  /// What a note's row shows on its right: what it's sorted by (its date
+  /// edited, sorted by title).
+  private func detail(of ref: NoteRef) -> String {
+    let store = NoteStore.shared
+    switch sortKey {
+    case .length:
+      let words = store.wordCount(of: ref)
+      return "\(words.formatted()) word\(words == 1 ? "" : "s")"
+    case .created: return store.created(ref).map { NoteCell.dateFormatter.string(from: $0) } ?? ""
+    case .edited, .title: return store.modified(ref).map { NoteCell.dateFormatter.string(from: $0) } ?? ""
+    }
+  }
+
+  /// The groups in the order chosen.
+  private func sortedGroups() -> [String] {
+    let store = NoteStore.shared
+    let byName = store.groups
+    var notes: [String: Int] = [:]
+    var edited: [String: Date] = [:]
+    if groupSortKey != .name {
+      for ref in store.notes {
+        guard let group = store.group(of: ref) else { continue }
+        notes[group, default: 0] += 1
+        // (store.notes is by date edited: the first is the last edited.)
+        if edited[group] == nil { edited[group] = store.modified(ref) }
+      }
+    }
+    // (Ties stay A to Z.)
+    let sorted: [String] = switch groupSortKey {
+    case .name: byName
+    case .edited: byName.enumerated().sorted {
+        let (a, b) = (edited[$0.element] ?? .distantPast, edited[$1.element] ?? .distantPast)
+        return a != b ? a > b : $0.offset < $1.offset
+      }.map(\.element)
+    case .count: byName.enumerated().sorted {
+        let (a, b) = (notes[$0.element] ?? 0, notes[$1.element] ?? 0)
+        return a != b ? a > b : $0.offset < $1.offset
+      }.map(\.element)
+    }
+    return groupSortReversed ? sorted.reversed() : sorted
+  }
+
+  @objc private func showSortMenu(_ sender: NSView) {
+    let menu = NSMenu()
+    let orders: (String, String) = switch sortKey {
+    case .title: ("A to Z", "Z to A")
+    case .length: ("Longest First", "Shortest First")
+    case .edited, .created: ("Newest First", "Oldest First")
+    }
+    addSortItems(to: menu, keys: [(SortKey.edited, "Date Edited"), (.created, "Date Created"), (.title, "Title"), (.length, "Length")],
+                 current: sortKey, reversed: sortReversed, orders: orders) { [weak self] key, reversed in
+      guard let self else { return }
+      self.sortKey = key
+      self.sortReversed = reversed
+      self.reloadSorted()
+    }
+    menu.addItem(.separator())
+    let groups = NSMenu()
+    let groupOrders: (String, String) = switch groupSortKey {
+    case .name: ("A to Z", "Z to A")
+    case .edited: ("Newest First", "Oldest First")
+    case .count: ("Most Notes First", "Fewest Notes First")
+    }
+    addSortItems(to: groups, keys: [(GroupSortKey.name, "Name"), (.edited, "Date Edited"), (.count, "Number of Notes")],
+                 current: groupSortKey, reversed: groupSortReversed, orders: groupOrders) { [weak self] key, reversed in
+      guard let self else { return }
+      self.groupSortKey = key
+      self.groupSortReversed = reversed
+      self.reloadSorted()
+    }
+    let groupsItem = NSMenuItem(title: "Sort Groups", action: nil, keyEquivalent: "")
+    groupsItem.submenu = groups
+    menu.addItem(groupsItem)
+    menu.addItem(.separator())
+    let journal = ClosureMenuItem(title: "Show Journal Notes") { [weak self] in
+      guard let self else { return }
+      self.showsJournal.toggle()
+      self.reload()
+    }
+    journal.state = showsJournal ? .on : .off
+    menu.addItem(journal)
+    menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 4), in: sender)
+  }
+
+  /// A sort menu's choices: what to sort by, then which way (`orders`: its
+  /// own way, then reversed). Sorting by something else starts its own way.
+  private func addSortItems<Key: Equatable>(to menu: NSMenu, keys: [(Key, String)], current: Key, reversed: Bool,
+                                            orders: (String, String), choose: @escaping (Key, Bool) -> Void) {
+    for (key, title) in keys {
+      let item = ClosureMenuItem(title: title) { if key != current { choose(key, false) } }
+      item.state = key == current ? .on : .off
+      menu.addItem(item)
+    }
+    menu.addItem(.separator())
+    for (isReversed, title) in [(false, orders.0), (true, orders.1)] {
+      let item = ClosureMenuItem(title: title) { if isReversed != reversed { choose(current, isReversed) } }
+      item.state = isReversed == reversed ? .on : .off
+      menu.addItem(item)
+    }
+  }
+
+  /// The rows move to their new places; what they show on their right may
+  /// change too.
+  private func reloadSorted() {
+    reload()
+    tableView.enumerateAvailableRowViews { _, row in
+      guard items.indices.contains(row), case .note(let ref) = items[row],
+            let cell = tableView.view(atColumn: 0, row: row, makeIfNecessary: false) as? NoteCell else { return }
+      cell.configure(title: ref.kind == .journal ? ref.displayTitle : ref.name, excerpt: NoteStore.shared.excerpt(of: ref),
+                     detail: detail(of: ref))
+    }
+  }
+
   @objc private func trashChecked() {
     // In the list's order.
-    onDelete?(NoteStore.shared.notes.filter { checkedNotes.contains($0) })
+    onDelete?((NoteStore.shared.notes + NoteStore.shared.journalDays).filter { checkedNotes.contains($0) })
   }
 
   /// Brings the trash button in (or out) where it ends up, at the end: it
@@ -2027,7 +2271,14 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     guard items.indices.contains(row) else { return }
     switch items[row] {
     case .note(let ref): navigator?.openNote(ref)
-    case .header(let group): toggleGroup(group)
+    case .header(let group):
+      // Held at the top: it stays there, its notes folding under it (or
+      // unfolding from it).
+      if let sticky = tableView.stickyRow, sticky.row == row {
+        heldHeader = (.header(group), sticky.frame.minY - scroll.contentView.bounds.minY)
+      }
+      toggleGroup(group)
+      heldHeader = nil
     case .placeholder: break
     }
   }
@@ -2035,6 +2286,14 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// Export, Move to Group and Move to Trash for `ref`.
   private func addNoteItems(for ref: NoteRef, to menu: NSMenu) {
     menu.addItem(ClosureMenuItem(title: "Export as Markdown…") { [weak self] in self?.onExport?(ref) })
+    // (Journal days go in no group.)
+    if ref.kind == .note { addGroupMenu(for: ref, to: menu) }
+    menu.addItem(.separator())
+    menu.addItem(ClosureMenuItem(title: "Move to Trash…") { [weak self] in self?.onDelete?([ref]) })
+  }
+
+  /// Move to Group › each group, New Group, Remove from Group.
+  private func addGroupMenu(for ref: NoteRef, to menu: NSMenu) {
     let groups = NSMenu()
     let current = NoteStore.shared.group(of: ref)
     for group in NoteStore.shared.groups {
@@ -2053,8 +2312,6 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     let groupsItem = NSMenuItem(title: "Move to Group", action: nil, keyEquivalent: "")
     groupsItem.submenu = groups
     menu.addItem(groupsItem)
-    menu.addItem(.separator())
-    menu.addItem(ClosureMenuItem(title: "Move to Trash…") { [weak self] in self?.onDelete?([ref]) })
   }
 
   /// Rename and Delete for `group`.
@@ -2196,6 +2453,43 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   }
 
   private var noteDrag: NoteDrag?
+  /// The grouped note a dragged one is held over, and (once held there long
+  /// enough) the one it would make a new group with.
+  private var dwellingOn: NoteRef?
+  private var dwelled: NoteRef?
+  private var dwellTimer: Timer?
+  private static let dwellDelay: TimeInterval = 0.6
+
+  /// Follows the note the pointer is over (a grouped one, not between rows):
+  /// held there a moment, it offers to make a group.
+  private func trackDwell(row: Int, operation: NSTableView.DropOperation, dragging ref: NoteRef) {
+    var over: NoteRef?
+    if operation == .on, items.indices.contains(row), case .note(let other) = items[row], other != ref,
+       NoteStore.shared.group(of: other) != nil {
+      over = other
+    }
+    guard over != dwellingOn else { return }
+    dwellingOn = over
+    dwelled = nil
+    dwellTimer?.invalidate()
+    dwellTimer = nil
+    guard let over else { return }
+    // (Fires while the drag tracks the mouse, too.)
+    let timer = Timer(timeInterval: Self.dwellDelay, repeats: false) { [weak self] _ in
+      guard let self, self.noteDrag != nil, self.dwellingOn == over else { return }
+      self.dwelled = over
+      self.setDropTarget(.newGroup(with: over))
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    dwellTimer = timer
+  }
+
+  private func endDwell() {
+    dwellTimer?.invalidate()
+    dwellTimer = nil
+    dwellingOn = nil
+    dwelled = nil
+  }
 
   private func canLift(_ row: Int) -> Bool {
     guard filter.isEmpty, renaming == nil, noteDrag == nil, items.indices.contains(row), case .note = items[row] else { return false }
@@ -2209,7 +2503,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     let side = max(0, rowInset - 36)
     let rect = NSRect(x: side, y: rowView.frame.minY, width: rowView.frame.width - 2 * side, height: rowView.frame.height)
     let picture = rowView.picture(of: NSRect(x: side, y: 0, width: rect.width, height: rect.height))
-    let blank = SlideOverlayView(frame: rect)
+    // (Clear of the neighbors' drop washes, which reach a little past their rows.)
+    let blank = SlideOverlayView(frame: rect.insetBy(dx: 0, dy: 4))
     blank.wantsLayer = true
     blank.layer?.backgroundColor = resolvedCGColor(Theme.background)
     blank.layer?.zPosition = 2
@@ -2253,6 +2548,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     guard let drag = noteDrag else { return }
     drag.preview.setFrameOrigin(NSPoint(x: drag.preview.frame.minX, y: point.y - drag.grab))
     let (row, operation) = dropPosition(at: point)
+    trackDwell(row: row, operation: operation, dragging: drag.ref)
     setDropTarget(target(for: drag.ref, row: row, operation: operation))
   }
 
@@ -2260,6 +2556,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// note's top and bottom quarters; without groups, notes are only dropped
   /// on).
   private func dropPosition(at point: NSPoint) -> (row: Int, operation: NSTableView.DropOperation) {
+    if let sticky = tableView.stickyRow, sticky.frame.contains(point) { return (sticky.row, .on) }
     let row = tableView.row(at: point)
     guard row >= 0 else { return (point.y < 0 ? 0 : items.count, .above) }
     guard case .note = items[row], !NoteStore.shared.groups.isEmpty else { return (row, .on) }
@@ -2276,19 +2573,22 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     guard let drag = noteDrag else { return }
     noteDrag = nil
     let target = drop ? dropTarget : nil
+    endDwell()
     setDropTarget(nil)
+    // Where it lands (a journal day lands as the note it becomes).
+    var landed = drag.ref
     if let target {
       // (What moves slides; its old place is taken by what follows.)
       drag.blank.removeFromSuperview()
       pendingReload = false
-      perform(target, with: drag.ref)
+      landed = perform(target, with: drag.ref)
     } else if pendingReload {
       pendingReload = false
       reload()
     }
     var destination: NSPoint?
     var landing: NSView?
-    if let row = items.firstIndex(of: .note(drag.ref)) {
+    if let row = items.firstIndex(of: .note(landed)) {
       let rect = tableView.rect(ofRow: row)
       destination = NSPoint(x: drag.preview.frame.minX, y: rect.minY)
       // Its row shows when the copy gets there.
@@ -2339,15 +2639,20 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   private func target(for ref: NoteRef, row: Int, operation: NSTableView.DropOperation) -> DropTarget? {
     guard filter.isEmpty else { return nil }
     let store = NoteStore.shared
-    let from = store.group(of: ref)
+    // (A journal day comes out of the journal, into any group or none.)
+    let from = ref.kind == .journal ? Self.journalGroup : store.group(of: ref)
     if operation == .on, items.indices.contains(row) {
       switch items[row] {
       case .note(let other):
         guard other != ref else { return nil }
-        guard let group = store.group(of: other) else { return .newGroup(with: other) }
+        // On a journal day: the two make a group (the day leaving the journal).
+        if other.kind == .journal { return .newGroup(with: other) }
+        // A note in a group takes the dragged one in its group, unless held
+        // over a moment: then the two make a new one.
+        guard let group = store.group(of: other), other != dwelled else { return .newGroup(with: other) }
         return group != from ? .group(group) : nil
       case .header(let group), .placeholder(let group):
-        return group != from ? .group(group) : nil
+        return group != from && group != Self.journalGroup ? .group(group) : nil
       }
     }
     // Between rows: the group of the row above (below the last, the notes
@@ -2355,23 +2660,54 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     guard !store.groups.isEmpty, row > 0, row <= items.count else { return nil }
     let group: String?
     switch items[row - 1] {
-    case .note(let other): group = store.group(of: other)
+    case .note(let other):
+      guard other.kind == .note else { return nil }
+      group = store.group(of: other)
     case .header(let g), .placeholder(let g): group = g
     }
-    return group != from ? .group(group) : nil
+    return group != from && group != Self.journalGroup ? .group(group) : nil
   }
 
-  private func perform(_ target: DropTarget, with ref: NoteRef) {
-    switch target {
-    case .newGroup(let other): makeGroup(with: [other, ref])
-    case .group(let group): move([ref], to: group)
+  /// Drops `ref` there; what it is now (a journal day is a note now).
+  @discardableResult
+  private func perform(_ target: DropTarget, with ref: NoteRef) -> NoteRef {
+    // Journal days (dragged, or dropped on) leave the journal first. (The
+    // list changes once, as the drop's move or new group shows it.)
+    var refs = [ref]
+    if case .newGroup(let other) = target { refs.append(other) }
+    batching = true
+    let notes = refs.map { $0.kind == .journal ? takeOutOfJournal($0) : $0 }
+    batching = false
+    guard let note = notes[0], notes.allSatisfy({ $0 != nil }) else {
+      reload()
+      NSSound.beep()
+      return ref
     }
+    switch target {
+    case .newGroup: makeGroup(with: [notes[1]!, note])
+    case .group(let group): move([note], to: group)
+    }
+    return note
+  }
+
+  /// A journal day dropped among the notes becomes one (Undo puts it back,
+  /// with what the drop did after).
+  private func takeOutOfJournal(_ day: NoteRef) -> NoteRef? {
+    guard let note = NoteStore.shared.makeNote(fromJournalDay: day) else { return nil }
+    window?.undoManager?.registerUndo(withTarget: self) { list in list.putBackInJournal(note, as: day) }
+    return note
+  }
+
+  private func putBackInJournal(_ note: NoteRef, as day: NoteRef) {
+    guard NoteStore.shared.returnToJournal(note, as: day) else { return NSSound.beep() }
+    window?.undoManager?.registerUndo(withTarget: self) { list in _ = list.takeOutOfJournal(day) }
   }
 
   /// For automated checks: drops the note named `name` at `row`, on it or
   /// above it, as if dragged there.
   func debugDrop(_ name: String, row: Int, on: Bool) {
-    let ref = NoteRef(kind: .note, name: name)
+    // (A journal day by its date: "2026-10-30".)
+    let ref = NoteStore.shared.resolve(linkName: name) ?? NoteRef(kind: .note, name: name)
     guard NoteStore.shared.exists(ref), let target = target(for: ref, row: row, operation: on ? .on : .above) else { return }
     perform(target, with: ref)
   }
@@ -2380,6 +2716,26 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   /// none), or deletes it.
   func debugToggleGroup(_ name: String) { toggleGroup(name.isEmpty ? nil : name) }
   func debugDeleteGroup(_ name: String) { deleteGroup(name) }
+  /// For automated checks: shows or hides the journal's days, as the sort
+  /// menu would.
+  func debugShowJournal(_ shown: Bool) {
+    showsJournal = shown
+    reload()
+  }
+  /// For automated checks: sorts the groups as the sort menu would.
+  func debugSortGroups(_ key: String, reversed: Bool) {
+    guard let key = GroupSortKey(rawValue: key) else { return }
+    groupSortKey = key
+    groupSortReversed = reversed
+    reloadSorted()
+  }
+  /// For automated checks: sorts the notes as the sort menu would.
+  func debugSort(_ key: String, reversed: Bool) {
+    guard let key = SortKey(rawValue: key) else { return }
+    sortKey = key
+    sortReversed = reversed
+    reloadSorted()
+  }
   func debugScroll(to y: CGFloat) {
     scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
     scroll.reflectScrolledClipView(scroll.contentView)
@@ -2409,14 +2765,40 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     dropTarget = target
     guard let target, let rows = rows(of: target) else {
       dropHighlight.hide()
+      updateStickyWash()
       return
     }
+    defer { updateStickyWash() }
     // As much room above the first row's text as below the last one's.
-    let pad: CGFloat = 12
+    let pad = Self.dropPad
     let top = (textBounds(ofRow: rows.lowerBound)?.minY).map { $0 - pad } ?? tableView.rect(ofRow: rows.lowerBound).minY + 1
     let bottom = (textBounds(ofRow: rows.upperBound)?.maxY).map { $0 + pad } ?? tableView.rect(ofRow: rows.upperBound).maxY - 1
     let frame = NSRect(x: rowInset + 4, y: top, width: tableView.bounds.width - 2 * (rowInset + 4), height: bottom - top)
     dropHighlight.show(in: frame)
+  }
+
+  /// Room around the text of what a drop wash covers.
+  private static let dropPad: CGFloat = 12
+
+  /// The drop wash over a group shows on its header held at the top too,
+  /// as it would on the header itself.
+  private func updateStickyWash() {
+    guard !stickyHeader.isHidden, case .group(let group)? = dropTarget, group == stickyHeader.group else {
+      stickyHeader.wash = nil
+      return
+    }
+    let cell = stickyHeader.cell
+    stickyHeader.layoutSubtreeIfNeeded()
+    let texts = cell.subviews.filter { $0 is NSTextField && !$0.isHidden && !($0 as! NSTextField).stringValue.isEmpty }
+    let text = texts.map { stickyHeader.convert($0.frame, from: cell) }.reduce(NSRect.null) { $0.union($1) }
+    guard !text.isNull else {
+      stickyHeader.wash = nil
+      return
+    }
+    // (Down past its bottom: the wash goes on, on the list.)
+    let top = text.minY - Self.dropPad
+    stickyHeader.wash = NSRect(x: rowInset + 4, y: top, width: stickyHeader.bounds.width - 2 * (rowInset + 4),
+                               height: stickyHeader.bounds.height - top + 20)
   }
 
   /// Where a row's text is (in the table), if it's showing.
@@ -2438,10 +2820,12 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
   private func show(_ fresh: [NotesListItem]) {
     let animated = window?.isVisible == true && !isHidden && !Motion.reduceMotion && !items.isEmpty && fresh != items
     endSlide()
+    heldDuringSlide = animated ? heldHeader.flatMap { if case .header(let group) = $0.item { group } else { nil } } : nil
     defer { updateToc() }
     guard animated else {
       items = fresh
       tableView.reloadData()
+      scrollToHeldHeader()
       return
     }
     let clip = scroll.contentView
@@ -2450,6 +2834,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     let renamed = renamedItems
     var oldTops: [NotesListItem: CGFloat] = [:]
     for (row, item) in items.enumerated() { oldTops[renamed[item] ?? item] = tableView.rect(ofRow: row).minY - oldOrigin }
+    // (A header held at the top was where its copy showed.)
+    if let held = heldHeader { oldTops[held.item] = held.top }
     var pictures: [(item: NotesListItem, frame: NSRect, image: NSImage)] = []
     let before = tableView.rows(in: tableView.visibleRect)
     for row in before.lowerBound..<before.upperBound {
@@ -2461,6 +2847,8 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     items = fresh
     tableView.reloadData()
     tableView.layoutSubtreeIfNeeded()
+    // (Before the rows slide: they slide to where they show then.)
+    scrollToHeldHeader()
 
     let newOrigin = clip.bounds.minY
     let background = resolvedCGColor(Theme.background)
@@ -2477,7 +2865,9 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       }
       if let old = oldTops[item] {
         let offset = old - (rowView.frame.minY - newOrigin)
-        guard abs(offset) > 0.5 else { continue }
+        // (A header held at the top stays over the rows going under it, as
+        // its copy was.)
+        guard abs(offset) > 0.5 || item == heldHeader?.item else { continue }
         slideLayer(layer, by: offset)
         layer.zPosition = 1
         layer.backgroundColor = background
@@ -2530,7 +2920,27 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     DispatchQueue.main.asyncAfter(deadline: .now() + Motion.foldDuration + 0.05) { [weak self] in
       guard let self, self.slideGeneration == generation else { return }
       self.endSlide()
+      if self.heldDuringSlide != nil {
+        self.heldDuringSlide = nil
+        self.updateStickyHeader()
+      }
     }
+  }
+
+  /// A header held at the top of the list as the list changes: where it
+  /// shows (from the top), and the list scrolls to keep it at the top.
+  private var heldHeader: (item: NotesListItem, top: CGFloat)?
+  /// The group whose header was held as the list changed: its copy stays
+  /// at the top (with the fade below it) until the rows have slid.
+  private var heldDuringSlide: String??
+
+  /// Scrolls so the held header is at the top (as far as the list goes).
+  private func scrollToHeldHeader() {
+    guard let held = heldHeader, let row = items.firstIndex(of: held.item) else { return }
+    let clip = scroll.contentView
+    let maxY = max(0, tableView.frame.height + scroll.contentInsets.bottom - clip.bounds.height)
+    clip.setBoundsOrigin(NSPoint(x: 0, y: min(tableView.rect(ofRow: row).minY, maxY)))
+    scroll.reflectScrolledClipView(clip)
   }
 
   /// Pictures over the list and rows sliding, put back at the end.
@@ -2594,11 +3004,26 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     if case .note = items[row] { true } else { false }
   }
 
+  /// A group's header: its name, how many notes it has, and its ⋮ menu.
+  private func configure(_ cell: GroupHeaderCell, for group: String?) {
+    let count = group == Self.journalGroup ? NoteStore.shared.journalDays.count
+      : NoteStore.shared.notes.filter { NoteStore.shared.group(of: $0) == group }.count
+    // (The journal's can't be renamed or deleted.)
+    cell.configure(name: Self.title(of: group), count: count, hasMenu: group != nil && group != Self.journalGroup)
+    cell.onMore = { [weak self] button in
+      guard let self, let group else { return }
+      let menu = NSMenu()
+      self.addGroupItems(for: group, to: menu)
+      menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    }
+  }
+
   func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
     switch items[row] {
     case .note(let ref):
       let cell = (tableView.makeView(withIdentifier: NoteCell.identifier, owner: self) as? NoteCell) ?? NoteCell()
-      cell.configure(title: ref.name, excerpt: NoteStore.shared.excerpt(of: ref), date: NoteStore.shared.modified(ref))
+      cell.configure(title: ref.kind == .journal ? ref.displayTitle : ref.name, excerpt: NoteStore.shared.excerpt(of: ref),
+                     detail: detail(of: ref))
       cell.onMore = { [weak self] button in
         guard let self else { return }
         let menu = NSMenu()
@@ -2608,14 +3033,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       return cell
     case .header(let group):
       let cell = (tableView.makeView(withIdentifier: GroupHeaderCell.identifier, owner: self) as? GroupHeaderCell) ?? GroupHeaderCell()
-      let count = NoteStore.shared.notes.filter { NoteStore.shared.group(of: $0) == group }.count
-      cell.configure(name: group ?? Self.ungroupedTitle, count: count, hasMenu: group != nil)
-      cell.onMore = { [weak self] button in
-        guard let self, let group else { return }
-        let menu = NSMenu()
-        self.addGroupItems(for: group, to: menu)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
-      }
+      configure(cell, for: group)
       cell.onRename = { [weak self] name in
         guard let group else { return }
         self?.finishRenaming(group, to: name)
@@ -2633,6 +3051,7 @@ final class NotesListView: NSView, NSTableViewDataSource, NSTableViewDelegate, N
       let rowView = NoteRowView()
       rowView.inset = rowInset
       rowView.isChecked = checkedNotes.contains(ref)
+      rowView.isUnread = NoteStore.shared.isUnread(ref)
       rowView.onCheck = { [weak self] checked in
         if checked { self?.checkedNotes.insert(ref) } else { self?.checkedNotes.remove(ref) }
       }
@@ -2710,6 +3129,10 @@ private final class NotesTableView: NSTableView {
   var onDragMove: ((NSPoint) -> Void)?
   var onDragEnd: ((Bool) -> Void)?
 
+  /// The header held over the top of the list (see `updateStickyHeader`):
+  /// its group's header row, and where it shows (in the table).
+  var stickyRow: (row: Int, frame: NSRect)?
+
   /// The row under `point` as it shows: rows sliding into place are where
   /// they are on screen, not where they're going.
   private func rowShown(at point: NSPoint) -> Int {
@@ -2728,7 +3151,9 @@ private final class NotesTableView: NSTableView {
   private func isOnSurface(_ point: NSPoint, row: Int) -> Bool {
     guard row >= 0, let rowView = rowView(atRow: row, makeIfNecessary: false) as? RoundedRowView else { return row >= 0 }
     let inset = rowView.inset + 4
-    return point.x >= rowView.frame.minX + inset && point.x <= rowView.frame.maxX - inset
+    // A group's chevron, out in the gutter, folds it too.
+    let leading = (rowView as? GroupRowView)?.chevronMinX ?? inset
+    return point.x >= rowView.frame.minX + leading && point.x <= rowView.frame.maxX - inset
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -2742,6 +3167,7 @@ private final class NotesTableView: NSTableView {
     // The gutters neither open nor drag a note.
     guard isOnSurface(start, row: row) else { return }
     var lifted = false
+    defer { stopAutoscroll() }
     while let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp, .keyDown]) {
       switch next.type {
       case .leftMouseDragged:
@@ -2749,9 +3175,9 @@ private final class NotesTableView: NSTableView {
         if !lifted, hypot(point.x - start.x, point.y - start.y) > 4, canLift?(row) == true {
           lifted = true
           onLift?(row, start)
+          startAutoscroll()
         }
         guard lifted else { continue }
-        autoscroll(with: next)
         onDragMove?(convert(next.locationInWindow, from: nil))
       case .keyDown where next.keyCode == 53:  // Escape
         if lifted {
@@ -2765,6 +3191,62 @@ private final class NotesTableView: NSTableView {
         break
       }
     }
+  }
+
+  // MARK: Autoscroll
+
+  /// How close to the list's top or bottom edge a dragged note starts
+  /// scrolling it, and the fastest it scrolls (points per second), as in a
+  /// note.
+  private static let autoscrollZone: CGFloat = 56
+  private static let autoscrollSpeed: CGFloat = 1400
+  private var autoscrollTimer: Timer?
+
+  private func startAutoscroll() {
+    stopAutoscroll()
+    var last = CACurrentMediaTime()
+    // (Fires while the drag tracks the mouse, too.)
+    let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { [weak self] _ in
+      MainActor.assumeIsolated {
+        let now = CACurrentMediaTime()
+        self?.autoscrollStep(min(now - last, 0.05))
+        last = now
+      }
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    autoscrollTimer = timer
+  }
+
+  private func stopAutoscroll() {
+    autoscrollTimer?.invalidate()
+    autoscrollTimer = nil
+  }
+
+  /// The list scrolls while a dragged note is near or past its edges, faster
+  /// the closer it gets, even when the pointer holds still; the note follows.
+  private func autoscrollStep(_ elapsed: CFTimeInterval) {
+    guard let window, let scrollView = enclosingScrollView else { return }
+    let clip = scrollView.contentView
+    let pointer = window.mouseLocationOutsideOfEventStream
+    let inClip = clip.convert(pointer, from: nil)
+    let visible = clip.bounds
+    let zone = min(Self.autoscrollZone, visible.height / 4)
+    // Flipped: minY is the top edge.
+    var pull: CGFloat = 0
+    if inClip.y < visible.minY + zone {
+      pull = -min(1, (visible.minY + zone - inClip.y) / zone)
+    } else if inClip.y > visible.maxY - zone {
+      pull = min(1, (inClip.y - (visible.maxY - zone)) / zone)
+    }
+    guard pull != 0 else { return }
+    let maxY = max(0, frame.height + scrollView.contentInsets.bottom - visible.height)
+    let step = pull * abs(pull) * Self.autoscrollSpeed * CGFloat(elapsed)
+    let y = min(max(0, visible.minY + step), maxY)
+    guard abs(y - visible.minY) > 0.01 else { return }
+    clip.scroll(to: NSPoint(x: visible.minX, y: y))
+    scrollView.reflectScrolledClipView(clip)
+    // The list moved under a still pointer: the note follows it.
+    onDragMove?(convert(pointer, from: nil))
   }
 
   /// Without NSTableView's own handling, which outlines the clicked row.
@@ -2975,7 +3457,7 @@ private final class NoteCell: NSTableCellView {
   /// ⋮: the note's menu (export, move to the Trash).
   private let moreButton = IconButton(symbol: "ellipsis", size: 13, tooltip: "More", target: nil, action: nil)
   var onMore: ((NSView) -> Void)?
-  private static let dateFormatter: DateFormatter = {
+  static let dateFormatter: DateFormatter = {
     let f = DateFormatter()
     f.dateStyle = .medium
     f.doesRelativeDateFormatting = true
@@ -3029,10 +3511,10 @@ private final class NoteCell: NSTableCellView {
 
   required init?(coder: NSCoder) { fatalError() }
 
-  func configure(title: String, excerpt: String, date: Date?) {
+  func configure(title: String, excerpt: String, detail: String) {
     titleLabel.stringValue = title
     excerptLabel.stringValue = excerpt.isEmpty ? "Empty note" : excerpt
-    dateLabel.stringValue = date.map { NoteCell.dateFormatter.string(from: $0) } ?? ""
+    dateLabel.stringValue = detail
   }
 }
 
@@ -3063,14 +3545,71 @@ class RoundedRowView: NSTableRowView {
   }
 }
 
-/// A note's row, with a checkbox in the gutter on its left to check the
-/// note: it comes in while the row is hovered, and stays while checked.
-private final class NoteRowView: RoundedRowView {
-  private let checkbox = SelectionCheckbox()
+/// A row that knows whether the pointer is over it (over `hoverRect`).
+private class HoverRowView: RoundedRowView {
   private var tracking: NSTrackingArea?
-  private var hovering = false {
-    didSet { if hovering != oldValue { updateCheckbox(animated: true) } }
+  private(set) var hovering = false {
+    didSet { if hovering != oldValue { hoverChanged() } }
   }
+
+  /// Where the row counts as hovered, in its own coordinates.
+  var hoverRect: NSRect { bounds }
+
+  func hoverChanged() {}
+
+  override func updateTrackingAreas() {
+    super.updateTrackingAreas()
+    if let tracking { removeTrackingArea(tracking) }
+    let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeInActiveApp, .inVisibleRect],
+                              owner: self)
+    addTrackingArea(area)
+    tracking = area
+  }
+
+  override func mouseEntered(with event: NSEvent) { track(event) }
+  override func mouseMoved(with event: NSEvent) { track(event) }
+  override func mouseExited(with event: NSEvent) { hovering = false }
+
+  private func track(_ event: NSEvent) {
+    hovering = hoverRect.contains(convert(event.locationInWindow, from: nil))
+  }
+
+  override func viewDidMoveToWindow() {
+    super.viewDidMoveToWindow()
+    NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
+    if let clip = enclosingScrollView?.contentView {
+      NotificationCenter.default.addObserver(self, selector: #selector(listScrolled), name: NSView.boundsDidChangeNotification, object: clip)
+    }
+  }
+
+  /// Rows that move (a group folding above them) check the pointer too.
+  override func setFrameOrigin(_ newOrigin: NSPoint) {
+    let moved = newOrigin != frame.origin
+    super.setFrameOrigin(newOrigin)
+    if moved, window != nil { listScrolled() }
+  }
+
+  /// Scrolling sends no enter or exit events: rows moving away from a still
+  /// pointer lose their hover (and those moving under it gain it).
+  private var syncPending = false
+  @objc private func listScrolled() {
+    guard !syncPending else { return }
+    syncPending = true
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.syncPending = false
+      guard let window = self.window, !self.isHiddenOrHasHiddenAncestor else { return self.hovering = false }
+      self.hovering = window.isKeyWindow && self.hoverRect.contains(self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
+    }
+  }
+}
+
+/// A note's row, with a checkbox in the gutter on its left to check the
+/// note: it comes in while the row is hovered, and stays while checked. A
+/// note changed while it wasn't open has a dot there instead, otherwise.
+private final class NoteRowView: HoverRowView {
+  private let checkbox = SelectionCheckbox()
+  private let dot = UnreadDot()
   var onCheck: ((Bool) -> Void)?
   var isChecked: Bool {
     get { checkbox.isChecked }
@@ -3079,9 +3618,13 @@ private final class NoteRowView: RoundedRowView {
       updateCheckbox(animated: false)
     }
   }
+  var isUnread = false {
+    didSet { updateCheckbox(animated: false) }
+  }
 
   override init(frame frameRect: NSRect) {
     super.init(frame: frameRect)
+    addSubview(dot)
     addSubview(checkbox)
     checkbox.onToggle = { [weak self] in
       guard let self else { return }
@@ -3096,7 +3639,10 @@ private final class NoteRowView: RoundedRowView {
   /// later), so its click area wins where they overlap.
   override func didAddSubview(_ subview: NSView) {
     super.didAddSubview(subview)
-    if subview !== checkbox { addSubview(checkbox, positioned: .above, relativeTo: nil) }
+    if subview !== checkbox && subview !== dot {
+      addSubview(dot, positioned: .above, relativeTo: nil)
+      addSubview(checkbox, positioned: .above, relativeTo: nil)
+    }
   }
 
   override func layout() {
@@ -3106,49 +3652,29 @@ private final class NoteRowView: RoundedRowView {
     let size = SelectionCheckbox.hitSize
     let center = max(4 + SelectionCheckbox.boxSize / 2, inset - 12)
     checkbox.frame = NSRect(x: (center - size / 2).rounded(), y: ((bounds.height - size) / 2).rounded(), width: size, height: size)
+    let dotSize = UnreadDot.size
+    dot.frame = NSRect(x: (center - dotSize / 2).rounded(), y: ((bounds.height - dotSize) / 2).rounded(), width: dotSize, height: dotSize)
   }
 
-  override func updateTrackingAreas() {
-    super.updateTrackingAreas()
-    if let tracking { removeTrackingArea(tracking) }
-    let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect], owner: self)
-    addTrackingArea(area)
-    tracking = area
-  }
+  override func hoverChanged() { updateCheckbox(animated: true) }
 
-  override func mouseEntered(with event: NSEvent) { hovering = true }
-  override func mouseExited(with event: NSEvent) { hovering = false }
-
-  override func viewDidMoveToWindow() {
-    super.viewDidMoveToWindow()
-    NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: nil)
-    if let clip = enclosingScrollView?.contentView {
-      NotificationCenter.default.addObserver(self, selector: #selector(listScrolled), name: NSView.boundsDidChangeNotification, object: clip)
-    }
-  }
-
-  /// Scrolling sends no enter or exit events: rows moving away from a still
-  /// pointer lose their hover (and those moving under it gain it).
-  private var syncPending = false
-  @objc private func listScrolled() {
-    guard !syncPending else { return }
-    syncPending = true
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
-      self.syncPending = false
-      guard let window = self.window, !self.isHiddenOrHasHiddenAncestor else { return self.hovering = false }
-      self.hovering = window.isKeyWindow && self.bounds.contains(self.convert(window.mouseLocationOutsideOfEventStream, from: nil))
-    }
-  }
+  private var dotShown = false
 
   private func updateCheckbox(animated: Bool) {
-    checkbox.setShown(hovering || checkbox.isChecked, animated: animated)
+    let showsCheckbox = hovering || checkbox.isChecked
+    checkbox.setShown(showsCheckbox, animated: animated)
+    let showsDot = isUnread && !showsCheckbox
+    guard showsDot != dotShown else { return }
+    dotShown = showsDot
+    dot.pop(in: showsDot, animated: animated)
   }
 }
 
 /// A group's header row: a chevron in the gutter (where notes have their
-/// checkbox), turned down while the group is open.
-private final class GroupRowView: RoundedRowView {
+/// checkbox), turned down while the group is open. A click anywhere on it,
+/// chevron included, folds it; hovered, the chevron brightens like a
+/// heading's in a note.
+private final class GroupRowView: HoverRowView {
   static let height: CGFloat = 50
   /// How far below the row's middle its content sits (room above it, from
   /// the group before).
@@ -3179,10 +3705,166 @@ private final class GroupRowView: RoundedRowView {
     chevron.frame = NSRect(x: (center - size / 2).rounded(), y: ((bounds.height - size) / 2 + Self.drop).rounded(), width: size, height: size)
   }
 
+  /// Where the chevron starts, from the row's left edge.
+  var chevronMinX: CGFloat { min(chevron.frame.minX, inset + 4) }
+
+  override var hoverRect: NSRect {
+    NSRect(x: chevronMinX, y: 0, width: bounds.width - inset - 4 - chevronMinX, height: bounds.height)
+  }
+
+  override func hoverChanged() { chevron.isHovered = hovering }
+
   /// Turns the chevron from where it was to where it is.
   func turnChevron() { chevron.turn(fromOpen: isCollapsed) }
 
   override func drawSelection(in dirtyRect: NSRect) {}
+}
+
+/// The page's background fading out downward, eased like the list's top
+/// fade, as strong as `strength` at the top: laid over what should fade.
+private final class TopFadeCover: NSView {
+  var strength: CGFloat = 0 {
+    didSet { if strength != oldValue { needsDisplay = true } }
+  }
+
+  override var isFlipped: Bool { true }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+  override func draw(_ dirtyRect: NSRect) {
+    guard strength > 0 else { return }
+    // (The list's content shows as much as 1 - strength at the top, all of
+    // it at the bottom: the cover hides the rest.)
+    let steps = 8
+    let colors = (0...steps).map { i -> NSColor in
+      let t = CGFloat(i) / CGFloat(steps)
+      return Theme.background.withAlphaComponent(strength * (1 - t * t * (3 - 2 * t)))
+    }
+    let locations = (0...steps).map { CGFloat($0) / CGFloat(steps) }
+    NSGradient(colors: colors, atLocations: locations, colorSpace: .sRGB)?.draw(in: bounds, angle: 90)
+  }
+}
+
+private extension NSColor {
+  /// `color` laid over the opaque `background`, as one opaque color.
+  convenience init(sRGB background: NSColor, under color: NSColor) {
+    let top = color.usingColorSpace(.sRGB) ?? color
+    let a = top.alphaComponent
+    self.init(srgbRed: top.redComponent * a + background.redComponent * (1 - a),
+              green: top.greenComponent * a + background.greenComponent * (1 - a),
+              blue: top.blueComponent * a + background.blueComponent * (1 - a), alpha: 1)
+  }
+}
+
+/// A copy of a group's header, held over the top of the list: opaque, over
+/// the notes scrolling under it, which fade in below it. A click folds the
+/// group, as on the header itself; scrolling over it scrolls the list.
+private final class StickyHeaderView: NSView {
+  /// As tall as the list's own fade under its top edge.
+  static let fade = NotesListView.topFadeHeight
+  let row = GroupRowView()
+  let cell = GroupHeaderCell()
+  /// Over the header: the background fading in down to it, as the list's
+  /// content fades under its top edge (see `updateTopFade`).
+  private let topCover = TopFadeCover()
+  /// How strong that fade is (0 to 1), as the list's.
+  var topFadeStrength: CGFloat {
+    get { topCover.strength }
+    set { topCover.strength = newValue }
+  }
+  var group: String?
+  weak var scrollView: NSScrollView?
+  var onClick: (() -> Void)?
+  var menuForHeader: (() -> NSMenu?)?
+  /// Where a dragged note's drop wash shows on it (its group is where the
+  /// note would go), or nil.
+  var wash: NSRect? {
+    didSet { if wash != oldValue { needsDisplay = true } }
+  }
+  /// How far the next header has pushed it up (0 or less).
+  var push: CGFloat = 0 {
+    didSet {
+      guard push != oldValue else { return }
+      needsLayout = true
+      needsDisplay = true
+    }
+  }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    layer?.masksToBounds = true
+    row.addSubview(cell)
+    addSubview(row)
+    addSubview(topCover)
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  /// The fade below takes no clicks: they go to the notes under it (and
+  /// a pushed header's part above it is gone).
+  override func hitTest(_ point: NSPoint) -> NSView? {
+    guard let superview, case let local = convert(point, from: superview), bounds.contains(local), row.frame.contains(local) else {
+      return nil
+    }
+    return super.hitTest(point)
+  }
+
+  override func mouseDown(with event: NSEvent) {}
+  override func mouseUp(with event: NSEvent) {
+    if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+  }
+  override func menu(for event: NSEvent) -> NSMenu? { menuForHeader?() }
+  override func scrollWheel(with event: NSEvent) { scrollView?.scrollWheel(with: event) }
+
+  override var isFlipped: Bool { true }
+
+  override func layout() {
+    super.layout()
+    row.frame = NSRect(x: 0, y: push, width: bounds.width, height: bounds.height - Self.fade)
+    topCover.frame = NSRect(x: 0, y: 0, width: bounds.width, height: NotesListView.topFadeHeight)
+  }
+
+  override func draw(_ dirtyRect: NSRect) {
+    let background = Theme.background.usingColorSpace(.sRGB) ?? Theme.background
+    Theme.background.setFill()
+    row.frame.fill()
+    let fade = NSRect(x: 0, y: row.frame.maxY, width: bounds.width, height: Self.fade)
+    guard let wash else { return drawFade(in: fade, color: background) }
+    // The drop wash over the background, as it shows on the list under it:
+    // over the header, and fading out like the list below it.
+    let washed = NSColor(sRGB: background, under: Theme.accentWash)
+    let path = NSBezierPath(roundedRect: wash, xRadius: 10, yRadius: 10)
+    NSGraphicsContext.saveGraphicsState()
+    row.frame.clip()
+    washed.setFill()
+    path.fill()
+    NSGraphicsContext.restoreGraphicsState()
+    NSGraphicsContext.saveGraphicsState()
+    let outside = NSBezierPath(rect: fade)
+    outside.append(path)
+    outside.windingRule = .evenOdd
+    outside.addClip()
+    drawFade(in: fade, color: background)
+    NSGraphicsContext.restoreGraphicsState()
+    NSGraphicsContext.saveGraphicsState()
+    path.addClip()
+    drawFade(in: fade, color: washed)
+    NSGraphicsContext.restoreGraphicsState()
+  }
+
+  /// `color` fading out down `rect`, eased like the list's top fade (see
+  /// `updateTopFade`), so it has no hard edge.
+  private func drawFade(in rect: NSRect, color: NSColor) {
+    let steps = 8
+    let colors = (0...steps).map { i -> NSColor in
+      let t = CGFloat(i) / CGFloat(steps)
+      return color.withAlphaComponent(1 - t * t * (3 - 2 * t))
+    }
+    let locations = (0...steps).map { CGFloat($0) / CGFloat(steps) }
+    // (From the header down: the view is flipped.)
+    NSGradient(colors: colors, atLocations: locations, colorSpace: .sRGB)?.draw(in: rect, angle: 90)
+  }
 }
 
 /// A chevron pointing right, turned down while open. It's drawn in a layer of
@@ -3191,6 +3873,9 @@ private final class ChevronView: NSView {
   private let glyph = CALayer()
   var isOpen = false {
     didSet { needsLayout = true }
+  }
+  var isHovered = false {
+    didSet { if isHovered != oldValue { needsDisplay = true } }
   }
 
   override init(frame frameRect: NSRect) {
@@ -3210,9 +3895,9 @@ private final class ChevronView: NSView {
   }
 
   override func updateLayer() {
-    // Drawn like a note's chevrons, so it's the same grey.
-    guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold, color: Theme.secondaryText,
-                                    in: effectiveAppearance) else { return }
+    // Drawn like a note's chevrons: the same grey, brighter hovered.
+    guard let symbol = Theme.symbol("chevron.right", size: 10, weight: .semibold,
+                                    color: isHovered ? Theme.text : Theme.secondaryText, in: effectiveAppearance) else { return }
     glyph.contents = symbol.layerContents(forContentsScale: window?.backingScaleFactor ?? 2)
     glyph.contentsGravity = .center
     glyph.contentsScale = window?.backingScaleFactor ?? 2
@@ -3272,7 +3957,7 @@ private final class GroupHeaderCell: NSTableCellView, NSTextFieldDelegate {
       nameField.centerYAnchor.constraint(equalTo: centerYAnchor, constant: GroupRowView.drop),
       nameField.trailingAnchor.constraint(lessThanOrEqualTo: countLabel.leadingAnchor, constant: -8),
       countLabel.firstBaselineAnchor.constraint(equalTo: nameField.firstBaselineAnchor),
-      countLabel.trailingAnchor.constraint(lessThanOrEqualTo: moreButton.leadingAnchor, constant: -16),
+      countLabel.trailingAnchor.constraint(equalTo: moreButton.leadingAnchor, constant: -16),
       moreButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
       moreButton.centerYAnchor.constraint(equalTo: nameField.centerYAnchor),
     ])
@@ -3365,6 +4050,58 @@ private extension NSView {
 
 /// A round-cornered checkbox drawn like a note's tasks, which scales and
 /// fades in and out (reversing from wherever it is).
+private extension NSView {
+  /// Comes in growing from small and fading in, or goes out shrinking and
+  /// fading (a gutter's checkbox, an unread dot).
+  func pop(in shown: Bool, animated: Bool) {
+    guard let layer else { return }
+    let current = layer.presentation()
+    let hidden = centeredScale(0.6)
+    // (Coming in from nothing: from small, whatever the model transform is.)
+    let fromTransform = current.map { $0.opacity < 0.01 ? hidden : $0.transform } ?? hidden
+    let fromOpacity = current?.opacity ?? Float(alphaValue)
+    layer.removeAnimation(forKey: "glea.pop.transform")
+    alphaValue = shown ? 1 : 0
+    guard animated, !Motion.reduceMotion else {
+      layer.removeAnimation(forKey: "glea.pop.opacity")
+      return
+    }
+    let fade = Motion.basic("opacity", duration: 0.16, timing: Motion.easeOut)
+    fade.fromValue = fromOpacity
+    fade.toValue = shown ? 1 : 0
+    let scale = Motion.basic("transform", duration: 0.2, timing: Motion.easeOut)
+    scale.fromValue = fromTransform
+    scale.toValue = shown ? CATransform3DIdentity : hidden
+    // Going out, it stays small (AppKit resets the model transform).
+    scale.fillMode = .forwards
+    scale.isRemovedOnCompletion = shown
+    layer.add(fade, forKey: "glea.pop.opacity")
+    layer.add(scale, forKey: "glea.pop.transform")
+  }
+}
+
+/// A note changed while it wasn't open: a dot where its checkbox goes.
+private final class UnreadDot: NSView {
+  static let size: CGFloat = 8
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    wantsLayer = true
+    alphaValue = 0
+  }
+
+  required init?(coder: NSCoder) { fatalError() }
+
+  override var wantsUpdateLayer: Bool { true }
+
+  override func updateLayer() {
+    layer?.backgroundColor = Theme.accent.cgColor
+    layer?.cornerRadius = bounds.height / 2
+  }
+
+  override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 private final class SelectionCheckbox: NSView {
   /// The box drawn, and the area around it that takes clicks.
   static let boxSize: CGFloat = 14
@@ -3386,29 +4123,7 @@ private final class SelectionCheckbox: NSView {
   func setShown(_ shown: Bool, animated: Bool) {
     guard shown != isShown else { return }
     isShown = shown
-    guard let layer else { return }
-    let current = layer.presentation()
-    let hidden = centeredScale(0.6)
-    // (Coming in from nothing: from small, whatever the model transform is.)
-    let fromTransform = current.map { $0.opacity < 0.01 ? hidden : $0.transform } ?? hidden
-    let fromOpacity = current?.opacity ?? Float(alphaValue)
-    layer.removeAnimation(forKey: "glea.check.transform")
-    alphaValue = shown ? 1 : 0
-    guard animated, !Motion.reduceMotion else {
-      layer.removeAnimation(forKey: "glea.check.opacity")
-      return
-    }
-    let fade = Motion.basic("opacity", duration: 0.16, timing: Motion.easeOut)
-    fade.fromValue = fromOpacity
-    fade.toValue = shown ? 1 : 0
-    let scale = Motion.basic("transform", duration: 0.2, timing: Motion.easeOut)
-    scale.fromValue = fromTransform
-    scale.toValue = shown ? CATransform3DIdentity : hidden
-    // Going out, it stays small (AppKit resets the model transform).
-    scale.fillMode = .forwards
-    scale.isRemovedOnCompletion = shown
-    layer.add(fade, forKey: "glea.check.opacity")
-    layer.add(scale, forKey: "glea.check.transform")
+    pop(in: shown, animated: animated)
   }
 
   override func hitTest(_ point: NSPoint) -> NSView? {

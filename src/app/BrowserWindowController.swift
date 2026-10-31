@@ -654,11 +654,11 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       }
       updatePinnedExtensions()
       setMode(saved == nil ? initialMode ?? .web : .web)
-      // Its current tab shows; the others load hidden.
+      // Its current tab shows; the others load hidden, one by one.
       DispatchQueue.main.async { [weak self] in
         guard let self else { return }
         if let active = self.activeTab { self.activate(active) }
-        for tab in self.tabs { self.attach(tab) }
+        self.loadRestoredTabs(after: 0.5)
       }
       return
     }
@@ -670,13 +670,10 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     }
     updatePinnedExtensions()
     setMode(.journal)
-    // Restored tabs load right away, hidden (the active one first), so they
-    // are ready when shown instead of loading on first click.
-    DispatchQueue.main.async { [weak self] in
-      guard let self else { return }
-      if let active = self.activeTab { self.attach(active) }
-      for tab in self.tabs { self.attach(tab) }
-    }
+    // Restored tabs load hidden (the active one first), so they are ready
+    // when shown instead of loading on first click: one by one, once the
+    // notes have settled.
+    loadRestoredTabs(after: 2)
   }
 
   required init?(coder: NSCoder) { fatalError() }
@@ -1167,7 +1164,12 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
     switch newMode {
     case .journal: journalView.reloadIfNeeded()
     case .notes: notesView.reload()
-    case .web: if !isShowingNewTab { activeTab?.browserView?.isHidden = false }
+    case .web:
+      // (Not loaded yet, if restored tabs are still loading: now.)
+      if !isShowingNewTab, let tab = activeTab {
+        attach(tab)
+        tab.browserView?.isHidden = false
+      }
     case .note: break
     }
     // What floats over the page's text (the format bar, the slash and link
@@ -1381,6 +1383,63 @@ final class BrowserWindowController: NSWindowController, NSWindowDelegate, NSMen
       tabs.append(tab)
     }
     normalizeTabOrder()
+  }
+
+  // MARK: Loading restored tabs
+
+  /// Restored tabs still to load, in order, and the one loading.
+  private var tabsToLoad: [Tab] = []
+  private var loadingRestored: (tab: Tab, since: CFTimeInterval)?
+  private var restoreTimer: Timer?
+
+  /// Loads the restored tabs in the background after `delay`, one at a time
+  /// (each waits for the one before to finish loading, or a few seconds),
+  /// so launching doesn't load every page at once. On the notes, it waits
+  /// while you type or scroll. A tab shown first loads then.
+  private func loadRestoredTabs(after delay: TimeInterval) {
+    tabsToLoad = (activeTab.map { [$0] } ?? []) + tabs.filter { $0 !== activeTab }
+    restoreTimer?.invalidate()
+    restoreTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+      MainActor.assumeIsolated {
+        guard let self else { return }
+        self.restoreTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] timer in
+          MainActor.assumeIsolated {
+            guard let self else { return timer.invalidate() }
+            self.loadNextRestoredTab()
+          }
+        }
+      }
+    }
+  }
+
+  private func loadNextRestoredTab() {
+    let now = CACurrentMediaTime()
+    if let (tab, since) = loadingRestored {
+      // (It may not have started loading yet.)
+      let elapsed = now - since
+      if elapsed < 0.6 || (tab.isLoading && elapsed < 5) { return }
+      loadingRestored = nil
+    }
+    if mode != .web, NSApp.isActive, Self.userActive(within: 1) { return }
+    // (Closed, or loaded since: shown, say.)
+    while let next = tabsToLoad.first, next.browserView != nil || !tabs.contains(where: { $0 === next }) {
+      tabsToLoad.removeFirst()
+    }
+    guard !tabsToLoad.isEmpty else {
+      restoreTimer?.invalidate()
+      restoreTimer = nil
+      return
+    }
+    let tab = tabsToLoad.removeFirst()
+    attach(tab)
+    loadingRestored = (tab, now)
+  }
+
+  /// Whether a key was pressed or something scrolled in the last `seconds`.
+  private static func userActive(within seconds: CFTimeInterval) -> Bool {
+    [CGEventType.keyDown, .scrollWheel].contains {
+      CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: $0) < seconds
+    }
   }
 
   private func attach(_ tab: Tab) {

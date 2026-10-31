@@ -69,6 +69,7 @@ final class NoteStore {
   private struct Entry {
     var content: String
     var modified: Date
+    var created: Date
     /// The group (folder in notes/) it's in, "" for none.
     var folder = ""
   }
@@ -168,7 +169,7 @@ final class NoteStore {
     }
     for kind in [NoteRef.Kind.note, .journal] {
       let dir = directory(for: kind)
-      let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+      let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey])) ?? []
       for file in files where file.pathExtension.lowercased() == "md" {
         let ref = NoteRef(kind: kind, name: file.deletingPathExtension().lastPathComponent)
         if kind == .journal && ref.date == nil { continue }
@@ -181,7 +182,7 @@ final class NoteStore {
     for folder in folders where isGroupFolder(folder) {
       let name = folder.lastPathComponent
       groupFolders.insert(name)
-      let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+      let files = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey])) ?? []
       for file in files where file.pathExtension.lowercased() == "md" {
         let ref = NoteRef(kind: .note, name: file.deletingPathExtension().lastPathComponent)
         if entries[ref] == nil, var entry = readEntry(at: file) {
@@ -190,7 +191,45 @@ final class NoteStore {
         }
       }
     }
+    loadUnread()
     startWatching()
+  }
+
+  // MARK: Unread
+
+  /// Whether a note shows in an editor now (the editors tell).
+  var isShowing: (NoteRef) -> Bool = { _ in false }
+  /// Notes changed while no editor showed them (by another app, or a
+  /// capture added to them), by name: unread until one shows them.
+  private var unread: Set<String> = []
+  /// Kept by notes folder (a folder's notes have their own).
+  private static let unreadKey = "unreadNotes"
+
+  func isUnread(_ ref: NoteRef) -> Bool { ref.kind == .note && unread.contains(ref.name) }
+
+  /// Shown in an editor: read.
+  func markRead(_ ref: NoteRef) {
+    guard unread.remove(ref.name) != nil else { return }
+    saveUnread()
+    postChange([ref.id])
+  }
+
+  /// Changed without being shown: unread (the change posts itself).
+  private func markUnseen(_ ref: NoteRef) {
+    guard ref.kind == .note, !isShowing(ref), unread.insert(ref.name).inserted else { return }
+    saveUnread()
+  }
+
+  private func loadUnread() {
+    let saved = UserDefaults.standard.dictionary(forKey: Self.unreadKey)?[root.standardizedFileURL.path] as? [String] ?? []
+    let names = Set(entries.keys.filter { $0.kind == .note }.map(\.name))
+    unread = Set(saved).intersection(names)
+  }
+
+  private func saveUnread() {
+    var all = UserDefaults.standard.dictionary(forKey: Self.unreadKey) ?? [:]
+    all[root.standardizedFileURL.path] = unread.isEmpty ? nil : unread.sorted()
+    UserDefaults.standard.set(all, forKey: Self.unreadKey)
   }
 
   /// A folder in notes/ is a group when it holds notes, or nothing (a folder
@@ -204,8 +243,9 @@ final class NoteStore {
 
   private func readEntry(at url: URL) -> Entry? {
     guard let data = try? Data(contentsOf: url) else { return nil }
-    let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? Date()
-    return Entry(content: String(decoding: data, as: UTF8.self), modified: modified)
+    let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
+    let modified = values?.contentModificationDate ?? Date()
+    return Entry(content: String(decoding: data, as: UTF8.self), modified: modified, created: values?.creationDate ?? modified)
   }
 
   private func directory(for kind: NoteRef.Kind) -> URL {
@@ -230,8 +270,10 @@ final class NoteStore {
   func exists(_ ref: NoteRef) -> Bool { entries[ref] != nil }
 
   func content(of ref: NoteRef) -> String { entries[ref]?.content ?? "" }
+  func wordCount(of ref: NoteRef) -> Int { content(of: ref).split { $0.isWhitespace || $0.isNewline }.count }
 
   func modified(_ ref: NoteRef) -> Date? { entries[ref]?.modified }
+  func created(_ ref: NoteRef) -> Date? { entries[ref]?.created }
 
   /// Notes (not journal days), most recently edited first.
   var notes: [NoteRef] {
@@ -316,6 +358,8 @@ final class NoteStore {
     var text = Frontmatter.body(of: markdown)
     let replacements: [(String, String)] = [
       ("%%.*?%%", ""),
+      // An embed's size (`![alt|380](…)`, `![[image.png|240x120]]`) isn't text.
+      ("(!\\[[^\\]]*?)\\|\\d+(?:x\\d+)?(?=\\])", "$1"),
       ("(?m)\\s\\^[\\w-]+$", ""),
       ("(?m)^(\\s*>\\s?)+\\[![\\w-]+\\][+-]?[ \\t]*", ""),
       ("==(?=\\S)(.+?)(?<=\\S)==", "$1"),
@@ -520,7 +564,10 @@ final class NoteStore {
     do {
       try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
       try content.write(to: url, atomically: true, encoding: .utf8)
-      entries[ref] = Entry(content: content, modified: Date(), folder: entries[ref]?.folder ?? "")
+      // (Writing replaces the file: it keeps the date it was made.)
+      let created = entries[ref]?.created ?? Date()
+      try? FileManager.default.setAttributes([.creationDate: created], ofItemAtPath: url.path)
+      entries[ref] = Entry(content: content, modified: Date(), created: created, folder: entries[ref]?.folder ?? "")
       if ref.kind == .note { aliasIndex = nil }
       return true
     } catch {
@@ -553,7 +600,7 @@ final class NoteStore {
     let ref = NoteRef(kind: .note, name: name)
     let url = fileURL(for: ref)
     try? "".write(to: url, atomically: true, encoding: .utf8)
-    entries[ref] = Entry(content: "", modified: Date())
+    entries[ref] = Entry(content: "", modified: Date(), created: Date())
     postChange([ref.id])
     return ref
   }
@@ -596,21 +643,88 @@ final class NoteStore {
       return .failure(.invalidName)
     }
     entries[newRef] = entries.removeValue(forKey: ref)
-    aliasIndex = nil
-
-    // Links to a heading or block in it too ("[[Old#Heading]]").
-    let pattern = "\\[\\[" + NSRegularExpression.escapedPattern(for: ref.name) + "(\\||\\]\\]|#)"
-    if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-      let template = "[[" + NSRegularExpression.escapedTemplate(for: name) + "$1"
-      for (other, entry) in entries {
-        let range = NSRange(entry.content.startIndex..., in: entry.content)
-        guard regex.firstMatch(in: entry.content, range: range) != nil else { continue }
-        save(other, content: regex.stringByReplacingMatches(in: entry.content, range: range, withTemplate: template))
-      }
+    if unread.remove(ref.name) != nil {
+      unread.insert(newRef.name)
+      saveUnread()
     }
+    aliasIndex = nil
+    rewriteLinks(from: ref.name, to: name)
     ActivityLog.shared.renamed(ref, to: newRef)
     postChange([ref.id, newRef.id])
     return .success(newRef)
+  }
+
+  /// Rewrites every `[[old]]` link (to a heading or block in it too,
+  /// "[[old#Heading]]") to `[[new]]`.
+  private func rewriteLinks(from old: String, to new: String) {
+    let pattern = "\\[\\[" + NSRegularExpression.escapedPattern(for: old) + "(\\||\\]\\]|#)"
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return }
+    let template = "[[" + NSRegularExpression.escapedTemplate(for: new) + "$1"
+    for (other, entry) in entries {
+      let range = NSRange(entry.content.startIndex..., in: entry.content)
+      guard regex.firstMatch(in: entry.content, range: range) != nil else { continue }
+      save(other, content: regex.stringByReplacingMatches(in: entry.content, range: range, withTemplate: template))
+    }
+  }
+
+  // MARK: Journal days as notes
+
+  /// Takes a journal day out of the journal: it becomes a note (in no
+  /// group) named after its date ("Friday 30 October 2026"; a date as a
+  /// name would be the day's), and links to the day now go to it. Nil if
+  /// its file can't move.
+  func makeNote(fromJournalDay day: NoteRef) -> NoteRef? {
+    guard day.kind == .journal, entries[day] != nil else { return nil }
+    var name = NoteStore.sanitize(day.displayTitle)
+    if hasNote(named: name) {
+      var i = 2
+      while hasNote(named: "\(name) \(i)") { i += 1 }
+      name = "\(name) \(i)"
+    }
+    let note = NoteRef(kind: .note, name: name)
+    guard moveFile(of: day, to: note, folder: "") else { return nil }
+    rewriteLinks(from: day.name, to: name)
+    postChange([day.id, note.id])
+    return note
+  }
+
+  /// Puts a note made from a journal day back as that day (Undo). False if
+  /// the day has a page again.
+  @discardableResult
+  func returnToJournal(_ note: NoteRef, as day: NoteRef) -> Bool {
+    guard note.kind == .note, day.kind == .journal, entries[note] != nil, entries[day] == nil,
+          !FileManager.default.fileExists(atPath: fileURL(for: day).path), moveFile(of: note, to: day, folder: "") else { return false }
+    rewriteLinks(from: note.name, to: day.name)
+    postChange([note.id, day.id])
+    return true
+  }
+
+  /// Moves `ref`'s file to where `to` goes (in `folder`, for a note), its
+  /// links to images and files rewritten to still point there; it keeps its
+  /// dates.
+  private func moveFile(of ref: NoteRef, to: NoteRef, folder: String) -> Bool {
+    guard var entry = entries[ref] else { return false }
+    let source = fileURL(for: ref)
+    let dest = fileURL(for: to, folder: folder)
+    guard !FileManager.default.fileExists(atPath: dest.path) else { return false }
+    let content = NoteStore.rebasingLinks(in: entry.content, from: source.deletingLastPathComponent(),
+                                          to: dest.deletingLastPathComponent())
+    do {
+      try FileManager.default.moveItem(at: source, to: dest)
+      if content != entry.content {
+        try content.write(to: dest, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.modificationDate: entry.modified, .creationDate: entry.created], ofItemAtPath: dest.path)
+      }
+    } catch {
+      NSLog("Glea: moving \(ref.name) failed: \(error)")
+      return false
+    }
+    entry.content = content
+    entry.folder = to.kind == .note ? folder : ""
+    entries[ref] = nil
+    entries[to] = entry
+    aliasIndex = nil
+    return true
   }
 
   /// Moves the note's file to the Trash.
@@ -639,6 +753,7 @@ final class NoteStore {
     }
     trashedFolders[ref] = entries[ref]?.folder
     entries[ref] = nil
+    if unread.remove(ref.name) != nil { saveUnread() }
     aliasIndex = nil
     postChange([ref.id])
     return trashed as URL?
@@ -722,7 +837,7 @@ final class NoteStore {
       }
       // (Moving doesn't count as editing: it keeps its place in the list.)
       if content != entry.content {
-        try? FileManager.default.setAttributes([.modificationDate: entry.modified], ofItemAtPath: dest.path)
+        try? FileManager.default.setAttributes([.modificationDate: entry.modified, .creationDate: entry.created], ofItemAtPath: dest.path)
       }
       entry.folder = folder
       entry.content = content
@@ -814,6 +929,7 @@ final class NoteStore {
     let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
     content = trimmed.isEmpty ? markdown + "\n" : content.replacingOccurrences(
       of: "\\s+$", with: "", options: .regularExpression) + "\n\n" + markdown + "\n"
+    markUnseen(ref)
     save(ref, content: content)
   }
 
@@ -1040,7 +1156,7 @@ final class NoteStore {
         changed.insert(ref.id)
       }
       guard isGroup else { continue }
-      let files = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+      let files = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey])) ?? []
       for file in files where file.pathExtension.lowercased() == "md" {
         let ref = NoteRef(kind: .note, name: file.deletingPathExtension().lastPathComponent)
         guard entries[ref] == nil, var entry = readEntry(at: file) else { continue }
@@ -1077,7 +1193,11 @@ final class NoteStore {
         if let existing = entries[ref], existing.folder != folder,
            FileManager.default.fileExists(atPath: fileURL(for: ref).path) { continue }
         guard var entry = readEntry(at: url), entry.content != entries[ref]?.content || folder != entries[ref]?.folder else { continue }
+        // Written by another app (not just moved).
+        if entry.content != entries[ref]?.content { markUnseen(ref) }
         entry.folder = folder
+        // (Another app saving it may have replaced the file: it keeps the date it was made.)
+        if let created = entries[ref]?.created { entry.created = created }
         entries[ref] = entry
       } else {
         // (Gone from where it was, not from where it moved.)

@@ -206,8 +206,9 @@ struct MarkdownStyler {
   nonisolated static let paragraphSpacing: CGFloat = 6
   /// How tall a line of body text is.
   static let bodyLineHeight = NSLayoutManager().defaultLineHeight(for: Theme.bodyFont)
-  /// How far each level of heading nesting indents its section.
-  nonisolated static let sectionIndent: CGFloat = 20
+  /// How far each level of heading nesting indents its section: a nested
+  /// heading's chevron lines up with its parent's text (see `chevronRect`).
+  nonisolated static let sectionIndent: CGFloat = 24
 
   static var baseAttributes: [NSAttributedString.Key: Any] {
     let paragraph = NSMutableParagraphStyle()
@@ -2105,8 +2106,10 @@ final class NoteGutterView: NSView {
     }
   }
 
+  /// A heading's chevron, clear of its text; one level in, it sits under the
+  /// text of the heading above (`sectionIndent` is this far plus 3).
   private func chevronRect(_ item: Item) -> NSRect {
-    NSRect(x: NoteGutterView.width - 23 + item.indent, y: item.centerY - 9, width: 18, height: 18)
+    NSRect(x: NoteGutterView.width - 27 + item.indent, y: item.centerY - 9, width: 18, height: 18)
   }
 
   private func gripRect(_ handle: Handle) -> NSRect {
@@ -2175,13 +2178,26 @@ final class NoteGutterView: NSView {
     let hit = handles.filter { $0.band.contains(point.y) && point.x >= 0 }
       .min { $0.band.upperBound - $0.band.lowerBound < $1.band.upperBound - $1.band.lowerBound }
     setHovered(hit)
+    setHoveredChevron(chevron(at: point)?.key)
     if grip(at: point) != nil { NSCursor.openHand.set() }
   }
 
   private func setHovered(_ handle: Handle?) {
+    if handle == nil { setHoveredChevron(nil) }
     guard handle?.block != hovered?.block || handle?.centerY != hovered?.centerY else { return }
     hovered = handle
     needsDisplay = true
+  }
+
+  /// The chevron under the pointer, brighter. (Moving onto it along its
+  /// heading's line stays on the same block: it redraws on its own.)
+  private var hoveredChevron: String?
+  private func setHoveredChevron(_ key: String?) {
+    guard key != hoveredChevron else { return }
+    for item in items where item.key == key || item.key == hoveredChevron {
+      setNeedsDisplay(chevronRect(item).insetBy(dx: -4, dy: -4))
+    }
+    hoveredChevron = key
   }
 
   override func mouseDown(with event: NSEvent) {
@@ -2306,8 +2322,7 @@ final class NoteGutterView: NSView {
     for item in items where !(hiddenBand?.contains(item.centerY) ?? false) {
       let rect = chevronRect(item)
       guard rect.insetBy(dx: -4, dy: -4).intersects(dirtyRect) else { continue }
-      let over = mouse.map { rect.insetBy(dx: -3, dy: -3).contains($0) } ?? false
-      guard let image = chevronImage(over: over) else { continue }
+      guard let image = chevronImage(over: item.key == hoveredChevron) else { continue }
       let size = image.size
       NSGraphicsContext.saveGraphicsState()
       // Turns from right (collapsed) to down (open) as the section opens.
@@ -3315,6 +3330,8 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
     NotificationCenter.default.addObserver(self, selector: #selector(notesChanged(_:)), name: .notesDidChange, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(imageLoaded), name: ImageCache.didLoad, object: nil)
     MarkdownEditorView.live.add(self)
+    // What's changed while no editor shows it is unread.
+    NoteStore.shared.isShowing = { ref in MarkdownEditorView.live.allObjects.contains { $0.ref == ref && $0.isShowingNote } }
 
     if embedded != nil {
       textView.isEditable = false
@@ -3340,6 +3357,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
 
   override func viewDidMoveToWindow() {
     super.viewDidMoveToWindow()
+    if window != nil { markShownRead() }
     // The table toggle shows while the pointer is over a table, or over the
     // toggle itself (in the page's gutter, outside this view).
     if let hoverArea {
@@ -3512,6 +3530,7 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   override func viewDidUnhide() {
     super.viewDidUnhide()
     if abs(styledWidth - bounds.width) > 1 { needsLayout = true }
+    markShownRead()
   }
 
   /// A long note's width changes come in bursts (a live resize, zooming the
@@ -5237,6 +5256,20 @@ final class MarkdownEditorView: NSView, NSTextViewDelegate {
   func rebind(to newRef: NoteRef) {
     flush()
     ref = newRef
+    markShownRead()
+  }
+
+  /// Whether it shows its note (a whole note, on screen).
+  var isShowingNote: Bool { embedded == nil && window != nil && !isHiddenOrHasHiddenAncestor }
+
+  /// Shown: the note is read. (Once the view has settled: marking it read
+  /// redraws lists of notes.)
+  private func markShownRead() {
+    guard embedded == nil else { return }
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.isShowingNote else { return }
+      NoteStore.shared.markRead(self.ref)
+    }
   }
 
   @objc private func notesChanged(_ note: Notification) {

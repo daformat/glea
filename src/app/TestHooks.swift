@@ -281,10 +281,11 @@ enum TestHooks {
       case "drag-note-to": if let y = Double(argument) { list?.debugDragTo(y) }
       default: list?.debugEndDrag(drop: argument == "drop")
       }
-    case "drop-note", "toggle-group", "delete-group", "rename-group", "notes-toc", "scroll-notes":
+    case "drop-note", "toggle-group", "delete-group", "rename-group", "notes-toc", "scroll-notes", "sort-notes", "sort-groups", "notes-journal":
       // drop-note:<name>|<row>|on (or above) drops a note in All Notes as if
       // dragged there; toggle-group:<name> ("" for ungrouped) and
-      // delete-group:<name>.
+      // delete-group:<name>; sort-notes:<edited|created|title|length>[|reversed]
+      // and sort-groups:<name|edited|count>[|reversed]; notes-journal:<0|1>.
       let list = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? NotesListView }.first
       if parts[0] == "toggle-group" { list?.debugToggleGroup(argument) }
       if parts[0] == "delete-group" { list?.debugDeleteGroup(argument) }
@@ -294,6 +295,9 @@ enum TestHooks {
         list?.debugRenameGroup(names[0], to: names[1])
       }
       let fields = argument.split(separator: "|").map(String.init)
+      if parts[0] == "sort-notes", let key = fields.first { list?.debugSort(key, reversed: fields.count > 1) }
+      if parts[0] == "sort-groups", let key = fields.first { list?.debugSortGroups(key, reversed: fields.count > 1) }
+      if parts[0] == "notes-journal" { list?.debugShowJournal(argument == "1") }
       if parts[0] == "drop-note", fields.count == 3, let row = Int(fields[1]) { list?.debugDrop(fields[0], row: row, on: fields[2] == "on") }
     case "toc-hover", "toc-click":
       let page = [controller.window?.contentView].compactMap { $0 }.flatMap(allSubviews).compactMap { $0 as? ColumnPageView }.first { !$0.isHiddenOrHasHiddenAncestor }
@@ -602,6 +606,16 @@ enum TestHooks {
         let page = allSubviews(window.contentView!).compactMap { $0 as? ColumnPageView }.first { !$0.isHiddenOrHasHiddenAncestor }
         NSLog("Glea pdf-scroll %@ pdf=%@ note=%.0f", argument, pdf.debugScrollState, page?.scrollView.contentView.bounds.minY ?? -1)
       }
+    case "wheel":
+      // wheel:<x>,<y>,<delta>: a scroll wheel at a point of the window
+      // (points, from the top left; + goes down the page).
+      let values = argument.split(separator: ",").compactMap { Double($0) }
+      guard values.count == 3, let window = controller.window, let content = window.contentView, let screen = NSScreen.screens.first,
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: Int32(-values[2]), wheel2: 0, wheel3: 0)
+      else { break }
+      let point = window.convertPoint(toScreen: NSPoint(x: values[0], y: content.bounds.height - values[1]))
+      event.location = CGPoint(x: point.x, y: screen.frame.maxY - point.y)
+      if let ns = NSEvent(cgEvent: event) { window.sendEvent(ns) }
     case "trackpad-scroll":
       // trackpad-scroll:<delta>,<began|changed|ended|momentum|momentum-ended>
       // scrolls the tab bar like a trackpad gesture (pixels, + goes right).
@@ -747,6 +761,27 @@ enum TestHooks {
               content.isFlipped, layer?.cornerRadius ?? -1, layer?.maskedCorners.rawValue ?? 0, layer?.masksToBounds ?? false,
               window.styleMask.rawValue, String(describing: type(of: content.superview!)), content.superview?.layer?.cornerRadius ?? -1)
       }
+    case "fold-duration":
+      // fold-duration:<seconds>: how long folds take (slowed down to watch one).
+      if let seconds = Double(argument) { Motion.foldDuration = seconds }
+    case "mouse-move":
+      // mouse-move:<x>,<y>: the pointer moves to a point of the window
+      // (points, from the top left), as tracking areas see it: each that
+      // follows the pointer there is told (macOS makes those events itself,
+      // from the real pointer).
+      let values = argument.split(separator: ",").compactMap { Double($0) }
+      guard values.count == 2, let window = controller.window, let content = window.contentView,
+            let event = NSEvent.mouseEvent(with: .mouseMoved, location: NSPoint(x: values[0], y: content.bounds.height - values[1]),
+                                           modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                                           windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 0, pressure: 0)
+      else { break }
+      for view in allSubviews(content) where !view.isHiddenOrHasHiddenAncestor {
+        let point = view.convert(event.locationInWindow, from: nil)
+        for area in view.trackingAreas where area.options.contains(.mouseMoved) {
+          let rect = area.options.contains(.inVisibleRect) ? view.visibleRect : area.rect
+          if rect.contains(point) { (area.owner as? NSResponder)?.mouseMoved(with: event) }
+        }
+      }
     case "hover-row":
       // hover-row:<n>,<0|1>: the nth hover-tracked row (top to bottom) as if
       // the pointer came over it or left.
@@ -829,7 +864,8 @@ enum TestHooks {
     case "tabs-state":
       for (i, tab) in controller.tabs.enumerated() {
         let g = controller.groups.firstIndex { $0.id == tab.groupID }.map(String.init) ?? "-"
-        NSLog("Glea tab %d %@ pinned=%d group=%@ active=%d", i, tab.displayTitle, tab.isPinned, g, tab === controller.activeTab)
+        NSLog("Glea tab %d %@ pinned=%d group=%@ active=%d loaded=%d", i, tab.displayTitle, tab.isPinned, g, tab === controller.activeTab,
+              tab.browserView != nil)
       }
     case "drag":
       // drag:x1,x2 (points in the window, at the tab bar's middle): a mouse drag.
