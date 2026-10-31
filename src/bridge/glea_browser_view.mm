@@ -16,6 +16,7 @@
 #include "include/cef_request_context.h"
 #include "include/cef_request_context_handler.h"
 #include "include/cef_resource_request_handler.h"
+#include "include/cef_task.h"
 #include "include/views/cef_box_layout.h"
 #include "include/views/cef_browser_view.h"
 #include "include/views/cef_panel.h"
@@ -109,6 +110,19 @@ bool IsNewTabDisposition(cef_window_open_disposition_t d) {
   return d == CEF_WOD_NEW_FOREGROUND_TAB || d == CEF_WOD_NEW_BACKGROUND_TAB ||
          d == CEF_WOD_NEW_WINDOW || d == CEF_WOD_NEW_POPUP;
 }
+
+// Runs a block as a task on a CEF thread: after the tasks already queued there,
+// unlike dispatch_async on the main queue, whose order against them isn't set.
+class BlockTask : public CefTask {
+ public:
+  explicit BlockTask(dispatch_block_t block) : block_([block copy]) {}
+  void Execute() override { block_(); }
+
+ private:
+  dispatch_block_t block_;
+
+  IMPLEMENT_REFCOUNTING(BlockTask);
+};
 
 // Receives all browser events for one GleaBrowserView. Runs on the UI thread,
 // which on macOS is the main thread.
@@ -510,6 +524,14 @@ class BrowserClient : public CefClient,
                               const CefString& requesting_origin,
                               uint32_t requested_permissions,
                               CefRefPtr<CefPermissionPromptCallback> callback) override {
+    // Allowing a page's <permission> element (Google Meet's camera and
+    // microphone buttons) can bring the same requests straight back, already
+    // granted, for a follow-up (asking macOS for the camera, say): allowing them
+    // again would grant them twice, which crashes Chromium. Close it instead.
+    if (accepting_.count(browser->GetIdentifier())) {
+      callback->Continue(CEF_PERMISSION_RESULT_DISMISS);
+      return true;
+    }
     const uint32_t streams = CEF_PERMISSION_TYPE_CAMERA_STREAM | CEF_PERMISSION_TYPE_MIC_STREAM;
     if (requested_permissions == 0 || (requested_permissions & ~streams) != 0) return false;
     return AskMediaAccess(browser, requesting_origin,
@@ -518,6 +540,24 @@ class BrowserClient : public CefClient,
       callback->Continue(allowed ? CEF_PERMISSION_RESULT_ACCEPT : CEF_PERMISSION_RESULT_DENY);
     });
   }
+
+  // Called just before Chromium applies the answer: a prompt shown while it
+  // applies an Allow is that follow-up (above). Anything queued meanwhile is
+  // shown by a later task, after this one.
+  void OnDismissPermissionPrompt(CefRefPtr<CefBrowser> browser,
+                                 uint64_t prompt_id,
+                                 cef_permission_request_result_t result) override {
+    if (result != CEF_PERMISSION_RESULT_ACCEPT) return;
+    const int id = browser->GetIdentifier();
+    accepting_.insert(id);
+    CefRefPtr<BrowserClient> client(this);
+    CefPostTask(TID_UI, new BlockTask(^{
+      client->accepting_.erase(id);
+    }));
+  }
+
+  // Browsers whose permission prompt Chromium is applying an Allow to.
+  std::set<int> accepting_;
 
   /// Asks the view's delegate; false if it doesn't handle it.
   bool AskMediaAccess(CefRefPtr<CefBrowser> browser, const CefString& origin, bool camera, bool microphone,
