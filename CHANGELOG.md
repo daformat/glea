@@ -2,6 +2,27 @@
 
 What changed in each release of Glea.
 
+## 0.23.0 Beta — 2026-10-31
+
+- All Notes has a sort menu, between search and +: sort your notes by date
+  edited, date created, title or length, either way round, and your groups
+  by name, last edit or number of notes.
+- Show Journal Notes, in the sort menu, lists your journal days in All
+  Notes too. Drag one into a group or onto a note and it becomes a note.
+- A blue dot marks the notes that changed while they weren't open, by
+  another app or something you collected, until you open them.
+- A group's name stays at the top of All Notes while you scroll through
+  its notes. Click it to fold the group.
+- Drag a note onto one that's in a group and hold a moment to make a new
+  group with the two. Dragging near the top or bottom of the list scrolls
+  it.
+- A group's chevron folds it too, like its name.
+- Note previews in All Notes no longer show image sizes like |380.
+- In a note, the chevrons that fold headings sit a little further from
+  their text, and light up as you point at them.
+- Glea is quicker to use right after you open it: your tabs load in the
+  background one at a time, rather than all at once.
+
 ## 0.22.4 Beta — 2026-10-31
 
 - Google Meet no longer makes Glea quit unexpectedly as you allow it to
