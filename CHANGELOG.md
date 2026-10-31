@@ -2,6 +2,11 @@
 
 What changed in each release of Glea.
 
+## 0.22.4 Beta — 2026-10-31
+
+- Google Meet no longer makes Glea quit unexpectedly as you allow it to
+  use your camera and microphone.
+
 ## 0.22.3 Beta — 2026-10-26
 
 - Web pages run on Chromium 156 (up from 154), with its security fixes.
